@@ -1,6 +1,8 @@
 //! Evaluates `[[forbidden]]` rules against the graph.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
+
+use rustc_hash::FxHashMap as HashMap;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -105,7 +107,7 @@ pub fn validate(rules: &[Rule]) -> Result<()> {
 
 pub fn evaluate(g: &Graph, rules: &[Rule]) -> Result<Vec<Violation>> {
     let mut out = vec![];
-    let mut cache = HashMap::new();
+    let mut cache = HashMap::default();
     for rule in rules.iter().filter(|r| r.severity != Severity::Off) {
         let c = compile(rule)?;
         let violation = |from, to, cycle| Violation {
@@ -142,11 +144,18 @@ pub fn evaluate(g: &Graph, rules: &[Rule]) -> Result<Vec<Violation>> {
                 }
             }
         } else {
-            for (i, e) in g.edges.iter().enumerate() {
-                let Some(caps) = c.source_matches(&g.modules[e.from].id) else { continue };
-                if c.edge_matches(g, i, caps.as_ref(), &mut cache) {
-                    let cycle = if e.circular { g.cycle_path(i) } else { vec![] };
-                    out.push(violation(e.from, Some(e.to), cycle));
+            // Match `from` once per module, then test its outgoing edges.
+            for m in 0..g.modules.len() {
+                if g.out[m].is_empty() {
+                    continue;
+                }
+                let Some(caps) = c.source_matches(&g.modules[m].id) else { continue };
+                for &i in &g.out[m] {
+                    let e = &g.edges[i];
+                    if c.edge_matches(g, i, caps.as_ref(), &mut cache) {
+                        let cycle = if e.circular { g.cycle_path(i) } else { vec![] };
+                        out.push(violation(e.from, Some(e.to), cycle));
+                    }
                 }
             }
         }

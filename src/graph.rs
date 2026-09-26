@@ -1,6 +1,8 @@
 //! The dependency graph: modules, deduplicated edges, cycles and metrics.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque};
+
+use rustc_hash::FxHashMap as HashMap;
 use std::path::{Path, PathBuf};
 
 use petgraph::algo::tarjan_scc;
@@ -8,7 +10,7 @@ use petgraph::graph::{DiGraph, NodeIndex};
 use serde::Serialize;
 
 use crate::config::Options;
-use crate::scan::{ImportFlags, Scan, Target};
+use crate::scan::{ImportFlags, ScannedFile, Target, Work};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -68,11 +70,12 @@ pub struct Graph {
     pub cycles: Vec<Vec<usize>>,
     pub cycle_of: Vec<Option<usize>>,
     pub timings: Timings,
-    index: HashMap<(ModuleKind, String), usize>,
+    /// Module ids per kind (indexed by `ModuleKind as usize`).
+    index: [HashMap<String, usize>; 4],
 }
 
 impl Graph {
-    pub fn build(root: &Path, scan: Scan, opts: &Options) -> Graph {
+    pub fn build(root: &Path, files: &[ScannedFile], work: Work, opts: &Options) -> Graph {
         let t = std::time::Instant::now();
         let mut g = Graph {
             root: root.to_path_buf(),
@@ -82,35 +85,42 @@ impl Graph {
             inc: vec![],
             cycles: vec![],
             cycle_of: vec![],
-            timings: Timings { walk_ms: scan.walk_ms, parse_ms: scan.parse_ms, graph_ms: 0.0 },
-            index: HashMap::new(),
+            timings: Timings { walk_ms: work.walk_ms, parse_ms: work.parse_ms, graph_ms: 0.0 },
+            index: Default::default(),
         };
-        for f in &scan.files {
+        for f in files {
             let id = g.rel(&f.path);
             let m = g.intern(ModuleKind::Local, id);
             g.modules[m].scanned = true;
             g.modules[m].parse_errors = f.parse_errors;
         }
 
+        // Scanned files are modules 0..n in order; look targets up by path to
+        // avoid a path → string conversion per import.
+        let by_path: HashMap<&Path, usize> = files.iter().enumerate().map(|(i, f)| (f.path.as_path(), i)).collect();
         let mut pkgs = PackageJsons::default();
-        let mut seen: HashMap<(usize, usize), usize> = HashMap::new();
+        // Target → edge, for deduplicating imports within the current file.
+        let mut seen: HashMap<usize, usize> = HashMap::default();
         let mut bases: Vec<&'static str> = vec![];
-        for f in &scan.files {
-            let from = g.index[&(ModuleKind::Local, g.rel(&f.path))];
+        for (from, f) in files.iter().enumerate() {
+            seen.clear();
             for imp in &f.imports {
-                let (kind, id, base) = match &imp.target {
-                    Target::Local(p) => (ModuleKind::Local, g.rel(p), "local"),
-                    Target::Npm(pkg) => (ModuleKind::Npm, pkg.clone(), pkgs.classify(&f.path, pkg)),
-                    Target::Builtin(n) => (ModuleKind::Builtin, n.clone(), "core"),
-                    Target::Unresolved => {
-                        (ModuleKind::Unresolved, imp.specifier.clone(), "unresolvable")
+                let (to, base) = match &imp.target {
+                    Target::Local(p) => match by_path.get(p.as_path()) {
+                        Some(&i) => (i, "local"),
+                        None => (g.intern(ModuleKind::Local, g.rel(p)), "local"),
+                    },
+                    Target::Npm(pkg) => {
+                        let base = pkgs.classify(&f.path, pkg);
+                        (g.intern_ref(ModuleKind::Npm, pkg), base)
                     }
+                    Target::Builtin(n) => (g.intern_ref(ModuleKind::Builtin, n), "core"),
+                    Target::Unresolved => (g.intern_ref(ModuleKind::Unresolved, &imp.specifier), "unresolvable"),
                 };
-                let to = g.intern(kind, id);
-                match seen.get(&(from, to)) {
+                match seen.get(&to) {
                     Some(&e) => g.edges[e].flags = g.edges[e].flags.merge(imp.flags),
                     None => {
-                        seen.insert((from, to), g.edges.len());
+                        seen.insert(to, g.edges.len());
                         bases.push(base);
                         g.edges.push(Edge {
                             from,
@@ -143,12 +153,19 @@ impl Graph {
         p.strip_prefix(&self.root).unwrap_or(p).to_string_lossy().replace('\\', "/")
     }
 
+    fn intern_ref(&mut self, kind: ModuleKind, id: &str) -> usize {
+        match self.index[kind as usize].get(id) {
+            Some(&i) => i,
+            None => self.intern(kind, id.to_string()),
+        }
+    }
+
     fn intern(&mut self, kind: ModuleKind, id: String) -> usize {
-        if let Some(&i) = self.index.get(&(kind, id.clone())) {
+        if let Some(&i) = self.index[kind as usize].get(&id) {
             return i;
         }
         let i = self.modules.len();
-        self.index.insert((kind, id.clone()), i);
+        self.index[kind as usize].insert(id.clone(), i);
         self.modules.push(Module { id, kind, scanned: false, parse_errors: 0 });
         i
     }
@@ -217,7 +234,8 @@ impl Graph {
     /// BFS for the shortest module path `from → … → to` (inclusive).
     /// With `circular_only`, only edges marked circular are followed.
     pub fn path_between(&self, from: usize, to: usize, circular_only: bool) -> Option<Vec<usize>> {
-        let mut prev: HashMap<usize, usize> = HashMap::from([(from, from)]);
+        let mut prev: HashMap<usize, usize> = HashMap::default();
+        prev.insert(from, from);
         let mut q = VecDeque::from([from]);
         while let Some(m) = q.pop_front() {
             if m == to {
@@ -280,7 +298,7 @@ impl Graph {
     }
 
     pub fn find(&self, kind: ModuleKind, id: &str) -> Option<usize> {
-        self.index.get(&(kind, id.to_string())).copied()
+        self.index[kind as usize].get(id).copied()
     }
 
     /// Resolve a user-typed module reference: exact id, root-relative path,
@@ -397,10 +415,10 @@ impl PackageJsons {
             None => format!("@types/{pkg}"),
         };
         for dir in file.ancestors().skip(1) {
-            let deps = self
-                .by_dir
-                .entry(dir.to_path_buf())
-                .or_insert_with(|| PackageDeps::read(&dir.join("package.json")));
+            if !self.by_dir.contains_key(dir) {
+                self.by_dir.insert(dir.to_path_buf(), PackageDeps::read(&dir.join("package.json")));
+            }
+            let deps = &self.by_dir[dir];
             if let Some(d) = deps
                 && let Some(k) = d.kind_of(pkg).or_else(|| d.kind_of(&types_pkg)) {
                     return k;

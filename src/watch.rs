@@ -9,31 +9,46 @@ use anyhow::Result;
 use notify::event::ModifyKind;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher as _};
 
-use crate::scan::SOURCE_EXTS;
+use crate::scan::has_source_ext;
 
 /// How long the filesystem must be quiet before a batch of changes is released
 /// (editors and formatters often write several times per save).
 const QUIET: Duration = Duration::from_millis(150);
 
+/// A settled batch of filesystem changes.
+#[derive(Debug, Default)]
+pub struct Changes {
+    pub paths: BTreeSet<PathBuf>,
+    /// tsconfig / package.json / tangle.toml changed: everything must be rebuilt.
+    pub config: bool,
+}
+
+impl Changes {
+    /// Forces a full rebuild.
+    pub fn full() -> Self {
+        Changes { config: true, ..Default::default() }
+    }
+
+    /// "src/a.ts" or "src/a.ts +3 more".
+    pub fn describe(&self, root: &Path) -> String {
+        let rel = |p: &PathBuf| p.strip_prefix(root).unwrap_or(p).to_string_lossy().replace('\\', "/");
+        match (self.paths.iter().next(), self.paths.len()) {
+            (None, _) => String::new(),
+            (Some(p), 1) => rel(p),
+            (Some(p), n) => format!("{} +{} more", rel(p), n - 1),
+        }
+    }
+}
+
 pub struct Watcher {
     _inner: RecommendedWatcher,
-    rx: Receiver<PathBuf>,
-    root: PathBuf,
-    pending: BTreeSet<PathBuf>,
+    rx: Receiver<(PathBuf, bool)>,
+    pending: Changes,
     last_event: Option<Instant>,
 }
 
-/// Files whose changes can alter the dependency graph or the rules.
-fn relevant(p: &Path) -> bool {
-    if p.components().any(|c| matches!(c.as_os_str().to_str(), Some("node_modules" | ".git" | "target"))) {
-        return false;
-    }
-    let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
-    SOURCE_EXTS.contains(&ext)
-        || name == "tangle.toml"
-        || name == "package.json"
-        || (name.starts_with("tsconfig") && ext == "json")
+fn is_config(name: &str) -> bool {
+    name == "tangle.toml" || name == "package.json" || (name.starts_with("tsconfig") && name.ends_with(".json"))
 }
 
 impl Watcher {
@@ -41,36 +56,46 @@ impl Watcher {
         let (tx, rx) = channel();
         let mut inner = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
             let Ok(ev) = res else { return };
-            let content_change = match ev.kind {
-                EventKind::Create(_) | EventKind::Remove(_) => true,
-                EventKind::Modify(ModifyKind::Metadata(_)) => false,
-                EventKind::Modify(_) => true,
-                _ => false,
+            let structural = match ev.kind {
+                EventKind::Create(_) | EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(_)) => true,
+                EventKind::Modify(ModifyKind::Metadata(_)) => return,
+                EventKind::Modify(_) => false,
+                _ => return,
             };
-            if content_change {
-                for p in ev.paths.into_iter().filter(|p| relevant(p)) {
-                    let _ = tx.send(p);
+            for p in ev.paths {
+                let ignored = p
+                    .components()
+                    .any(|c| matches!(c.as_os_str().to_str(), Some("node_modules" | ".git" | "target")));
+                if ignored {
+                    continue;
+                }
+                let config = p.file_name().and_then(|n| n.to_str()).is_some_and(is_config);
+                // Extension-less paths matter only when created/removed/renamed:
+                // they may be directories full of sources.
+                if config || has_source_ext(&p) || (structural && p.extension().is_none()) {
+                    let _ = tx.send((p, config));
                 }
             }
         })?;
         inner.watch(root, RecursiveMode::Recursive)?;
-        Ok(Self { _inner: inner, rx, root: root.to_path_buf(), pending: BTreeSet::new(), last_event: None })
+        Ok(Self { _inner: inner, rx, pending: Changes::default(), last_event: None })
     }
 
-    fn take(&mut self) -> Vec<String> {
+    fn add(&mut self, (path, config): (PathBuf, bool)) {
+        self.pending.paths.insert(path);
+        self.pending.config |= config;
+        self.last_event = Some(Instant::now());
+    }
+
+    fn take(&mut self) -> Changes {
         self.last_event = None;
         std::mem::take(&mut self.pending)
-            .into_iter()
-            .map(|p| p.strip_prefix(&self.root).unwrap_or(&p).to_string_lossy().replace('\\', "/"))
-            .collect()
     }
 
-    /// Non-blocking. Returns the changed paths (root-relative) once a burst of
-    /// changes has settled, otherwise `None`.
-    pub fn poll(&mut self) -> Option<Vec<String>> {
-        while let Ok(p) = self.rx.try_recv() {
-            self.pending.insert(p);
-            self.last_event = Some(Instant::now());
+    /// Non-blocking: returns the changes once a burst has settled.
+    pub fn poll(&mut self) -> Option<Changes> {
+        while let Ok(ev) = self.rx.try_recv() {
+            self.add(ev);
         }
         match self.last_event {
             Some(t) if t.elapsed() >= QUIET => Some(self.take()),
@@ -78,26 +103,15 @@ impl Watcher {
         }
     }
 
-    /// Blocks until a burst of changes has settled; returns the changed paths.
-    pub fn wait(&mut self) -> Vec<String> {
-        let Ok(first) = self.rx.recv() else { return vec![] };
-        self.pending.insert(first);
+    /// Blocks until a burst of changes has settled.
+    pub fn wait(&mut self) -> Changes {
+        let Ok(first) = self.rx.recv() else { return Changes::default() };
+        self.add(first);
         loop {
             match self.rx.recv_timeout(QUIET) {
-                Ok(p) => {
-                    self.pending.insert(p);
-                }
-                Err(RecvTimeoutError::Timeout) | Err(RecvTimeoutError::Disconnected) => return self.take(),
+                Ok(ev) => self.add(ev),
+                Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => return self.take(),
             }
         }
-    }
-}
-
-/// "src/a.ts" or "src/a.ts +3 more".
-pub fn describe(changed: &[String]) -> String {
-    match changed {
-        [] => "changes".into(),
-        [one] => one.clone(),
-        [first, rest @ ..] => format!("{first} +{} more", rest.len()),
     }
 }

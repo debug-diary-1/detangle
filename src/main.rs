@@ -155,18 +155,62 @@ pub struct Analysis {
     pub config_path: Option<PathBuf>,
 }
 
-fn analyze(path: &Path, config: Option<&Path>) -> Result<Analysis> {
-    let dir = std::fs::canonicalize(path).with_context(|| format!("{} not found", path.display()))?;
-    if !dir.is_dir() {
-        bail!("{} is not a directory", path.display());
+/// A loaded project whose scan can be kept up to date incrementally.
+pub struct Project {
+    dir: PathBuf,
+    root: PathBuf,
+    config_arg: Option<PathBuf>,
+    cfg: Config,
+    config_path: Option<PathBuf>,
+    session: scan::Session,
+}
+
+impl Project {
+    fn open(path: &Path, config: Option<&Path>) -> Result<Self> {
+        let dir = std::fs::canonicalize(path).with_context(|| format!("{} not found", path.display()))?;
+        if !dir.is_dir() {
+            bail!("{} is not a directory", path.display());
+        }
+        let root = config::find_root(&dir);
+        let (cfg, config_path): (Config, _) = config::load(&root, config)?;
+        rules::validate(&cfg.forbidden)?;
+        let session = scan::Session::new(&root, &dir, &cfg.options)?;
+        Ok(Project { dir, root, config_arg: config.map(Path::to_path_buf), cfg, config_path, session })
     }
-    let root = config::find_root(&dir);
-    let (cfg, config_path): (Config, _) = config::load(&root, config)?;
-    rules::validate(&cfg.forbidden)?;
-    let scan = scan::scan(&root, &dir, &cfg.options)?;
-    let graph = Graph::build(&root, scan, &cfg.options);
-    let violations = rules::evaluate(&graph, &cfg.forbidden)?;
-    Ok(Analysis { graph, violations, config_path })
+
+    fn analyze(&self) -> Result<Analysis> {
+        let graph = Graph::build(&self.root, self.session.files(), self.session.work, &self.cfg.options);
+        let violations = rules::evaluate(&graph, &self.cfg.forbidden)?;
+        Ok(Analysis { graph, violations, config_path: self.config_path.clone() })
+    }
+
+    /// Applies filesystem changes and re-analyses. Returns the new analysis
+    /// and a one-line description of the work done. On error (e.g. a
+    /// half-edited tangle.toml) the previous state is kept.
+    fn rebuild(&mut self, changes: &watch::Changes) -> Result<(Analysis, String)> {
+        let t = std::time::Instant::now();
+        if changes.config {
+            *self = Project::open(&self.dir, self.config_arg.as_deref())?;
+        } else {
+            self.session.update(&changes.paths.iter().cloned().collect::<Vec<_>>())?;
+        }
+        let a = self.analyze()?;
+        let w = self.session.work;
+        let work = if changes.config {
+            format!("full rebuild of {} files", w.reparsed)
+        } else if w.walked && w.reresolved > w.reparsed {
+            format!("{} reparsed, all re-resolved", w.reparsed)
+        } else {
+            report::plural(w.reparsed, "file") + " reparsed"
+        };
+        let ms = t.elapsed().as_secs_f64() * 1000.0;
+        let what = if changes.paths.is_empty() { String::new() } else { format!("{} · ", changes.describe(&self.root)) };
+        Ok((a, format!("↻ {what}{work} · {ms:.0}ms")))
+    }
+}
+
+fn analyze(path: &Path, config: Option<&Path>) -> Result<Analysis> {
+    Project::open(path, config)?.analyze()
 }
 
 fn main() -> ExitCode {
@@ -187,30 +231,40 @@ fn run() -> Result<ExitCode> {
             if !std::io::stdout().is_terminal() {
                 bail!("the explorer needs a terminal; try `tangle check` or `tangle stats`");
             }
-            let a = analyze(&t.path, t.config.as_deref())?;
-            let watcher = if no_watch { None } else { watch::Watcher::new(&a.graph.root).ok() };
-            tui::run(a, || analyze(&t.path, t.config.as_deref()), watcher)?;
+            let mut project = Project::open(&t.path, t.config.as_deref())?;
+            let a = project.analyze()?;
+            let watcher = if no_watch { None } else { watch::Watcher::new(&project.root).ok() };
+            tui::run(a, |changes| project.rebuild(changes), watcher)?;
         }
         Cmd::Watch { target: t } => {
             let dir = std::fs::canonicalize(&t.path).with_context(|| format!("{} not found", t.path.display()))?;
             let root = config::find_root(&dir);
             let mut watcher = watch::Watcher::new(&root)?;
-            let mut changed: Option<Vec<String>> = None;
+            let mut project: Option<Project> = None;
+            let mut changes = watch::Changes::full();
             loop {
-                let started = std::time::Instant::now();
-                let result = analyze(&t.path, t.config.as_deref());
+                // Incremental when we have a project; otherwise (first run, or
+                // after a config error) try a full open.
+                let result = match project.as_mut() {
+                    Some(p) => p.rebuild(&changes).map(|(a, s)| (a, Some(s))),
+                    None => Project::open(&t.path, t.config.as_deref()).and_then(|p| {
+                        let a = p.analyze()?;
+                        project = Some(p);
+                        Ok((a, None))
+                    }),
+                };
                 print!("\x1b[2J\x1b[3J\x1b[H");
-                if let Some(c) = &changed {
-                    println!("{}\n", p.dim(&format!("↻ {} · rebuilt in {:.0}ms", watch::describe(c), started.elapsed().as_secs_f64() * 1000.0)));
-                }
                 match result {
-                    Ok(a) => {
+                    Ok((a, status)) => {
+                        if let Some(s) = status {
+                            println!("{}\n", p.dim(&s));
+                        }
                         print!("{}", report::text(&a.graph, &a.violations, 0));
                     }
                     Err(e) => println!("{} {e:#}", p.red("error:")),
                 }
                 println!("{}", p.dim(&format!("\nwatching {} — ctrl-c to stop", root.display())));
-                changed = Some(watcher.wait());
+                changes = watcher.wait();
             }
         }
         Cmd::Check { target, format, strict, baseline, write_baseline } => {

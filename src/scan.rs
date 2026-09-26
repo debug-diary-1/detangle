@@ -2,6 +2,8 @@
 //! (oxc_resolver). Everything per-file runs in parallel.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
+use std::time::SystemTime;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Instant;
@@ -75,17 +77,160 @@ pub struct Import {
     pub target: Target,
 }
 
+/// (modified time, size): a cheap proxy for "content changed".
+type Stamp = Option<(SystemTime, u64)>;
+
+fn stamp(p: &Path) -> Stamp {
+    let m = std::fs::metadata(p).ok()?;
+    Some((m.modified().ok()?, m.len()))
+}
+
 #[derive(Debug)]
 pub struct ScannedFile {
     pub path: PathBuf,
     pub imports: Vec<Import>,
     pub parse_errors: usize,
+    /// Unresolved imports, kept so a file can be re-resolved without re-parsing.
+    raw: Vec<(String, ImportFlags)>,
+    stamp: Stamp,
 }
 
-pub struct Scan {
-    pub files: Vec<ScannedFile>,
+/// What a rebuild had to do.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Work {
+    pub walked: bool,
+    pub reparsed: usize,
+    pub reresolved: usize,
     pub walk_ms: f64,
     pub parse_ms: f64,
+}
+
+/// A long-lived scan of a project that can be updated incrementally.
+pub struct Session {
+    root: PathBuf,
+    dir: PathBuf,
+    opts: Options,
+    resolver: Resolvers,
+    files: Vec<ScannedFile>,
+    index: HashMap<PathBuf, usize>,
+    pub work: Work,
+}
+
+impl Session {
+    /// Full scan: walk, parse and resolve everything.
+    pub fn new(root: &Path, dir: &Path, opts: &Options) -> Result<Self> {
+        let t = Instant::now();
+        let paths = discover(root, dir, opts)?;
+        let walk_ms = ms(t);
+        let t = Instant::now();
+        let resolver = make_resolver(root, opts);
+        let files: Vec<ScannedFile> = paths.into_par_iter().map(|p| parse_file(p, None).0).collect();
+        let mut s = Session {
+            root: root.to_path_buf(),
+            dir: dir.to_path_buf(),
+            opts: opts.clone(),
+            resolver,
+            files,
+            index: HashMap::new(),
+            work: Work::default(),
+        };
+        s.resolve_all();
+        s.reindex();
+        let n = s.files.len();
+        s.work = Work { walked: true, reparsed: n, reresolved: n, walk_ms, parse_ms: ms(t) };
+        Ok(s)
+    }
+
+    pub fn files(&self) -> &[ScannedFile] {
+        &self.files
+    }
+
+    fn reindex(&mut self) {
+        self.index = self.files.iter().enumerate().map(|(i, f)| (f.path.clone(), i)).collect();
+    }
+
+    fn resolve_all(&mut self) {
+        let r = &self.resolver;
+        self.files.par_iter_mut().for_each(|f| f.resolve(r));
+    }
+
+    /// Brings the scan up to date after the given paths changed. Config
+    /// changes (tsconfig, package.json) need a fresh `Session` instead.
+    pub fn update(&mut self, changed: &[PathBuf]) -> Result<()> {
+        let mut work = Work::default();
+        // Decide from the filesystem, not from event kinds: watchers (notably
+        // macOS FSEvents) often report a plain save as a create.
+        let structural = changed.iter().any(|p| match self.index.get(p) {
+            Some(_) => !p.is_file(),                                      // removed
+            None if p.is_file() => has_source_ext(p),                     // added
+            None => p.is_dir() || p.extension().is_none(),                // dir created/removed/renamed
+        });
+
+        let t = Instant::now();
+        let dirty: Vec<usize> = if structural {
+            let paths = discover(&self.root, &self.dir, &self.opts)?;
+            work.walked = true;
+            work.walk_ms = ms(t);
+            let same_set = paths.len() == self.files.len() && paths.iter().zip(&self.files).all(|(p, f)| *p == f.path);
+            if !same_set {
+                // The set of files changed, so any import may now resolve
+                // differently (`./foo` → the new `foo.ts`): re-resolve all
+                // with fresh resolver caches, but only re-parse what changed.
+                let t = Instant::now();
+                let mut old: HashMap<PathBuf, ScannedFile> = self.files.drain(..).map(|f| (f.path.clone(), f)).collect();
+                let reused: Vec<(PathBuf, Option<ScannedFile>)> =
+                    paths.into_iter().map(|p| { let o = old.remove(&p); (p, o) }).collect();
+                let parsed: Vec<(ScannedFile, bool)> =
+                    reused.into_par_iter().map(|(p, prev)| parse_file(p, prev)).collect();
+                work.reparsed = parsed.iter().filter(|(_, fresh)| *fresh).count();
+                self.files = parsed.into_iter().map(|(f, _)| f).collect();
+                self.resolver = make_resolver(&self.root, &self.opts);
+                self.resolve_all();
+                self.reindex();
+                work.reresolved = self.files.len();
+                work.parse_ms = ms(t);
+                self.work = work;
+                return Ok(());
+            }
+            // Same files (e.g. an editor's atomic save): re-parse the reported
+            // paths plus anything whose stamp moved.
+            let mut v: Vec<usize> = (0..self.files.len())
+                .into_par_iter()
+                .filter(|&i| stamp(&self.files[i].path) != self.files[i].stamp)
+                .collect();
+            v.extend(changed.iter().filter_map(|p| self.index.get(p).copied()));
+            v
+        } else {
+            changed.iter().filter_map(|p| self.index.get(p).copied()).collect()
+        };
+        let mut dirty = dirty;
+        dirty.sort_unstable();
+        dirty.dedup();
+
+        // Same file set: only re-parse and re-resolve the files that changed.
+        let t = Instant::now();
+        let r = &self.resolver;
+        let updated: Vec<(usize, ScannedFile)> = dirty
+            .par_iter()
+            .map(|&i| {
+                let (mut f, _) = parse_file(self.files[i].path.clone(), None);
+                f.resolve(r);
+                (i, f)
+            })
+            .collect();
+        work.reparsed = updated.len();
+        work.reresolved = updated.len();
+        for (i, f) in updated {
+            self.files[i] = f;
+        }
+        work.parse_ms = ms(t);
+        self.work = work;
+        Ok(())
+    }
+}
+
+fn ms(t: Instant) -> f64 {
+    t.elapsed().as_secs_f64() * 1000.0
 }
 
 fn globset(patterns: &[String]) -> Result<Option<GlobSet>> {
@@ -132,20 +277,6 @@ pub fn discover(root: &Path, dir: &Path, opts: &Options) -> Result<Vec<PathBuf>>
     let mut files = found.into_inner().unwrap();
     files.sort();
     Ok(files)
-}
-
-pub fn scan(root: &Path, dir: &Path, opts: &Options) -> Result<Scan> {
-    let t = Instant::now();
-    let paths = discover(root, dir, opts)?;
-    let walk_ms = t.elapsed().as_secs_f64() * 1000.0;
-
-    let t = Instant::now();
-    let resolver = make_resolver(root, opts);
-    let files = paths
-        .into_par_iter()
-        .map(|path| scan_file(&resolver, path))
-        .collect();
-    Ok(Scan { files, walk_ms, parse_ms: t.elapsed().as_secs_f64() * 1000.0 })
 }
 
 /// The main resolver honours tsconfig; `plain` ignores it. A tsconfig that
@@ -199,23 +330,38 @@ thread_local! {
     static ALLOC: RefCell<Allocator> = RefCell::new(Allocator::default());
 }
 
-fn scan_file(resolver: &Resolvers, path: PathBuf) -> ScannedFile {
+/// Parses `path`, reusing `prev`'s imports when the file is unchanged
+/// (returns whether it actually parsed). The result still needs `resolve`.
+fn parse_file(path: PathBuf, prev: Option<ScannedFile>) -> (ScannedFile, bool) {
+    let st = stamp(&path);
+    if let Some(prev) = prev
+        && prev.stamp.is_some()
+        && prev.stamp == st
+    {
+        return (ScannedFile { imports: vec![], ..prev }, false);
+    }
     let Ok(source) = std::fs::read_to_string(&path) else {
-        return ScannedFile { path, imports: vec![], parse_errors: 1 };
+        return (ScannedFile { path, imports: vec![], parse_errors: 1, raw: vec![], stamp: st }, true);
     };
     let (raw, parse_errors) = ALLOC.with(|a| {
         let mut alloc = a.borrow_mut();
         alloc.reset();
         extract(&alloc, &path, &source)
     });
-    let imports = raw
-        .into_iter()
-        .filter_map(|(specifier, flags)| {
-            let target = resolve(resolver, &path, &specifier)?;
-            Some(Import { specifier, flags, target })
-        })
-        .collect();
-    ScannedFile { path, imports, parse_errors }
+    (ScannedFile { path, imports: vec![], parse_errors, raw, stamp: st }, true)
+}
+
+impl ScannedFile {
+    fn resolve(&mut self, resolver: &Resolvers) {
+        self.imports = self
+            .raw
+            .iter()
+            .filter_map(|(specifier, flags)| {
+                let target = resolve(resolver, &self.path, specifier)?;
+                Some(Import { specifier: specifier.clone(), flags: *flags, target })
+            })
+            .collect();
+    }
 }
 
 fn extract(alloc: &Allocator, path: &Path, source: &str) -> (Vec<(String, ImportFlags)>, usize) {
@@ -243,6 +389,10 @@ fn extract(alloc: &Allocator, path: &Path, source: &str) -> (Vec<(String, Import
         errors += ret.diagnostics.len();
     }
     (c.out, errors)
+}
+
+pub fn has_source_ext(p: &Path) -> bool {
+    p.extension().and_then(|e| e.to_str()).is_some_and(|e| SOURCE_EXTS.contains(&e))
 }
 
 pub fn is_builtin(spec: &str) -> bool {
@@ -487,6 +637,62 @@ mod tests {
         let svelte = "<script>\n  import Button from './Button.svelte';\n  $: doubled = count * 2;\n</script>\n<Button />";
         let (got, errors) = extract(&alloc, Path::new("B.svelte"), svelte);
         assert_eq!((got.len(), errors), (1, 0));
+    }
+
+    /// Incremental updates must always agree with a fresh full scan.
+    #[test]
+    fn incremental_matches_full_scan() {
+        let tmp = std::env::temp_dir().join(format!("tangle-inc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("src/feat")).unwrap();
+        let root = std::fs::canonicalize(&tmp).unwrap();
+        let w = |rel: &str, body: &str| std::fs::write(root.join(rel), body).unwrap();
+        let snapshot = |s: &Session| -> Vec<String> {
+            let mut v: Vec<String> = s
+                .files()
+                .iter()
+                .flat_map(|f| {
+                    let from = f.path.strip_prefix(&root).unwrap().display().to_string();
+                    let mut v: Vec<String> =
+                        f.imports.iter().map(|i| format!("{from}: {} -> {:?}", i.specifier, i.target)).collect();
+                    v.push(format!("{from} (file)"));
+                    v
+                })
+                .map(|l| l.replace(&root.display().to_string(), "<root>"))
+                .collect();
+            v.sort();
+            v
+        };
+        let opts = Options::default();
+        let src = root.join("src");
+        w("src/a.ts", "import './b'; import './c'; import './feat/x';");
+        w("src/b.ts", "export {}");
+        w("src/feat/x.ts", "import '../b'");
+        let mut s = Session::new(&root, &src, &opts).unwrap();
+
+        let mut step = |name: &str, changed: &[&str], expect_walk: bool| {
+            let paths: Vec<PathBuf> = changed.iter().map(|p| root.join(p)).collect();
+            s.update(&paths).unwrap();
+            assert_eq!(s.work.walked, expect_walk, "{name}: walked");
+            let fresh = Session::new(&root, &src, &opts).unwrap();
+            assert_eq!(snapshot(&s), snapshot(&fresh), "{name}: incremental != full");
+        };
+
+        w("src/b.ts", "import './a'");
+        step("edit", &["src/b.ts"], false);
+        w("src/c.ts", "export {}"); // a.ts's './c' now resolves
+        step("add file", &["src/c.ts"], true);
+        std::fs::remove_file(root.join("src/b.ts")).unwrap(); // './b' now unresolved
+        step("delete file", &["src/b.ts"], true);
+        std::fs::rename(root.join("src/feat"), root.join("src/feature")).unwrap();
+        step("rename dir", &["src/feat", "src/feature"], true);
+        w("src/a.ts", "import './c'; import './x';");
+        w("src/a.ts", "import './c'; import './y';"); // same size, same instant
+        step("same-size edit", &["src/a.ts"], false);
+        w("src/tmp.ts", "import './c'");
+        std::fs::rename(root.join("src/tmp.ts"), root.join("src/c.ts")).unwrap(); // atomic save
+        step("atomic save", &["src/tmp.ts", "src/c.ts"], false); // file set unchanged: no walk
+        std::fs::remove_dir_all(&tmp).unwrap();
     }
 
     #[test]

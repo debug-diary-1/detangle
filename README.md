@@ -46,6 +46,18 @@ The project root is the nearest ancestor containing `tangle.toml`, or else `pack
 | `c` / `v` | jump to this module's cycle or violations |
 | `r` | rebuild now (it rebuilds automatically on changes; `--no-watch` turns that off) |
 
+## Incremental rebuilds
+
+`tangle watch` and the explorer keep the parsed project in memory. What gets redone depends on the change:
+
+| Change | Work redone | VS Code `src/` |
+|---|---|---|
+| Edit a file | re-parse and re-resolve only that file, then rebuild the graph and rerun the rules | ~70 ms |
+| Add, remove or rename a file or folder | walk the tree again and re-resolve every import (the new file can change what `./foo` points to); only new or changed files are re-parsed | ~170 ms |
+| Change `tsconfig`, `package.json` or `tangle.toml`, or press `r` | full rebuild | ~300 ms |
+
+tangle checks the filesystem itself to decide whether files were added or removed, because watchers (notably macOS FSEvents) often report an ordinary save as a new file. Atomic saves from editors like vim and JetBrains therefore count as plain edits.
+
 ## What it understands
 
 - **Vue and Svelte** single-file components. It reads the `<script>` and `<script setup>` blocks, uses the `lang="ts"` or `lang="tsx"` setting, and treats `<script src>` as an import. Template content and `<svelte:head>` browser scripts are ignored.

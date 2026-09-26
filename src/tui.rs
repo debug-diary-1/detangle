@@ -1,6 +1,6 @@
 //! Interactive explorer.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::Result;
 use ratatui::DefaultTerminal;
@@ -11,7 +11,7 @@ use ratatui::widgets::*;
 use crate::Analysis;
 use crate::config::Severity;
 use crate::graph::{Edge, Graph, ModuleKind};
-use crate::watch::{self, Watcher};
+use crate::watch::{Changes, Watcher};
 
 #[derive(Clone, Copy, PartialEq)]
 enum Tab {
@@ -106,12 +106,16 @@ struct Snapshot {
 
 enum Outcome {
     Quit,
-    Reload(Vec<String>),
+    Reload(Changes),
 }
 
 /// Runs the explorer. With a watcher, the graph is rebuilt whenever relevant
 /// files change; `r` forces a rebuild either way.
-pub fn run(initial: Analysis, reanalyze: impl Fn() -> Result<Analysis>, mut watcher: Option<Watcher>) -> Result<()> {
+pub fn run(
+    initial: Analysis,
+    mut rebuild: impl FnMut(&Changes) -> Result<(Analysis, String)>,
+    mut watcher: Option<Watcher>,
+) -> Result<()> {
     let mut terminal = ratatui::init();
     let res = (|| -> Result<()> {
         let mut analysis = initial;
@@ -130,11 +134,10 @@ pub fn run(initial: Analysis, reanalyze: impl Fn() -> Result<Analysis>, mut watc
             };
             snapshot = Some(app.snapshot());
             drop(app);
-            let t = Instant::now();
-            status = Some(match reanalyze() {
-                Ok(a) => {
+            status = Some(match rebuild(&changed) {
+                Ok((a, summary)) => {
                     analysis = a;
-                    format!("↻ {} · rebuilt in {:.0}ms", watch::describe(&changed), t.elapsed().as_secs_f64() * 1000.0)
+                    summary
                 }
                 Err(e) => format!("✖ reload failed: {e:#}"),
             });
@@ -295,7 +298,7 @@ impl<'a> App<'a> {
                 self.on_key(k);
             }
             if std::mem::take(&mut self.reload) {
-                return Ok(Outcome::Reload(vec![]));
+                return Ok(Outcome::Reload(Changes::full()));
             }
             if let Some(changed) = watcher.as_mut().and_then(Watcher::poll) {
                 return Ok(Outcome::Reload(changed));
