@@ -3,7 +3,9 @@ mod graph;
 mod report;
 mod rules;
 mod scan;
+mod sfc;
 mod tui;
+mod watch;
 
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -43,8 +45,19 @@ struct Target {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Explore the dependency graph interactively (default)
-    Tui(Target),
+    /// Explore the dependency graph interactively (default); live-reloads on changes
+    Tui {
+        #[command(flatten)]
+        target: Target,
+        /// Don't rebuild when files change
+        #[arg(long)]
+        no_watch: bool,
+    },
+    /// Re-run the rules whenever files change
+    Watch {
+        #[command(flatten)]
+        target: Target,
+    },
     /// Check the rules; exits non-zero when errors are found
     Check {
         #[command(flatten)]
@@ -169,13 +182,36 @@ fn main() -> ExitCode {
 fn run() -> Result<ExitCode> {
     let cli = Cli::parse();
     let p = Paint::stdout();
-    match cli.cmd.unwrap_or(Cmd::Tui(cli.target)) {
-        Cmd::Tui(t) => {
+    match cli.cmd.unwrap_or(Cmd::Tui { target: cli.target, no_watch: false }) {
+        Cmd::Tui { target: t, no_watch } => {
             if !std::io::stdout().is_terminal() {
                 bail!("the explorer needs a terminal; try `tangle check` or `tangle stats`");
             }
             let a = analyze(&t.path, t.config.as_deref())?;
-            tui::run(&a)?;
+            let watcher = if no_watch { None } else { watch::Watcher::new(&a.graph.root).ok() };
+            tui::run(a, || analyze(&t.path, t.config.as_deref()), watcher)?;
+        }
+        Cmd::Watch { target: t } => {
+            let dir = std::fs::canonicalize(&t.path).with_context(|| format!("{} not found", t.path.display()))?;
+            let root = config::find_root(&dir);
+            let mut watcher = watch::Watcher::new(&root)?;
+            let mut changed: Option<Vec<String>> = None;
+            loop {
+                let started = std::time::Instant::now();
+                let result = analyze(&t.path, t.config.as_deref());
+                print!("\x1b[2J\x1b[3J\x1b[H");
+                if let Some(c) = &changed {
+                    println!("{}\n", p.dim(&format!("↻ {} · rebuilt in {:.0}ms", watch::describe(c), started.elapsed().as_secs_f64() * 1000.0)));
+                }
+                match result {
+                    Ok(a) => {
+                        print!("{}", report::text(&a.graph, &a.violations, 0));
+                    }
+                    Err(e) => println!("{} {e:#}", p.red("error:")),
+                }
+                println!("{}", p.dim(&format!("\nwatching {} — ctrl-c to stop", root.display())));
+                changed = Some(watcher.wait());
+            }
         }
         Cmd::Check { target, format, strict, baseline, write_baseline } => {
             let mut a = analyze(&target.path, target.config.as_deref())?;

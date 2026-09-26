@@ -138,3 +138,33 @@ fn baseline_suppresses_known_violations() {
     std::fs::remove_file(bl).unwrap();
     assert_eq!(code, 0);
 }
+
+#[test]
+fn vue_svelte_angular() {
+    let (out, _) = tangle(&["graph", "tests/fixtures/frameworks", "-f", "json", "--externals"]);
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let mut edges: Vec<String> = vec![];
+    for m in v["modules"].as_array().unwrap() {
+        for d in m["dependencies"].as_array().unwrap() {
+            let types: Vec<&str> = d["types"].as_array().unwrap().iter().map(|t| t.as_str().unwrap()).collect();
+            edges.push(format!("{} -> {} [{}]", m["id"].as_str().unwrap(), d["module"].as_str().unwrap(), types.join(",")));
+        }
+    }
+    for want in [
+        "src/main.ts -> src/App.vue [local]",
+        "src/main.ts -> src/components/Button.svelte [local]",
+        "src/App.vue -> src/components/Hello.vue [local]",
+        "src/App.vue -> src/types.ts [local,type-only]",
+        "src/components/Hello.vue -> src/util.ts [local]",
+        "src/components/Button.svelte -> src/util.ts [local]",
+        "src/components/Button.svelte -> svelte [npm]",
+        "src/app/app.component.ts -> @angular/core [npm]",
+        "src/app/app.component.ts -> src/app/app.component.html [local,resource]",
+        "src/app/app.component.ts -> ./missing.component.css [unresolvable,resource]",
+        "src/app/app.component.ts -> src/util.ts [local,dynamic]",
+    ] {
+        assert!(edges.iter().any(|e| e == want), "missing {want}\n{edges:#?}");
+    }
+    // `<script>` inside the template and the CDN script in <svelte:head> are not imports.
+    assert!(!edges.iter().any(|e| e.contains("cdn.example") || e.contains("not code")), "{edges:#?}");
+}

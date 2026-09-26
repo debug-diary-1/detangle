@@ -14,15 +14,17 @@ use oxc_ast::ast::*;
 use oxc_ast_visit::{Visit, walk};
 use oxc_parser::Parser;
 use oxc_resolver::{
-    ResolveError, ResolveOptions, Resolver, TsconfigDiscovery, TsconfigOptions, TsconfigReferences,
+    Resolution, ResolveError, ResolveOptions, Resolver, TsconfigDiscovery, TsconfigOptions, TsconfigReferences,
 };
 use oxc_span::SourceType;
 use rayon::prelude::*;
 use serde::Serialize;
 
 use crate::config::Options;
+use crate::sfc;
 
-pub const SOURCE_EXTS: &[&str] = &["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"];
+pub const SOURCE_EXTS: &[&str] =
+    &["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs", "vue", "svelte"];
 
 const NODE_BUILTINS: &[&str] = &[
     "assert", "assert/strict", "async_hooks", "buffer", "child_process", "cluster", "console",
@@ -40,6 +42,8 @@ pub struct ImportFlags {
     pub dynamic: bool,
     pub require: bool,
     pub reexport: bool,
+    /// Angular component resource (`templateUrl`, `styleUrl(s)`).
+    pub resource: bool,
 }
 
 impl ImportFlags {
@@ -51,6 +55,7 @@ impl ImportFlags {
             dynamic: self.dynamic && o.dynamic,
             require: self.require || o.require,
             reexport: self.reexport || o.reexport,
+            resource: self.resource && o.resource,
         }
     }
 }
@@ -143,7 +148,25 @@ pub fn scan(root: &Path, dir: &Path, opts: &Options) -> Result<Scan> {
     Ok(Scan { files, walk_ms, parse_ms: t.elapsed().as_secs_f64() * 1000.0 })
 }
 
-fn make_resolver(root: &Path, opts: &Options) -> Resolver {
+/// The main resolver honours tsconfig; `plain` ignores it. A tsconfig that
+/// can't be loaded (e.g. `extends` a package that isn't installed) makes the
+/// main resolver fail for *every* import in its scope, so failures are
+/// retried without it.
+struct Resolvers {
+    main: Resolver,
+    plain: Resolver,
+}
+
+impl Resolvers {
+    fn resolve_file(&self, from: &Path, spec: &str) -> Result<Resolution, ResolveError> {
+        self.main.resolve_file(from, spec).or_else(|e| match e {
+            ResolveError::Ignored(_) => Err(e),
+            _ => self.plain.resolve_file(from, spec).map_err(|_| e),
+        })
+    }
+}
+
+fn make_resolver(root: &Path, opts: &Options) -> Resolvers {
     let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
     let tsconfig = match &opts.tsconfig {
         Some(p) => TsconfigDiscovery::Manual(TsconfigOptions {
@@ -152,10 +175,10 @@ fn make_resolver(root: &Path, opts: &Options) -> Resolver {
         }),
         None => TsconfigDiscovery::Auto,
     };
-    Resolver::new(ResolveOptions {
+    let main = Resolver::new(ResolveOptions {
         tsconfig: Some(tsconfig),
         extensions: s(&[
-            ".ts", ".tsx", ".d.ts", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs", ".json", ".node",
+            ".ts", ".tsx", ".d.ts", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs", ".json", ".node", ".vue", ".svelte",
         ]),
         // TS ESM projects write `./foo.js` while the file on disk is `foo.ts`.
         extension_alias: vec![
@@ -167,14 +190,16 @@ fn make_resolver(root: &Path, opts: &Options) -> Resolver {
         condition_names: s(&["import", "require", "node", "default", "types"]),
         main_fields: s(&["module", "main", "types"]),
         ..ResolveOptions::default()
-    })
+    });
+    let plain = main.clone_with_options(ResolveOptions { tsconfig: None, ..main.options().clone() });
+    Resolvers { main, plain }
 }
 
 thread_local! {
     static ALLOC: RefCell<Allocator> = RefCell::new(Allocator::default());
 }
 
-fn scan_file(resolver: &Resolver, path: PathBuf) -> ScannedFile {
+fn scan_file(resolver: &Resolvers, path: PathBuf) -> ScannedFile {
     let Ok(source) = std::fs::read_to_string(&path) else {
         return ScannedFile { path, imports: vec![], parse_errors: 1 };
     };
@@ -194,11 +219,30 @@ fn scan_file(resolver: &Resolver, path: PathBuf) -> ScannedFile {
 }
 
 fn extract(alloc: &Allocator, path: &Path, source: &str) -> (Vec<(String, ImportFlags)>, usize) {
-    let st = SourceType::from_path(path).unwrap_or_default();
-    let ret = Parser::new(alloc, source, st).parse();
     let mut c = Collector::default();
-    c.visit_program(&ret.program);
-    (c.out, ret.diagnostics.len())
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    if !matches!(ext, "vue" | "svelte") {
+        let st = SourceType::from_path(path).unwrap_or_default();
+        let ret = Parser::new(alloc, source, st).parse();
+        c.visit_program(&ret.program);
+        return (c.out, ret.diagnostics.len());
+    }
+    let mut errors = 0;
+    for block in sfc::script_blocks(source) {
+        if let Some(src) = block.src {
+            c.push(src, ImportFlags::default());
+            continue;
+        }
+        let st = match block.lang {
+            "ts" => SourceType::ts(),
+            "tsx" => SourceType::tsx(),
+            _ => SourceType::jsx(),
+        };
+        let ret = Parser::new(alloc, block.content, st).parse();
+        c.visit_program(&ret.program);
+        errors += ret.diagnostics.len();
+    }
+    (c.out, errors)
 }
 
 pub fn is_builtin(spec: &str) -> bool {
@@ -233,7 +277,7 @@ fn package_from_path(p: &Path) -> Option<String> {
     }
 }
 
-fn resolve(resolver: &Resolver, from: &Path, spec: &str) -> Option<Target> {
+fn resolve(resolver: &Resolvers, from: &Path, spec: &str) -> Option<Target> {
     if is_builtin(spec) {
         let name = spec.trim_start_matches("node:");
         return Some(Target::Builtin(name.to_string()));
@@ -273,6 +317,7 @@ fn resolve(resolver: &Resolver, from: &Path, spec: &str) -> Option<Target> {
 #[derive(Default)]
 struct Collector {
     out: Vec<(String, ImportFlags)>,
+    decorator_depth: usize,
 }
 
 impl Collector {
@@ -346,6 +391,34 @@ impl<'a> Visit<'a> for Collector {
         }
     }
 
+    fn visit_decorator(&mut self, it: &Decorator<'a>) {
+        self.decorator_depth += 1;
+        walk::walk_decorator(self, it);
+        self.decorator_depth -= 1;
+    }
+
+    /// Angular `@Component({ templateUrl, styleUrl, styleUrls })`.
+    fn visit_object_property(&mut self, it: &ObjectProperty<'a>) {
+        if self.decorator_depth > 0 {
+            let urls: Vec<&str> = match it.key.static_name().as_deref() {
+                Some("templateUrl" | "styleUrl") => static_string(&it.value).into_iter().collect(),
+                Some("styleUrls") => match &it.value {
+                    Expression::ArrayExpression(a) => {
+                        a.elements.iter().filter_map(|e| e.as_expression().and_then(static_string)).collect()
+                    }
+                    _ => vec![],
+                },
+                _ => vec![],
+            };
+            for url in urls {
+                // Angular resolves these relative to the component even without "./".
+                let spec = if is_bare(url) { format!("./{url}") } else { url.to_string() };
+                self.push(&spec, ImportFlags { resource: true, ..Default::default() });
+            }
+        }
+        walk::walk_object_property(self, it);
+    }
+
     fn visit_ts_import_type(&mut self, it: &TSImportType<'a>) {
         self.push(it.source.value.as_str(), ImportFlags { type_only: true, ..Default::default() });
         walk::walk_ts_import_type(self, it);
@@ -384,6 +457,36 @@ mod tests {
         assert!(got[3].1.reexport && got[4].1.reexport);
         assert!(got[5].1.dynamic);
         assert!(got[6].1.require && got[7].1.require && got[9].1.require);
+    }
+
+    #[test]
+    fn angular_component_resources() {
+        let got = specs(
+            r#"
+            import { Component } from "@angular/core";
+            @Component({
+              selector: "app-root",
+              templateUrl: "./app.component.html",
+              styleUrls: ["./app.component.css", "theme.scss"],
+            })
+            export class AppComponent { config = { templateUrl: "not-a-decorator" }; }
+            "#,
+        );
+        let res: Vec<_> = got.iter().filter(|(_, f)| f.resource).map(|(s, _)| s.as_str()).collect();
+        assert_eq!(res, ["./app.component.html", "./app.component.css", "./theme.scss"]);
+    }
+
+    #[test]
+    fn vue_and_svelte_scripts() {
+        let alloc = Allocator::default();
+        let vue = "<template><Child/></template>\n<script setup lang=\"ts\">\nimport Child from './Child.vue'\nimport type { P } from './types'\n</script>\n";
+        let (got, errors) = extract(&alloc, Path::new("A.vue"), vue);
+        assert_eq!(errors, 0);
+        assert_eq!(got.iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>(), ["./Child.vue", "./types"]);
+        assert!(got[1].1.type_only);
+        let svelte = "<script>\n  import Button from './Button.svelte';\n  $: doubled = count * 2;\n</script>\n<Button />";
+        let (got, errors) = extract(&alloc, Path::new("B.svelte"), svelte);
+        assert_eq!((got.len(), errors), (1, 0));
     }
 
     #[test]

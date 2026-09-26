@@ -1,6 +1,9 @@
 //! Interactive explorer.
 
+use std::time::{Duration, Instant};
+
 use anyhow::Result;
+use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::prelude::*;
 use ratatui::widgets::*;
@@ -8,6 +11,7 @@ use ratatui::widgets::*;
 use crate::Analysis;
 use crate::config::Severity;
 use crate::graph::{Edge, Graph, ModuleKind};
+use crate::watch::{self, Watcher};
 
 #[derive(Clone, Copy, PartialEq)]
 enum Tab {
@@ -81,20 +85,60 @@ struct App<'a> {
     hot_rows: [Vec<usize>; 3],
     cycle_paths: Vec<Vec<usize>>,
     history: Vec<usize>,
+    live: bool,
+    reload: bool,
+    status: Option<String>,
 }
 
-pub fn run(a: &Analysis) -> Result<()> {
-    let mut app = App::new(a);
+/// UI state that survives a reload; modules are keyed by id since indices change.
+struct Snapshot {
+    tab: Tab,
+    pane: Pane,
+    sort: Sort,
+    show_ext: bool,
+    filter: String,
+    selected: Option<(ModuleKind, String)>,
+    history: Vec<(ModuleKind, String)>,
+    vsel: Option<usize>,
+    csel: Option<usize>,
+    hot_col: usize,
+}
+
+enum Outcome {
+    Quit,
+    Reload(Vec<String>),
+}
+
+/// Runs the explorer. With a watcher, the graph is rebuilt whenever relevant
+/// files change; `r` forces a rebuild either way.
+pub fn run(initial: Analysis, reanalyze: impl Fn() -> Result<Analysis>, mut watcher: Option<Watcher>) -> Result<()> {
     let mut terminal = ratatui::init();
     let res = (|| -> Result<()> {
-        while !app.quit {
-            terminal.draw(|f| app.draw(f))?;
-            if let Event::Key(k) = event::read()?
-                && k.kind == KeyEventKind::Press {
-                    app.on_key(k);
+        let mut analysis = initial;
+        let mut snapshot: Option<Snapshot> = None;
+        let mut status: Option<String> = None;
+        loop {
+            let mut app = App::new(&analysis);
+            app.live = watcher.is_some();
+            app.status = status.take();
+            if let Some(s) = snapshot.take() {
+                app.restore(s);
+            }
+            let changed = match app.event_loop(&mut terminal, &mut watcher)? {
+                Outcome::Quit => return Ok(()),
+                Outcome::Reload(changed) => changed,
+            };
+            snapshot = Some(app.snapshot());
+            drop(app);
+            let t = Instant::now();
+            status = Some(match reanalyze() {
+                Ok(a) => {
+                    analysis = a;
+                    format!("↻ {} · rebuilt in {:.0}ms", watch::describe(&changed), t.elapsed().as_secs_f64() * 1000.0)
                 }
+                Err(e) => format!("✖ reload failed: {e:#}"),
+            });
         }
-        Ok(())
     })();
     ratatui::restore();
     res
@@ -173,6 +217,7 @@ fn edge_tags(e: &Edge) -> Vec<Span<'static>> {
             "dynamic" => ("dynamic", Color::Yellow),
             "require" => ("cjs", Color::Yellow),
             "reexport" => ("re-export", Color::DarkGray),
+            "resource" => ("resource", Color::DarkGray),
             _ => continue,
         };
         v.push(Span::raw(" "));
@@ -229,9 +274,74 @@ impl<'a> App<'a> {
             hot_rows,
             cycle_paths,
             history: vec![],
+            live: false,
+            reload: false,
+            status: None,
         };
         app.rebuild();
         app
+    }
+
+    fn event_loop(&mut self, terminal: &mut DefaultTerminal, watcher: &mut Option<Watcher>) -> Result<Outcome> {
+        loop {
+            terminal.draw(|f| self.draw(f))?;
+            if self.quit {
+                return Ok(Outcome::Quit);
+            }
+            if event::poll(Duration::from_millis(100))?
+                && let Event::Key(k) = event::read()?
+                && k.kind == KeyEventKind::Press
+            {
+                self.on_key(k);
+            }
+            if std::mem::take(&mut self.reload) {
+                return Ok(Outcome::Reload(vec![]));
+            }
+            if let Some(changed) = watcher.as_mut().and_then(Watcher::poll) {
+                return Ok(Outcome::Reload(changed));
+            }
+        }
+    }
+
+    fn key_of(&self, m: usize) -> (ModuleKind, String) {
+        (self.g.modules[m].kind, self.g.modules[m].id.clone())
+    }
+
+    fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            tab: self.tab,
+            pane: self.pane,
+            sort: self.sort,
+            show_ext: self.show_ext,
+            filter: self.filter.clone(),
+            selected: self.current().map(|m| self.key_of(m)),
+            history: self.history.iter().map(|&m| self.key_of(m)).collect(),
+            vsel: self.vlist.selected(),
+            csel: self.clist.selected(),
+            hot_col: self.hot_col,
+        }
+    }
+
+    fn restore(&mut self, s: Snapshot) {
+        let g = self.g;
+        let find = |(k, id): &(ModuleKind, String)| g.find(*k, id);
+        self.pane = s.pane;
+        self.sort = s.sort;
+        self.show_ext = s.show_ext;
+        self.filter = s.filter;
+        self.history = s.history.iter().filter_map(find).collect();
+        self.rebuild();
+        if let Some(m) = s.selected.as_ref().and_then(find)
+            && let Some(pos) = self.rows.iter().position(|&r| r == m)
+        {
+            self.list.select(Some(pos));
+            self.reset_side();
+        }
+        let clamp = |sel: Option<usize>, len: usize| if len == 0 { None } else { Some(sel.unwrap_or(0).min(len - 1)) };
+        self.vlist.select(clamp(s.vsel, self.a.violations.len()));
+        self.clist.select(clamp(s.csel, g.cycles.len()));
+        self.hot_col = s.hot_col;
+        self.tab = s.tab;
     }
 
     fn current(&self) -> Option<usize> {
@@ -344,6 +454,7 @@ impl<'a> App<'a> {
         match k.code {
             KeyCode::Char('q') => self.quit = true,
             KeyCode::Char('?') => self.help = true,
+            KeyCode::Char('r') => self.reload = true,
             KeyCode::Char(c @ '1'..='4') => self.tab = TABS[c as usize - '1' as usize],
             KeyCode::Tab => self.tab = TABS[(idx + 1) % TABS.len()],
             KeyCode::BackTab => self.tab = TABS[(idx + TABS.len() - 1) % TABS.len()],
@@ -836,7 +947,7 @@ impl<'a> App<'a> {
             match self.tab {
                 Tab::Modules => &[
                     ("↑↓", "move"), ("←→", "pane"), ("⏎", "open"), ("⌫", "back"), ("/", "filter"),
-                    ("s", "sort"), ("e", "externals"), ("c", "cycle"), ("v", "violations"), ("⇥", "tab"), ("?", "help"), ("q", "quit"),
+                    ("s", "sort"), ("e", "externals"), ("⇥", "tab"), ("?", "help"), ("q", "quit"),
                 ],
                 Tab::Violations => &[("↑↓", "move"), ("⏎", "go to source"), ("t", "go to target"), ("⇥", "tab"), ("q", "quit")],
                 Tab::Cycles => &[("↑↓", "move"), ("⏎", "open module"), ("⇥", "tab"), ("q", "quit")],
@@ -851,7 +962,19 @@ impl<'a> App<'a> {
         if !self.history.is_empty() && self.tab == Tab::Modules {
             spans.push(Span::styled(format!("history {}", self.history.len()), Style::new().dim()));
         }
-        f.render_widget(Line::from(spans), area);
+        let mut right = vec![];
+        if let Some(st) = &self.status {
+            let color = if st.starts_with('✖') { Color::Red } else { Color::Gray };
+            right.push(Span::styled(format!("{st}  "), Style::new().fg(color)));
+        }
+        if self.live {
+            right.push(Span::styled("● live ", Style::new().fg(Color::Green).bold()));
+        }
+        let right = Line::from(right);
+        let [left_area, right_area] =
+            Layout::horizontal([Constraint::Min(0), Constraint::Length(right.width() as u16)]).areas(area);
+        f.render_widget(Line::from(spans), left_area);
+        f.render_widget(right, right_area);
     }
 
     fn draw_help(&self, f: &mut Frame) {
@@ -869,6 +992,7 @@ impl<'a> App<'a> {
             row("←→ h l", "switch pane (modules / imports / imported by)"),
             row("⏎", "follow the selected dependency"),
             row("⌫ b", "go back"),
+            row("r", "rebuild now (auto-rebuilds on file changes)"),
             Line::raw(""),
             Line::styled(" Modules", Style::new().bold()),
             row("/", "filter (space-separated terms, all must match)"),

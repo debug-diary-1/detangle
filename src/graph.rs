@@ -336,6 +336,9 @@ fn edge_types(base: &'static str, f: ImportFlags) -> Vec<&'static str> {
     if f.reexport {
         t.push("reexport");
     }
+    if f.resource {
+        t.push("resource");
+    }
     t
 }
 

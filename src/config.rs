@@ -14,7 +14,7 @@ pub const DEFAULT_CONFIG: &str = r#"# tangle.toml — dependency rules for this 
 #
 # Dependency types usable in `to.dependency_types`:
 #   local, npm, npm-dev, npm-peer, npm-optional, npm-undeclared, core,
-#   unresolvable, type-only, dynamic, require, reexport
+#   unresolvable, type-only, dynamic, require, reexport, resource
 
 [options]
 # Globs of files to analyse (empty = everything that isn't gitignored).
