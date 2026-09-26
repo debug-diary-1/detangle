@@ -369,6 +369,10 @@ fn extract(alloc: &Allocator, path: &Path, source: &str) -> (Vec<(String, Import
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
     if !matches!(ext, "vue" | "svelte") {
         let st = SourceType::from_path(path).unwrap_or_default();
+        // React projects routinely put JSX in plain .js files (CRA, Vite and
+        // Babel all accept it); TS files keep their own rules, since
+        // `<T>value` casts conflict with JSX there.
+        let st = if st.is_javascript() { st.with_jsx(true) } else { st };
         let ret = Parser::new(alloc, source, st).parse();
         c.visit_program(&ret.program);
         return (c.out, ret.diagnostics.len());
@@ -693,6 +697,19 @@ mod tests {
         std::fs::rename(root.join("src/tmp.ts"), root.join("src/c.ts")).unwrap(); // atomic save
         step("atomic save", &["src/tmp.ts", "src/c.ts"], false); // file set unchanged: no walk
         std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn jsx_in_plain_js_files() {
+        let alloc = Allocator::default();
+        let src = "import Button from './Button';\nexport default () => <div><Button /></div>;\n";
+        for file in ["App.js", "App.mjs", "App.cjs", "App.jsx"] {
+            let (got, errors) = extract(&alloc, Path::new(file), src);
+            assert_eq!((got.len(), errors), (1, 0), "{file}");
+        }
+        // TS keeps `<T>x` casts working.
+        let (_, errors) = extract(&alloc, Path::new("a.ts"), "const x = <number>y;");
+        assert_eq!(errors, 0);
     }
 
     #[test]

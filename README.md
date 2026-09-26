@@ -1,6 +1,6 @@
 # tangle
 
-Fast dependency analysis and architecture rules for JavaScript/TypeScript, Vue, Svelte and Angular, with a live-reloading terminal explorer. It does the same job as the JavaScript rules tool, written in Rust on top of the [oxc](https://oxc.rs) parser and resolver.
+Fast dependency analysis and architecture rules for JavaScript/TypeScript, React, Vue, Svelte and Angular, with a live-reloading terminal explorer. It does the same job as the JavaScript rules tool, written in Rust on top of the [oxc](https://oxc.rs) parser and resolver.
 
 | VS Code `src/` (9.6k files, 113k deps) | time |
 |---|---|
@@ -60,6 +60,7 @@ tangle checks the filesystem itself to decide whether files were added or remove
 
 ## What it understands
 
+- **React**: JSX/TSX, including JSX in plain `.js` files as Create React App, Vite and Babel setups allow. `React.lazy(() => import(...))` shows up as a dynamic import.
 - **Vue and Svelte** single-file components. It reads the `<script>` and `<script setup>` blocks, uses the `lang="ts"` or `lang="tsx"` setting, and treats `<script src>` as an import. Template content and `<svelte:head>` browser scripts are ignored.
 - **Angular**: `templateUrl`, `styleUrl` and `styleUrls` in decorators become dependencies of type `resource`, so a missing template or stylesheet is reported. Lazy `loadComponent` and `loadChildren` routes are picked up as dynamic imports.
 - If a tsconfig can't be loaded (for example, it `extends` a package that isn't installed), tangle falls back to resolving without it, so a single broken tsconfig doesn't make every import unresolvable.
