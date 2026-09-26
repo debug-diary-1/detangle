@@ -1,0 +1,1 @@
+{ "name": "basic", "dependencies": { "react": "^18" }, "devDependencies": { "vitest": "^1", "@types/estree": "^1" } }
