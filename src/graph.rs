@@ -50,6 +50,9 @@ pub struct Edge {
     /// Dependency types, e.g. `["npm-dev", "type-only"]`.
     pub types: Vec<&'static str>,
     pub circular: bool,
+    /// npm package declared in more than one package.json section.
+    #[serde(skip)]
+    pub multi_type: bool,
 }
 
 #[derive(Debug, Default, Clone, Copy, Serialize)]
@@ -101,21 +104,38 @@ impl Graph {
         let mut pkgs = PackageJsons::default();
         // Target → edge, for deduplicating imports within the current file.
         let mut seen: HashMap<usize, usize> = HashMap::default();
-        let mut bases: Vec<&'static str> = vec![];
+        let mut bases: Vec<Vec<&'static str>> = vec![];
+        let filter = PathFilter::new(opts);
         for (from, f) in files.iter().enumerate() {
             seen.clear();
             for imp in &f.imports {
+                if opts.ignore_type_only && imp.flags.type_only {
+                    continue;
+                }
+                if filter.active() {
+                    let keep = match &imp.target {
+                        Target::Local(p) => filter.keep(&[&g.rel(p)]),
+                        Target::Npm(pkg) => filter.keep(&[pkg, &format!("node_modules/{pkg}/")]),
+                        Target::Builtin(n) => filter.keep(&[n]),
+                        Target::Unresolved => filter.keep(&[&imp.specifier]),
+                    };
+                    if !keep {
+                        continue;
+                    }
+                }
                 let (to, base) = match &imp.target {
                     Target::Local(p) => match by_path.get(p.as_path()) {
-                        Some(&i) => (i, "local"),
-                        None => (g.intern(ModuleKind::Local, g.rel(p)), "local"),
+                        Some(&i) => (i, vec!["local"]),
+                        None => (g.intern(ModuleKind::Local, g.rel(p)), vec!["local"]),
                     },
                     Target::Npm(pkg) => {
                         let base = pkgs.classify(&f.path, pkg);
                         (g.intern_ref(ModuleKind::Npm, pkg), base)
                     }
-                    Target::Builtin(n) => (g.intern_ref(ModuleKind::Builtin, n), "core"),
-                    Target::Unresolved => (g.intern_ref(ModuleKind::Unresolved, &imp.specifier), "unresolvable"),
+                    Target::Builtin(n) => (g.intern_ref(ModuleKind::Builtin, n), vec!["core"]),
+                    Target::Unresolved => {
+                        (g.intern_ref(ModuleKind::Unresolved, &imp.specifier), vec!["unresolvable"])
+                    }
                 };
                 match seen.get(&to) {
                     Some(&e) => g.edges[e].flags = g.edges[e].flags.merge(imp.flags),
@@ -129,12 +149,14 @@ impl Graph {
                             flags: imp.flags,
                             types: vec![],
                             circular: false,
+                            multi_type: false,
                         });
                     }
                 }
             }
         }
         for (e, base) in g.edges.iter_mut().zip(bases) {
+            e.multi_type = base.len() > 1;
             e.types = edge_types(base, e.flags);
         }
 
@@ -234,6 +256,18 @@ impl Graph {
     /// BFS for the shortest module path `from → … → to` (inclusive).
     /// With `circular_only`, only edges marked circular are followed.
     pub fn path_between(&self, from: usize, to: usize, circular_only: bool) -> Option<Vec<usize>> {
+        self.path_where(from, to, |e| !circular_only || e.circular, |_| true)
+    }
+
+    /// BFS for the shortest path `from → … → to` using only edges satisfying
+    /// `edge_ok` and intermediate/end modules satisfying `node_ok`.
+    pub fn path_where(
+        &self,
+        from: usize,
+        to: usize,
+        edge_ok: impl Fn(&Edge) -> bool,
+        node_ok: impl Fn(usize) -> bool,
+    ) -> Option<Vec<usize>> {
         let mut prev: HashMap<usize, usize> = HashMap::default();
         prev.insert(from, from);
         let mut q = VecDeque::from([from]);
@@ -250,7 +284,7 @@ impl Graph {
             }
             for &e in &self.out[m] {
                 let edge = &self.edges[e];
-                if circular_only && !edge.circular {
+                if !edge_ok(edge) || !node_ok(edge.to) {
                     continue;
                 }
                 if let std::collections::hash_map::Entry::Vacant(v) = prev.entry(edge.to) {
@@ -272,6 +306,24 @@ impl Graph {
             for &e in adj {
                 let next = if forward { self.edges[e].to } else { self.edges[e].from };
                 if seen.insert(next) {
+                    q.push_back(next);
+                }
+            }
+        }
+        seen
+    }
+
+    /// Modules reachable from `start` (forward) or reaching it (backward),
+    /// following only edges satisfying `edge_ok`.
+    pub fn closure_where(&self, start: usize, forward: bool, edge_ok: impl Fn(&Edge) -> bool) -> HashSet<usize> {
+        let mut seen = HashSet::from([start]);
+        let mut q = VecDeque::from([start]);
+        while let Some(m) = q.pop_front() {
+            let adj = if forward { &self.out[m] } else { &self.inc[m] };
+            for &e in adj {
+                let edge = &self.edges[e];
+                let next = if forward { edge.to } else { edge.from };
+                if edge_ok(edge) && seen.insert(next) {
                     q.push_back(next);
                 }
             }
@@ -340,8 +392,10 @@ impl Graph {
     }
 }
 
-fn edge_types(base: &'static str, f: ImportFlags) -> Vec<&'static str> {
-    let mut t = vec![base];
+/// `base` is the kind of target — for npm packages every package.json
+/// section declaring it (e.g. `["npm", "npm-dev"]`), primary first.
+fn edge_types(base: Vec<&'static str>, f: ImportFlags) -> Vec<&'static str> {
+    let mut t = base;
     if f.type_only {
         t.push("type-only");
     }
@@ -385,18 +439,13 @@ impl PackageDeps {
         })
     }
 
-    fn kind_of(&self, name: &str) -> Option<&'static str> {
-        if self.deps.contains(name) {
-            Some("npm")
-        } else if self.peer.contains(name) {
-            Some("npm-peer")
-        } else if self.optional.contains(name) {
-            Some("npm-optional")
-        } else if self.dev.contains(name) {
-            Some("npm-dev")
-        } else {
-            None
-        }
+    /// Every section declaring `name`, most significant first.
+    fn kinds_of(&self, name: &str) -> Vec<&'static str> {
+        [(&self.deps, "npm"), (&self.peer, "npm-peer"), (&self.optional, "npm-optional"), (&self.dev, "npm-dev")]
+            .into_iter()
+            .filter(|(set, _)| set.contains(name))
+            .map(|(_, kind)| kind)
+            .collect()
     }
 }
 
@@ -409,7 +458,9 @@ struct PackageJsons {
 impl PackageJsons {
     /// Classifies `pkg` as imported from `file` by walking up through every
     /// enclosing package.json (so monorepo root deps count).
-    fn classify(&mut self, file: &Path, pkg: &str) -> &'static str {
+    /// Returns every dependency type the package is declared as, in the
+    /// nearest package.json that declares it.
+    fn classify(&mut self, file: &Path, pkg: &str) -> Vec<&'static str> {
         let types_pkg = match pkg.strip_prefix('@') {
             Some(s) => format!("@types/{}", s.replacen('/', "__", 1)),
             None => format!("@types/{pkg}"),
@@ -419,11 +470,38 @@ impl PackageJsons {
                 self.by_dir.insert(dir.to_path_buf(), PackageDeps::read(&dir.join("package.json")));
             }
             let deps = &self.by_dir[dir];
-            if let Some(d) = deps
-                && let Some(k) = d.kind_of(pkg).or_else(|| d.kind_of(&types_pkg)) {
-                    return k;
+            if let Some(d) = deps {
+                let kinds = d.kinds_of(pkg);
+                let kinds = if kinds.is_empty() { d.kinds_of(&types_pkg) } else { kinds };
+                if !kinds.is_empty() {
+                    return kinds;
                 }
+            }
         }
-        "npm-undeclared"
+        vec!["npm-undeclared"]
+    }
+}
+
+/// `include_only` / `exclude_path` from the options.
+pub struct PathFilter {
+    include: Option<fancy_regex::Regex>,
+    exclude: Option<fancy_regex::Regex>,
+}
+
+impl PathFilter {
+    /// Patterns were validated when the config was loaded.
+    pub fn new(opts: &Options) -> Self {
+        let re = |p: &Option<crate::config::Pat>| p.as_ref().and_then(|p| fancy_regex::Regex::new(&p.0).ok());
+        PathFilter { include: re(&opts.include_only), exclude: re(&opts.exclude_path) }
+    }
+
+    pub fn active(&self) -> bool {
+        self.include.is_some() || self.exclude.is_some()
+    }
+
+    /// Kept when some name is included and no name is excluded.
+    pub fn keep(&self, names: &[&str]) -> bool {
+        let hit = |r: &fancy_regex::Regex| names.iter().any(|n| r.is_match(n).unwrap_or(false));
+        self.include.as_ref().is_none_or(hit) && !self.exclude.as_ref().is_some_and(hit)
     }
 }

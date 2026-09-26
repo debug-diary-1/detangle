@@ -1,11 +1,8 @@
 # tangle
 
-Fast dependency analysis and architecture rules for JavaScript/TypeScript, React, Vue, Svelte and Angular, with a live-reloading terminal explorer. It does the same job as the JavaScript rules tool, written in Rust on top of the [oxc](https://oxc.rs) parser and resolver.
+Fast dependency analysis and architecture rules for JavaScript/TypeScript, React, Vue, Svelte and Angular, with a live-reloading terminal explorer. Written in Rust on top of the [oxc](https://oxc.rs) parser and resolver.
 
-| VS Code `src/` (9.6k files, 113k deps) | time |
-|---|---|
-| the JavaScript rules tool 18.4 | 40.3 s |
-| **tangle** | **0.29 s** |
+Analyses VS Code's `src/` (9.6k files, 113k dependencies) in **0.3 s**.
 
 ## Install
 
@@ -72,17 +69,26 @@ tangle checks the filesystem itself to decide whether files were added or remove
 
 ## Rules
 
-`tangle.toml` (run `tangle init` for a commented starter):
+`tangle.toml` (run `tangle init` for a commented starter). Paths are regular expressions matched against root-relative paths. Lookarounds work, and a list of patterns means "any of these".
 
 ```toml
+allowed_severity = "error"    # for [[allowed]] below; top-level keys go before any table
+
 [options]
-exclude = ["**/node_modules/**", "**/dist/**"]
+exclude = ["**/node_modules/**", "**/dist/**"]   # globs of files to skip
+include_only = '^src/'        # regex: keep only these modules (sources and targets)
+exclude_path = '^src/generated/'
 cycles_ignore_type_only = true
 
 [[forbidden]]
 name = "no-circular"
-severity = "warn"            # error | warn | info | off
+severity = "warn"             # error | warn | info | off
 to = { circular = true }
+
+# cycles that pass through a module in shared/ (considers every cycle, not one arbitrary one)
+[[forbidden]]
+name = "no-cycles-via-shared"
+to = { circular = true, via = '^src/shared/' }
 
 # $1 refers to capture groups of from.path
 [[forbidden]]
@@ -96,12 +102,38 @@ to = { path = '^src/features/', path_not = '^src/features/$1/' }
 name = "no-dead-files"
 from = { path = '^src/index\.ts$' }
 to = { path = '^src/', reachable = false }
+
+[[forbidden]]
+name = "no-copyleft"
+severity = "error"
+to = { license = 'GPL|AGPL' }
+
+# rules about modules themselves: "shared" code must have 2+ dependents
+[[forbidden]]
+name = "utils-must-be-shared"
+module = { path = '^src/utils/', number_of_dependents_less_than = 2 }
+
+# allow-list: anything not matching an allowed rule is reported as not-in-allowed
+# (with `allowed_severity`, set at the top of the file)
+[[allowed]]
+from = { path = '^src/ui/' }
+to = { path = ['^src/ui/', '^src/domain/'] }
+
+# modules matching `module` must depend on something matching `to`
+[[required]]
+name = "controllers-extend-base"
+severity = "error"
+module = { path = '\.controller\.ts$' }
+to = { path = 'base-controller' }
 ```
 
-`from`: `path`, `path_not`, `orphan`
-`to`: `path`, `path_not`, `circular`, `dependency_types`, `dependency_types_not`, `could_not_resolve`, `type_only`, `dynamic`, `reachable`, `more_unstable`
+| | conditions |
+|---|---|
+| `from` | `path`, `path_not`, `orphan` |
+| `to` | `path`, `path_not`, `circular`, `via`, `via_only`, `dependency_types`, `dependency_types_not`, `could_not_resolve`, `type_only`, `dynamic`, `reachable`, `more_unstable`, `more_than_one_dependency_type`, `license`, `license_not` |
+| `module` | `path`, `path_not`, `number_of_dependents_less_than`, `number_of_dependents_more_than` (with `from` restricting which dependents count) |
 
-Dependency types: `local`, `npm`, `npm-dev`, `npm-peer`, `npm-optional`, `npm-undeclared`, `core`, `unresolvable`, `type-only`, `dynamic`, `require`, `reexport`, `resource`.
+Dependency types: `local`, `npm`, `npm-dev`, `npm-peer`, `npm-optional`, `npm-undeclared`, `core`, `unresolvable`, `type-only`, `dynamic`, `require`, `reexport`, `resource`, `import`, `aliased` (a tsconfig-paths, `#imports` or workspace import of a local file), `deprecated` (the installed package is marked deprecated). A package declared in several `package.json` sections has all of the matching types, for example `npm` and `npm-dev`. npm packages can also be matched as `node_modules/<name>/`.
 
 ### Adopting rules in a legacy codebase
 
@@ -109,3 +141,18 @@ Dependency types: `local`, `npm`, `npm-dev`, `npm-peer`, `npm-optional`, `npm-un
 tangle check --write-baseline .tangle-baseline.json   # record today's violations
 tangle check --baseline .tangle-baseline.json         # fail only on new ones
 ```
+
+## Migrating an existing JavaScript rules config
+
+If your rules live in a JavaScript config (a `.js`, `.cjs`, `.mjs` or `.json` file exporting `forbidden`, `allowed` and `required` rules plus `options`), tangle can run it directly or convert it. JavaScript configs are evaluated with Node, so `extends` chains that point at preset packages work too. Plain JSON configs don't need Node.
+
+```sh
+tangle check -c rules.config.js                   # run it as is
+tangle init --from rules.config.js                # convert it to tangle.toml
+```
+
+Rule names, severities, regexes (including `$1` groups and lookarounds), `allowed`, `allowedSeverity`, `required`, module rules, `via`/`viaOnly`, licenses, dependency types and the `exclude`/`includeOnly`/`tsConfig`/`tsPreCompilationDeps` options all carry over. A rule that uses something tangle can't honour exactly (for example `scope: "folder"` or the `npm-bundled` type) is skipped with a warning rather than silently loosened. A skipped `allowed` rule gets a louder warning, because dropping it adds violations.
+
+## Cycle detection
+
+On VS Code, checked against an independently computed ground truth, tangle finds all 1,945 dependencies that sit on a cycle, with no false positives. Each one is reported with a concrete cycle as evidence. `via` and `viaOnly` consider every simple cycle through a dependency, not just one arbitrary cycle.

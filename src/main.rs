@@ -1,5 +1,6 @@
 mod config;
 mod graph;
+mod migrate;
 mod report;
 mod rules;
 mod scan;
@@ -130,6 +131,9 @@ enum Cmd {
     Init {
         #[arg(default_value = ".")]
         path: PathBuf,
+        /// Convert a JavaScript rules config (.js/.cjs/.mjs/.json) to tangle.toml
+        #[arg(long, value_name = "FILE")]
+        from: Option<PathBuf>,
         #[arg(long)]
         force: bool,
     },
@@ -162,6 +166,8 @@ pub struct Project {
     config_arg: Option<PathBuf>,
     cfg: Config,
     config_path: Option<PathBuf>,
+    /// Notes from loading the config (e.g. JavaScript config import warnings).
+    notes: Vec<String>,
     session: scan::Session,
 }
 
@@ -172,15 +178,27 @@ impl Project {
             bail!("{} is not a directory", path.display());
         }
         let root = config::find_root(&dir);
-        let (cfg, config_path): (Config, _) = config::load(&root, config)?;
-        rules::validate(&cfg.forbidden)?;
+        let loaded = config::load(&root, config)?;
+        let cfg: Config = loaded.config;
+        rules::validate(&cfg).with_context(|| match &loaded.path {
+            Some(p) => format!("in {}", p.display()),
+            None => "in the built-in rules".into(),
+        })?;
         let session = scan::Session::new(&root, &dir, &cfg.options)?;
-        Ok(Project { dir, root, config_arg: config.map(Path::to_path_buf), cfg, config_path, session })
+        Ok(Project {
+            dir,
+            root,
+            config_arg: config.map(Path::to_path_buf),
+            cfg,
+            config_path: loaded.path,
+            notes: loaded.notes,
+            session,
+        })
     }
 
     fn analyze(&self) -> Result<Analysis> {
         let graph = Graph::build(&self.root, self.session.files(), self.session.work, &self.cfg.options);
-        let violations = rules::evaluate(&graph, &self.cfg.forbidden)?;
+        let violations = rules::evaluate(&graph, &self.cfg)?;
         Ok(Analysis { graph, violations, config_path: self.config_path.clone() })
     }
 
@@ -210,7 +228,18 @@ impl Project {
 }
 
 fn analyze(path: &Path, config: Option<&Path>) -> Result<Analysis> {
-    Project::open(path, config)?.analyze()
+    Project::open(path, config)?.announce().analyze()
+}
+
+impl Project {
+    /// Prints config notes (once) to stderr.
+    fn announce(self) -> Self {
+        let p = Paint::stderr();
+        for n in &self.notes {
+            eprintln!("{}", p.dim(&format!("note: {n}")));
+        }
+        self
+    }
 }
 
 fn main() -> ExitCode {
@@ -231,7 +260,7 @@ fn run() -> Result<ExitCode> {
             if !std::io::stdout().is_terminal() {
                 bail!("the explorer needs a terminal; try `tangle check` or `tangle stats`");
             }
-            let mut project = Project::open(&t.path, t.config.as_deref())?;
+            let mut project = Project::open(&t.path, t.config.as_deref())?.announce();
             let a = project.analyze()?;
             let watcher = if no_watch { None } else { watch::Watcher::new(&project.root).ok() };
             tui::run(a, |changes| project.rebuild(changes), watcher)?;
@@ -377,13 +406,34 @@ fn run() -> Result<ExitCode> {
             let a = analyze(&target.path, target.config.as_deref())?;
             print!("{}", report::stats(&a.graph, &a.violations, top));
         }
-        Cmd::Init { path, force } => {
+        Cmd::Init { path, from, force } => {
             let file = path.join(config::CONFIG_FILE);
             if file.exists() && !force {
                 bail!("{} already exists (use --force to overwrite)", file.display());
             }
-            std::fs::write(&file, config::DEFAULT_CONFIG)?;
-            println!("{} {}", p.green("created"), file.display());
+            match from {
+                Some(src) => {
+                    let imported = migrate::import(&src)?;
+                    std::fs::write(&file, migrate::to_toml(&imported, &src)?)?;
+                    let c = &imported.config;
+                    println!(
+                        "{} {} from {} ({} forbidden, {} allowed, {} required)",
+                        p.green("created"),
+                        file.display(),
+                        src.display(),
+                        c.forbidden.len(),
+                        c.allowed.len(),
+                        c.required.len()
+                    );
+                    for w in &imported.warnings {
+                        println!("  {} {w}", p.yellow("not converted:"));
+                    }
+                }
+                None => {
+                    std::fs::write(&file, config::DEFAULT_CONFIG)?;
+                    println!("{} {}", p.green("created"), file.display());
+                }
+            }
         }
     }
     Ok(ExitCode::SUCCESS)

@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+
+use crate::migrate;
 use serde::{Deserialize, Serialize};
 
 pub const CONFIG_FILE: &str = "tangle.toml";
@@ -14,7 +16,8 @@ pub const DEFAULT_CONFIG: &str = r#"# tangle.toml — dependency rules for this 
 #
 # Dependency types usable in `to.dependency_types`:
 #   local, npm, npm-dev, npm-peer, npm-optional, npm-undeclared, core,
-#   unresolvable, type-only, dynamic, require, reexport, resource
+#   unresolvable, type-only, dynamic, require, reexport, resource, import,
+#   aliased, deprecated
 
 [options]
 # Globs of files to analyse (empty = everything that isn't gitignored).
@@ -78,13 +81,22 @@ to = { path = '\.(spec|test)\.[cm]?[jt]sx?$|(^|/)__(tests|mocks)__/' }
 # to = { path = '^src/', path_not = '\.(spec|test)\.ts$', reachable = false }
 "#;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
     pub options: Options,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub forbidden: Vec<Rule>,
+    /// Allow-list: every dependency must match at least one of these, or it
+    /// is reported as `not-in-allowed` with `allowed_severity`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed: Vec<AllowedRule>,
+    #[serde(default)]
+    pub allowed_severity: Severity,
+    /// Modules matching `module` must depend on something matching `to`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required: Vec<RequiredRule>,
 }
 
 impl Default for Config {
@@ -93,12 +105,49 @@ impl Default for Config {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+impl Config {
+    pub fn empty() -> Self {
+        Config {
+            options: Options::default(),
+            forbidden: vec![],
+            allowed: vec![],
+            allowed_severity: Severity::Warn,
+            required: vec![],
+        }
+    }
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+fn yes() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Options {
+    /// Globs of files to analyse.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub include: Vec<String>,
+    /// Globs of files to skip.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub exclude: Vec<String>,
+    /// Regex: only modules (files *and* dependency targets) matching this are
+    /// part of the graph.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub include_only: Option<Pat>,
+    /// Regex: modules (files and dependency targets) matching this are left
+    /// out of the graph entirely.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exclude_path: Option<Pat>,
+    #[serde(default = "yes")]
     pub cycles_ignore_type_only: bool,
+    /// Drop `import type` dependencies from the graph altogether.
+    #[serde(skip_serializing_if = "is_false")]
+    pub ignore_type_only: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tsconfig: Option<String>,
 }
 
@@ -107,29 +156,95 @@ impl Default for Options {
         Self {
             include: vec![],
             exclude: vec!["**/node_modules/**".into()],
+            include_only: None,
+            exclude_path: None,
             cycles_ignore_type_only: true,
+            ignore_type_only: false,
             tsconfig: None,
         }
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// A regular expression, written as a string or a list of alternatives.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Pat(pub String);
+
+impl<'de> Deserialize<'de> for Pat {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum OneOrMany {
+            One(String),
+            Many(Vec<String>),
+        }
+        Ok(match OneOrMany::deserialize(d)? {
+            OneOrMany::One(s) => Pat(s),
+            OneOrMany::Many(v) => Pat::any(&v),
+        })
+    }
+}
+
+impl Serialize for Pat {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&self.0)
+    }
+}
+
+impl Pat {
+    /// Alternation of several regexes.
+    pub fn any(v: &[String]) -> Pat {
+        match v {
+            [one] => Pat(one.clone()),
+            many => Pat(many.iter().map(|p| format!("(?:{p})")).collect::<Vec<_>>().join("|")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Rule {
     pub name: String,
     #[serde(default)]
     pub severity: Severity,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub comment: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "FromSpec::is_empty")]
     pub from: FromSpec,
+    #[serde(default, skip_serializing_if = "ToSpec::is_empty")]
+    pub to: ToSpec,
+    /// A rule about modules themselves (not their dependencies). With
+    /// `module`, `from` restricts which dependents are counted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub module: Option<ModuleSpec>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AllowedRule {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+    #[serde(default, skip_serializing_if = "FromSpec::is_empty")]
+    pub from: FromSpec,
+    #[serde(default, skip_serializing_if = "ToSpec::is_empty")]
+    pub to: ToSpec,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RequiredRule {
+    pub name: String,
     #[serde(default)]
+    pub severity: Severity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+    pub module: ModuleSpec,
     pub to: ToSpec,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
+    #[serde(alias = "ignore")]
     Off,
     Info,
     #[default]
@@ -148,27 +263,114 @@ impl Severity {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct FromSpec {
-    pub path: Option<String>,
-    pub path_not: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<Pat>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path_not: Option<Pat>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub orphan: Option<bool>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+impl FromSpec {
+    fn is_empty(&self) -> bool {
+        self.path.is_none() && self.path_not.is_none() && self.orphan.is_none()
+    }
+}
+
+/// `path` / `path_not`, used for `via` and `via_only`. Also accepts a bare
+/// string or list, meaning `path`.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct PathSpec {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<Pat>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path_not: Option<Pat>,
+}
+
+impl<'de> Deserialize<'de> for PathSpec {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Full {
+            path: Option<Pat>,
+            path_not: Option<Pat>,
+        }
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Either {
+            Full(Full),
+            Short(Pat),
+        }
+        Ok(match Either::deserialize(d)? {
+            Either::Full(f) => PathSpec { path: f.path, path_not: f.path_not },
+            Either::Short(p) => PathSpec { path: Some(p), path_not: None },
+        })
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ToSpec {
-    pub path: Option<String>,
-    pub path_not: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<Pat>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path_not: Option<Pat>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub circular: Option<bool>,
+    /// Circular only: some cycle through this dependency passes through a
+    /// module matching this.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub via: Option<PathSpec>,
+    /// Circular only: some cycle through this dependency consists solely of
+    /// modules matching this.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub via_only: Option<PathSpec>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub dependency_types: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub dependency_types_not: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub could_not_resolve: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub type_only: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub dynamic: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub reachable: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub more_unstable: Option<bool>,
+    /// The package is declared in more than one section of package.json
+    /// (e.g. both dependencies and devDependencies).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub more_than_one_dependency_type: Option<bool>,
+    /// Regex on the installed package's `license`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub license: Option<Pat>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub license_not: Option<Pat>,
+}
+
+impl ToSpec {
+    fn is_empty(&self) -> bool {
+        toml::to_string(self).map(|s| s.trim().is_empty()).unwrap_or(false)
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ModuleSpec {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<Pat>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path_not: Option<Pat>,
+    /// Fewer than N modules depend on it (e.g. "shared code must be shared").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub number_of_dependents_less_than: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub number_of_dependents_more_than: Option<usize>,
 }
 
 /// Finds the project root: the nearest ancestor of `start` holding a
@@ -182,17 +384,35 @@ pub fn find_root(start: &Path) -> PathBuf {
     start.to_path_buf()
 }
 
-pub fn load(root: &Path, explicit: Option<&Path>) -> Result<(Config, Option<PathBuf>)> {
+pub struct Loaded {
+    pub config: Config,
+    pub path: Option<PathBuf>,
+    /// Human-readable notes, e.g. about an imported JavaScript config.
+    pub notes: Vec<String>,
+}
+
+/// Loads `explicit` (a JavaScript config is converted on the fly), else
+/// `<root>/tangle.toml`, else the built-in defaults.
+pub fn load(root: &Path, explicit: Option<&Path>) -> Result<Loaded> {
     let path = match explicit {
         Some(p) => Some(p.to_path_buf()),
         None => Some(root.join(CONFIG_FILE)).filter(|p| p.is_file()),
     };
     let Some(path) = path else {
-        return Ok((Config::default(), None));
+        return Ok(Loaded { config: Config::default(), path: None, notes: vec![] });
     };
-    let text = std::fs::read_to_string(&path)
-        .with_context(|| format!("reading {}", path.display()))?;
-    let cfg: Config =
-        toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
-    Ok((cfg, Some(path)))
+    if migrate::is_js_config(&path) {
+        let imported = migrate::import(&path)?;
+        let mut notes = vec![format!(
+            "using {} ({} rules imported; run `tangle init --from {}` to convert it)",
+            path.file_name().unwrap_or_default().to_string_lossy(),
+            imported.config.forbidden.len() + imported.config.allowed.len() + imported.config.required.len(),
+            path.file_name().unwrap_or_default().to_string_lossy(),
+        )];
+        notes.extend(imported.warnings);
+        return Ok(Loaded { config: imported.config, path: Some(path), notes });
+    }
+    let text = std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let config: Config = toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+    Ok(Loaded { config, path: Some(path), notes: vec![] })
 }

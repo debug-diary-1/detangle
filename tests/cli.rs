@@ -168,3 +168,51 @@ fn vue_svelte_angular() {
     // `<script>` inside the template and the CDN script in <svelte:head> are not imports.
     assert!(!edges.iter().any(|e| e.contains("cdn.example") || e.contains("not code")), "{edges:#?}");
 }
+
+#[test]
+fn runs_javascript_rule_configs() {
+    let (out, code) = tangle(&["check", FIXTURE, "-c", "tests/fixtures/rules.config.json", "-f", "json"]);
+    assert_eq!(code, 1);
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let mut got: Vec<String> = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| format!("{} {} -> {}", x["rule"].as_str().unwrap(), x["from"].as_str().unwrap(), x["to"].as_str().unwrap_or("-")))
+        .collect();
+    got.sort();
+    assert_eq!(
+        got,
+        [
+            "no-circular src/features/cart/cart.ts -> src/features/cart/price.ts",
+            "no-circular src/features/cart/price.ts -> src/features/cart/cart.ts",
+            "no-cross-feature src/features/cart/cart.ts -> src/features/user/profile.ts",
+            // `node_modules/react/` also matches the npm package.
+            "no-non-package-json src/features/cart/price.ts -> lodash",
+            "not-to-unresolvable src/features/user/profile.ts -> ./does-not-exist",
+            // helper.test.ts has one dependent; orphan.ts has none.
+            "utils-must-be-shared src/utils/helper.test.ts -> -",
+            "utils-must-be-shared src/utils/orphan.ts -> -",
+        ]
+    );
+}
+
+#[test]
+fn init_converts_javascript_rule_configs() {
+    let dir = std::env::temp_dir().join(format!("tangle-init-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_tangle"))
+        .args(["init", dir.to_str().unwrap(), "--from", "tests/fixtures/rules.config.json"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let toml = std::fs::read_to_string(dir.join("tangle.toml")).unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert!(out.status.success(), "{stdout}");
+    assert!(stdout.contains("5 forbidden, 0 allowed, 1 required"), "{stdout}");
+    assert!(stdout.contains("'bundled' skipped"), "{stdout}");
+    assert!(toml.contains("#   - forbidden rule 'bundled' skipped"), "{toml}");
+    assert!(toml.contains("path_not = \"^src/features/$1/\""), "{toml}");
+}

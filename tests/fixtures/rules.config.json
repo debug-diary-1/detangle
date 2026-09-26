@@ -1,0 +1,14 @@
+{
+  "forbidden": [
+    { "name": "no-circular", "severity": "warn", "from": {}, "to": { "circular": true } },
+    { "name": "no-non-package-json", "severity": "error", "from": {}, "to": { "dependencyTypes": ["npm-no-pkg", "npm-unknown"] } },
+    { "name": "not-to-unresolvable", "severity": "error", "from": {}, "to": { "couldNotResolve": true } },
+    { "name": "no-cross-feature", "severity": "error", "from": { "path": "^src/features/([^/]+)/" }, "to": { "path": "^src/features/", "pathNot": "^src/features/$1/" } },
+    { "name": "utils-must-be-shared", "severity": "info", "from": {}, "module": { "path": "^src/utils/", "numberOfDependentsLessThan": 2 } },
+    { "name": "bundled", "severity": "error", "from": {}, "to": { "dependencyTypes": ["npm-bundled"] } }
+  ],
+  "required": [
+    { "name": "index-uses-react", "severity": "error", "module": { "path": "^src/index\\.ts$" }, "to": { "path": "^node_modules/react/" } }
+  ],
+  "options": { "doNotFollow": { "path": "node_modules" }, "tsPreCompilationDeps": false }
+}

@@ -249,6 +249,7 @@ fn globset(patterns: &[String]) -> Result<Option<GlobSet>> {
 pub fn discover(root: &Path, dir: &Path, opts: &Options) -> Result<Vec<PathBuf>> {
     let include = globset(&opts.include)?;
     let exclude = globset(&opts.exclude)?;
+    let filter = crate::graph::PathFilter::new(opts);
     let found = Mutex::new(Vec::new());
     WalkBuilder::new(dir)
         .require_git(false)
@@ -267,7 +268,8 @@ pub fn discover(root: &Path, dir: &Path, opts: &Options) -> Result<Vec<PathBuf>>
                     let rel = path.strip_prefix(root).unwrap_or(path);
                     let included = include.as_ref().is_none_or(|g| g.is_match(rel));
                     let excluded = exclude.as_ref().is_some_and(|g| g.is_match(rel));
-                    if included && !excluded {
+                    let kept = !filter.active() || filter.keep(&[&rel.to_string_lossy().replace('\\', "/")]);
+                    if included && !excluded && kept {
                         found.lock().unwrap().push(path.to_path_buf());
                     }
                 }
@@ -313,7 +315,8 @@ fn make_resolver(root: &Path, opts: &Options) -> Resolvers {
         ]),
         // TS ESM projects write `./foo.js` while the file on disk is `foo.ts`.
         extension_alias: vec![
-            (".js".into(), s(&[".ts", ".tsx", ".d.ts", ".js", ".jsx"])),
+            // Prefer TS source, then the real runtime file, then its typings.
+            (".js".into(), s(&[".ts", ".tsx", ".js", ".jsx", ".d.ts"])),
             (".jsx".into(), s(&[".tsx", ".jsx"])),
             (".mjs".into(), s(&[".mts", ".mjs"])),
             (".cjs".into(), s(&[".cts", ".cjs"])),
@@ -352,6 +355,11 @@ fn parse_file(path: PathBuf, prev: Option<ScannedFile>) -> (ScannedFile, bool) {
 }
 
 impl ScannedFile {
+    #[cfg(test)]
+    pub fn for_test(path: PathBuf, imports: Vec<Import>) -> Self {
+        ScannedFile { path, imports, parse_errors: 0, raw: vec![], stamp: None }
+    }
+
     fn resolve(&mut self, resolver: &Resolvers) {
         self.imports = self
             .raw
@@ -433,7 +441,10 @@ fn package_from_path(p: &Path) -> Option<String> {
 
 fn resolve(resolver: &Resolvers, from: &Path, spec: &str) -> Option<Target> {
     if is_builtin(spec) {
-        let name = spec.trim_start_matches("node:");
+        // `node:fs` ≡ `fs`, but `node:sqlite` / `node:test` only exist with the
+        // prefix (plain `sqlite` is an npm package), so keep it for those.
+        let bare = spec.trim_start_matches("node:");
+        let name = if NODE_BUILTINS.contains(&bare) { bare } else { spec };
         return Some(Target::Builtin(name.to_string()));
     }
     match resolver.resolve_file(from, spec) {
