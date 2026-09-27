@@ -809,3 +809,30 @@ fn do_not_follow_exclude_dynamic_and_max_depth() {
     assert_eq!(ids(run(&["graph", "-f", "json", "--from", "^src/c"])), ["src/c.js", "src/d.js"]);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn parse_cache_reuses_and_notices_edits() {
+    for strategy in ["metadata", "content"] {
+        let dir = std::env::temp_dir().join(format!("tangle-cache-{strategy}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        copy_dir(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cycle-depth"), &dir);
+        std::fs::remove_file(dir.join(".eslintrc.json")).unwrap();
+        let deps_of_a = || {
+            let out = Command::new(env!("CARGO_BIN_EXE_tangle"))
+                .args(["graph", "-f", "json", "--cache", "--cache-strategy", strategy])
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+            let a = v["modules"].as_array().unwrap().iter().find(|m| m["id"] == "src/a.js").unwrap().clone();
+            a["dependencies"].as_array().unwrap().iter().map(|d| d["module"].as_str().unwrap().to_string()).collect::<Vec<_>>()
+        };
+        assert_eq!(deps_of_a(), ["src/b.js"]);
+        assert!(dir.join("node_modules/.cache/tangle/parse-cache.json").is_file());
+        assert_eq!(deps_of_a(), ["src/b.js"]); // from the cache
+        // Same size, new content: the edit must still be seen.
+        std::fs::write(dir.join("src/a.js"), "import { c } from \"./c.js\";\nexport const a = () => [c];\n").unwrap();
+        assert_eq!(deps_of_a(), ["src/c.js"], "{strategy}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}

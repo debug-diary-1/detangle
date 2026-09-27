@@ -35,7 +35,16 @@ struct Cli {
     cmd: Option<Cmd>,
     #[command(flatten)]
     target: Target,
+    /// Keep parse results between runs (default dir: node_modules/.cache/tangle)
+    #[arg(long, global = true, num_args = 0..=1, value_name = "DIR")]
+    cache: Option<Option<PathBuf>>,
+    /// How the cache detects changed files
+    #[arg(long, global = true, value_enum)]
+    cache_strategy: Option<config::CacheStrategy>,
 }
+
+/// `--cache` / `--cache-strategy`, applied to every project opened.
+static CACHE_ARGS: std::sync::OnceLock<(Option<Option<PathBuf>>, Option<config::CacheStrategy>)> = std::sync::OnceLock::new();
 
 #[derive(Args, Clone)]
 struct Target {
@@ -264,6 +273,16 @@ impl Project {
         if let Some(m) = mode {
             cfg.options.config_env.mode = Some(m.to_string());
         }
+        if let Some((cache, strategy)) = CACHE_ARGS.get() {
+            match cache {
+                Some(Some(d)) => cfg.options.cache = config::CacheSetting::Dir(std::path::absolute(d)?.to_string_lossy().into_owned()),
+                Some(None) => cfg.options.cache = config::CacheSetting::Enabled(true),
+                None => {}
+            }
+            if let Some(s) = strategy {
+                cfg.options.cache_strategy = *s;
+            }
+        }
         rules::validate(&cfg).with_context(|| match &loaded.path {
             Some(p) => format!("in {}", p.display()),
             None => "in the built-in rules".into(),
@@ -355,6 +374,7 @@ fn main() -> ExitCode {
 
 fn run() -> Result<ExitCode> {
     let cli = Cli::parse();
+    let _ = CACHE_ARGS.set((cli.cache.clone(), cli.cache_strategy));
     let p = Paint::stdout();
     match cli.cmd.unwrap_or(Cmd::Tui { target: cli.target, no_watch: false }) {
         Cmd::Tui { target: t, no_watch } => {

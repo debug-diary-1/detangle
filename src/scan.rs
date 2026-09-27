@@ -78,6 +78,28 @@ impl ImportFlags {
         }
     }
 
+    /// Compact form for the parse cache: one bit per flag, the exotic index above.
+    fn to_bits(self) -> u32 {
+        let b = [self.type_only, self.dynamic, self.require, self.reexport, self.resource, self.amd, self.jsdoc, self.triple_slash, self.builtin_call];
+        b.iter().enumerate().fold(u32::from(self.exotic) << 16, |acc, (i, &on)| acc | (u32::from(on) << i))
+    }
+
+    fn from_bits(b: u32) -> Self {
+        let on = |i: u32| b >> i & 1 == 1;
+        ImportFlags {
+            type_only: on(0),
+            dynamic: on(1),
+            require: on(2),
+            reexport: on(3),
+            resource: on(4),
+            amd: on(5),
+            jsdoc: on(6),
+            triple_slash: on(7),
+            builtin_call: on(8),
+            exotic: (b >> 16) as u8,
+        }
+    }
+
     /// A plain `import`/`export` (not require, dynamic, AMD, a directive…).
     pub fn is_import(self) -> bool {
         !(self.require || self.dynamic || self.amd || self.triple_slash || self.exotic != 0 || self.builtin_call)
@@ -122,6 +144,130 @@ fn stamp(p: &Path) -> Stamp {
     Some((m.modified().ok()?, m.len()))
 }
 
+/// On-disk parse cache: each file's imports, reused while the file is
+/// unchanged. Files are compared by modification time and size; with the
+/// `content` strategy a file whose metadata changed (e.g. a fresh checkout)
+/// is still reused when its contents hash the same.
+mod cache {
+    use super::*;
+    use crate::config::CacheStrategy;
+    use serde::Deserialize;
+    use std::hash::{Hash, Hasher};
+
+    const FILE: &str = "parse-cache.json";
+
+    #[derive(Clone, Serialize, Deserialize)]
+    struct Entry {
+        /// Modification time and size.
+        meta: String,
+        /// Content hash (`content` strategy only).
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        hash: String,
+        errors: usize,
+        /// (specifier, `ImportFlags::to_bits`)
+        imports: Vec<(String, u32)>,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct Stored {
+        /// Invalidates everything when tangle or what it detects changes.
+        fingerprint: String,
+        files: HashMap<String, Entry>,
+    }
+
+    /// A loaded cache: reusable files, plus what's needed to save it again.
+    #[derive(Default)]
+    pub struct Loaded {
+        pub files: HashMap<PathBuf, ScannedFile>,
+        entries: HashMap<String, Entry>,
+        /// Some entry needs rewriting (its metadata changed).
+        pub dirty: bool,
+    }
+
+    fn fingerprint(opts: &Options) -> String {
+        let d = Detect::new(opts);
+        format!("{}|{:?}|{}|{}|{:?}", env!("CARGO_PKG_VERSION"), opts.cache_strategy, d.jsdoc, d.builtin_calls, d.exotic)
+    }
+
+    fn meta(path: &Path) -> Option<String> {
+        let (t, len) = stamp(path)?;
+        let t = t.duration_since(std::time::UNIX_EPOCH).ok()?;
+        Some(format!("{}.{:09}:{len}", t.as_secs(), t.subsec_nanos()))
+    }
+
+    fn hash(path: &Path) -> Option<String> {
+        let bytes = std::fs::read(path).ok()?;
+        let mut h = rustc_hash::FxHasher::default();
+        bytes.hash(&mut h);
+        Some(format!("{:016x}:{}", h.finish(), bytes.len()))
+    }
+
+    pub fn load(dir: &Path, root: &Path, opts: &Options) -> Loaded {
+        let Some(stored) = std::fs::read(dir.join(FILE)).ok().and_then(|b| serde_json::from_slice::<Stored>(&b).ok()) else {
+            return Loaded::default();
+        };
+        if stored.fingerprint != fingerprint(opts) {
+            return Loaded::default();
+        }
+        let content = opts.cache_strategy == CacheStrategy::Content;
+        let hits: Vec<(String, Entry, bool)> = stored
+            .files
+            .into_par_iter()
+            .filter_map(|(rel, mut e)| {
+                let path = root.join(&rel);
+                let now = meta(&path)?;
+                if now == e.meta {
+                    return Some((rel, e, false));
+                }
+                if content && !e.hash.is_empty() && hash(&path)? == e.hash {
+                    e.meta = now;
+                    return Some((rel, e, true));
+                }
+                None
+            })
+            .collect();
+        let mut out = Loaded::default();
+        for (rel, e, moved) in hits {
+            out.dirty |= moved;
+            let path = root.join(&rel);
+            let raw = e.imports.iter().map(|(s, b)| (s.clone(), ImportFlags::from_bits(*b))).collect();
+            let st = stamp(&path);
+            out.files.insert(path.clone(), ScannedFile { path, imports: vec![], parse_errors: e.errors, raw, stamp: st });
+            out.entries.insert(rel, e);
+        }
+        out
+    }
+
+    /// Saves the cache, reusing loaded entries (and their hashes) where current.
+    fn save(dir: &Path, root: &Path, opts: &Options, files: &[ScannedFile], loaded: &HashMap<String, Entry>) -> Result<()> {
+        let content = opts.cache_strategy == CacheStrategy::Content;
+        let entries: HashMap<String, Entry> = files
+            .par_iter()
+            .filter_map(|f| {
+                let rel = f.path.strip_prefix(root).ok()?.to_string_lossy().into_owned();
+                let m = meta(&f.path)?;
+                if let Some(e) = loaded.get(&rel).filter(|e| e.meta == m) {
+                    return Some((rel, e.clone()));
+                }
+                let imports = f.raw.iter().map(|(s, fl)| (s.clone(), fl.to_bits())).collect();
+                let hash = if content { hash(&f.path)? } else { String::new() };
+                Some((rel, Entry { meta: m, hash, errors: f.parse_errors, imports }))
+            })
+            .collect();
+        std::fs::create_dir_all(dir)?;
+        let tmp = dir.join(format!("{FILE}.{}", std::process::id()));
+        std::fs::write(&tmp, serde_json::to_vec(&Stored { fingerprint: fingerprint(opts), files: entries })?)?;
+        std::fs::rename(tmp, dir.join(FILE))?;
+        Ok(())
+    }
+
+    impl Loaded {
+        pub fn save(&self, dir: &Path, root: &Path, opts: &Options, files: &[ScannedFile]) -> Result<()> {
+            save(dir, root, opts, files, &self.entries)
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct ScannedFile {
     pub path: PathBuf,
@@ -162,7 +308,19 @@ impl Session {
         let t = Instant::now();
         let resolver = make_resolver(root, opts)?;
         let detect = Detect::new(opts);
-        let files: Vec<ScannedFile> = paths.into_par_iter().map(|p| parse_file(p, None, &detect).0).collect();
+        let cache_dir = opts.cache.dir(root);
+        let mut cached = cache_dir.as_deref().map(|d| cache::load(d, root, opts)).unwrap_or_default();
+        let with_prev: Vec<(PathBuf, Option<ScannedFile>)> = paths.into_iter().map(|p| { let prev = cached.files.remove(&p); (p, prev) }).collect();
+        let parsed: Vec<(ScannedFile, bool)> = with_prev.into_par_iter().map(|(p, prev)| parse_file(p, prev, &detect)).collect();
+        // Rewrite the cache only when a file was parsed, went away or moved.
+        let changed = cached.dirty || parsed.iter().any(|(_, fresh)| *fresh) || !cached.files.is_empty();
+        let files: Vec<ScannedFile> = parsed.into_iter().map(|(f, _)| f).collect();
+        if let Some(d) = &cache_dir
+            && changed
+        {
+            // A cache that can't be written only costs speed.
+            let _ = cached.save(d, root, opts, &files);
+        }
         let mut s = Session {
             root: root.to_path_buf(),
             dir: dir.to_path_buf(),
@@ -870,6 +1028,13 @@ export const f = (x) => [module.require("./g"), process.getBuiltinModule("fs"), 
         assert_eq!(resolved(&only, "vscode"), "builtin:vscode");
         assert_eq!(resolved(&only, "fs"), "Some(Unresolved)");
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn import_flags_round_trip_through_bits() {
+        let f = ImportFlags { type_only: true, reexport: true, triple_slash: true, builtin_call: true, exotic: 3, ..Default::default() };
+        assert_eq!(ImportFlags::from_bits(f.to_bits()), f);
+        assert_eq!(ImportFlags::from_bits(ImportFlags::default().to_bits()), ImportFlags::default());
     }
 
     #[test]

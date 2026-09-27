@@ -63,6 +63,10 @@ The project root is the nearest ancestor containing `tangle.toml`, or else `pack
 
 tangle checks the filesystem itself to decide whether files were added or removed, because watchers (notably macOS FSEvents) often report an ordinary save as a new file. Atomic saves from editors like vim and JetBrains therefore count as plain edits.
 
+### Parse cache
+
+`--cache` (or `options.cache = true`) keeps each file's parsed imports in `node_modules/.cache/tangle` and re-parses only files that changed. On VS Code's `src/` a warm run takes 155 ms instead of 227 ms. Resolution always runs fresh, so installing packages or adding files is never missed. By default, files count as changed when their modification time or size changes. With `--cache-strategy content` (`options.cache_strategy = "content"`), a file whose timestamp changed but whose contents didn't is still reused. That helps fresh CI checkouts once the cache is restored: the first run hashes and rewrites the cache, and later runs are fast again.
+
 ## What it understands
 
 - **React**: JSX/TSX, including JSX in plain `.js` files as Create React App, Vite and Babel setups allow. `React.lazy(() => import(...))` shows up as a dynamic import.

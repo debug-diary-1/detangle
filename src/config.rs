@@ -215,6 +215,13 @@ pub struct Options {
     /// Module resolution overrides (like webpack's / enhanced-resolve's).
     #[serde(skip_serializing_if = "ResolveConfig::is_default")]
     pub resolve: ResolveConfig,
+    /// Keep parse results between runs: `true` (in node_modules/.cache/tangle)
+    /// or a directory. Files are re-parsed only when they change.
+    #[serde(skip_serializing_if = "CacheSetting::is_off")]
+    pub cache: CacheSetting,
+    /// How the cache detects changed files.
+    #[serde(skip_serializing_if = "CacheStrategy::is_default")]
+    pub cache_strategy: CacheStrategy,
     /// Which group a module joins when several match: "first" (the first
     /// definition) or "deepest" (the one matching the longest path).
     #[serde(skip_serializing_if = "GroupMatch::is_default")]
@@ -222,6 +229,50 @@ pub struct Options {
     /// How Vite / webpack / Babel configs are evaluated.
     #[serde(default, skip_serializing_if = "ConfigEnv::is_default")]
     pub config_env: ConfigEnv,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum CacheSetting {
+    Enabled(bool),
+    Dir(String),
+}
+
+impl Default for CacheSetting {
+    fn default() -> Self {
+        CacheSetting::Enabled(false)
+    }
+}
+
+impl CacheSetting {
+    fn is_off(&self) -> bool {
+        *self == CacheSetting::Enabled(false)
+    }
+
+    /// The cache directory, if caching is on.
+    pub fn dir(&self, root: &Path) -> Option<PathBuf> {
+        match self {
+            CacheSetting::Enabled(false) => None,
+            CacheSetting::Enabled(true) => Some(root.join("node_modules/.cache/tangle")),
+            CacheSetting::Dir(d) => Some(root.join(d)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Deserialize, Serialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum CacheStrategy {
+    /// Modification time and size (fast)
+    #[default]
+    Metadata,
+    /// File contents (survives fresh checkouts, e.g. in CI)
+    Content,
+}
+
+impl CacheStrategy {
+    fn is_default(&self) -> bool {
+        *self == CacheStrategy::Metadata
+    }
 }
 
 /// `[options.resolve]`: replaces tangle's resolution defaults where set.
@@ -388,6 +439,8 @@ impl Default for Options {
             nx_projects: false,
             group_match: GroupMatch::First,
             resolve: ResolveConfig::default(),
+            cache: CacheSetting::Enabled(false),
+            cache_strategy: CacheStrategy::Metadata,
             jsdoc_imports: false,
             builtin_module_calls: false,
             exotic_require: vec![],

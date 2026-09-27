@@ -238,7 +238,7 @@ fn convert_rule(v: &Value, keys: &[&str]) -> Result<Value, Skip> {
 
 /// Options that only affect the originating tool's reporting or runtime.
 const HARMLESS_OPTIONS: &[&str] = &[
-    "reporterOptions", "progress", "cache", "prefix", "outputType", "outputTo", "moduleSystems",
+    "reporterOptions", "progress", "prefix", "outputType", "outputTo", "moduleSystems",
     "combinedDependencies", "parser",
     "skipAnalysisNotInRules", "metrics", "forceDeriveDependents", "experimentalStats", "baseDir",
     "validate", "ruleSet", "rulesFile", "mainFields",
@@ -333,6 +333,20 @@ pub fn convert(v: &Value) -> Imported {
                     let names = |k: &str| val.get(k).map(|l| l.as_array().into_iter().flatten().filter_map(|s| s.as_str().map(String::from)).collect::<Vec<_>>());
                     opts.resolve.builtins = names("override");
                     opts.resolve.builtins_add = names("add").unwrap_or_default();
+                }
+                "cache" => {
+                    // true, a folder, or { folder, strategy }.
+                    use crate::config::{CacheSetting, CacheStrategy};
+                    let folder = val.as_str().or_else(|| val.get("folder").and_then(Value::as_str));
+                    opts.cache = match (val, folder) {
+                        (Value::Bool(false), _) => CacheSetting::Enabled(false),
+                        // Its own default folder holds its own format.
+                        (_, Some(f)) if !f.contains("dependency") => CacheSetting::Dir(f.to_string()),
+                        _ => CacheSetting::Enabled(true),
+                    };
+                    if val.get("strategy").and_then(Value::as_str) == Some("content") {
+                        opts.cache_strategy = CacheStrategy::Content;
+                    }
                 }
                 "preserveSymlinks" => opts.resolve.preserve_symlinks = val == &json!(true),
                 "externalModuleResolutionStrategy" => opts.resolve.yarn_pnp = Some(val == &json!("yarn-pnp")),
