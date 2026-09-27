@@ -433,6 +433,12 @@ pub fn html(g: &Graph, vs: &[Violation], config: Option<&std::path::Path>) -> St
             comments.entry(v.rule.clone()).or_insert_with(|| json!(c));
         }
     }
+    // A rule covering several checks has no single comment: each row shows its own.
+    for v in vs {
+        if comments.get(&v.rule).is_some_and(|c| c.as_str() != v.comment.as_deref()) {
+            comments.insert(v.rule.clone(), json!(""));
+        }
+    }
     let generated = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
