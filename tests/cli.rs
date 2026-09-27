@@ -758,3 +758,16 @@ fn graph_filters_select_like_the_js_rules_tool() {
     assert!(mmd.contains("[\"src/a/\"]:::highlight"), "{mmd}");
     assert!(!mmd.contains("src/a/mid.ts"), "{mmd}");
 }
+
+#[test]
+fn graph_csv_matrix_and_d2() {
+    let (csv, _) = tangle(&["graph", "tests/fixtures/conditions", "-c", "/dev/null", "-f", "csv", "--focus", "c6"]);
+    // Same matrix layout as the JavaScript rules tool: header, "true"/"false" cells, trailing empty column.
+    assert_eq!(
+        csv,
+        "\"\",\"src/c6.ts\",\"src/c7.ts\",\"\"\n\"src/c6.ts\",\"false\",\"true\",\"\"\n\"src/c7.ts\",\"true\",\"false\",\"\"\n"
+    );
+    let (d2, _) = tangle(&["graph", "tests/fixtures/conditions", "-c", "/dev/null", "-f", "d2", "--focus", "c6"]);
+    assert!(d2.contains("\"src\".\"c6.ts\": {class: cycle; link: \"src/c6.ts\"}"), "{d2}");
+    assert!(d2.contains("\"src\".\"c6.ts\" -> \"src\".\"c7.ts\": {style.stroke: \"#dd3333\"; style.stroke-dash: 3}"), "{d2}");
+}

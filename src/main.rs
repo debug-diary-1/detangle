@@ -215,6 +215,9 @@ enum GraphFormat {
     Dot,
     Mermaid,
     Json,
+    D2,
+    /// Adjacency matrix
+    Csv,
 }
 
 pub struct Analysis {
@@ -453,6 +456,8 @@ fn run() -> Result<ExitCode> {
             let text = match format {
                 GraphFormat::Dot => report::dot(&a.graph, &view),
                 GraphFormat::Mermaid => report::mermaid(&a.graph, &view),
+                GraphFormat::D2 => report::d2(&a.graph, &view),
+                GraphFormat::Csv => report::csv(&a.graph, &view),
                 GraphFormat::Json => serde_json::to_string_pretty(&report::graph_json(&a.graph, &a.violations, &view))? + "\n",
             };
             match output {

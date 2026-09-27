@@ -650,6 +650,62 @@ pub fn mermaid(g: &Graph, view: &GraphView) -> String {
     out
 }
 
+/// D2: modules nested in containers by path segment.
+pub fn d2(g: &Graph, view: &GraphView) -> String {
+    let p = project(g, view);
+    let key = |id: &str| {
+        id.trim_end_matches('/').split('/').map(|s| format!("\"{}\"", s.replace('"', "\\\""))).collect::<Vec<_>>().join(".")
+    };
+    let mut out = String::from("# modules\n\n");
+    for (id, kind, cyclic, highlighted) in &p.nodes {
+        let class = match kind {
+            _ if *highlighted => "highlight",
+            ModuleKind::Local if *cyclic => "cycle",
+            ModuleKind::Local => "module",
+            ModuleKind::Npm => "npm",
+            ModuleKind::Builtin => "core",
+            ModuleKind::Unresolved => "unresolved",
+        };
+        let _ = writeln!(out, "{}: {{class: {class}; link: \"{}\"}}", key(id), id.replace('"', "\\\""));
+    }
+    out.push_str("\n# dependencies\n\n");
+    for (a, b, circular, type_only, dynamic) in &p.edges {
+        let mut style = vec![];
+        if *circular {
+            style.push("style.stroke: \"#dd3333\"");
+        }
+        if *type_only || *dynamic {
+            style.push("style.stroke-dash: 3");
+        }
+        let attrs = if style.is_empty() { String::new() } else { format!(": {{{}}}", style.join("; ")) };
+        let _ = writeln!(out, "{} -> {}{attrs}", key(&p.nodes[*a].0), key(&p.nodes[*b].0));
+    }
+    out.push_str(
+        "\n# styling\n\nclasses: {\n  module: {height: 30; style.border-radius: 10}\n  cycle: {height: 30; style.border-radius: 10; style.fill: \"#fde2e1\"; style.stroke: \"#dd3333\"}\n  npm: {height: 30; style.fill: \"#e0f4f7\"; style.stroke: \"#2a9bb0\"}\n  core: {height: 30; style.fill: \"#e5f5e5\"; style.stroke: \"#33aa33\"}\n  unresolved: {height: 30; style.fill: \"#ffd6d6\"; style.stroke: \"#cc0000\"}\n  highlight: {height: 30; style.border-radius: 10; style.fill: \"#fff3b0\"; style.stroke: \"#e6a100\"; style.stroke-width: 3}\n}\n",
+    );
+    out
+}
+
+/// CSV adjacency matrix: a row per module, "true" where it depends on the column's module.
+pub fn csv(g: &Graph, view: &GraphView) -> String {
+    let p = project(g, view);
+    let q = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
+    let mut order: Vec<usize> = (0..p.nodes.len()).collect();
+    order.sort_by(|&a, &b| p.nodes[a].0.cmp(&p.nodes[b].0));
+    let deps: HashSet<(usize, usize)> = p.edges.iter().map(|e| (e.0, e.1)).collect();
+    let mut out = String::new();
+    let header: Vec<String> = std::iter::once(q("")).chain(order.iter().map(|&i| q(&p.nodes[i].0))).chain([q("")]).collect();
+    let _ = writeln!(out, "{}", header.join(","));
+    for &row in &order {
+        let cells: Vec<String> = std::iter::once(q(&p.nodes[row].0))
+            .chain(order.iter().map(|&col| q(if deps.contains(&(row, col)) { "true" } else { "false" })))
+            .chain([q("")])
+            .collect();
+        let _ = writeln!(out, "{}", cells.join(","));
+    }
+    out
+}
+
 pub fn stats(g: &Graph, vs: &[Violation], top: usize) -> String {
     let p = Paint::stdout();
     let mut out = String::new();
