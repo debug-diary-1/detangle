@@ -237,3 +237,31 @@ fn html_report_embeds_the_analysis() {
     // Self-contained: no external resources.
     assert!(!html.contains("http://") && !html.contains("https://"));
 }
+
+#[test]
+fn webpack_babel_and_native_aliases() {
+    let (out, _) = tangle(&["graph", "tests/fixtures/aliases", "-f", "json"]);
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let index = v["modules"].as_array().unwrap().iter().find(|m| m["id"] == "src/index.js").unwrap();
+    let mut got: Vec<String> = index["dependencies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| format!("{} -> {}", d["specifier"].as_str().unwrap(), d["module"].as_str().unwrap()))
+        .collect();
+    got.sort();
+    assert_eq!(
+        got,
+        [
+            "@components/Button -> src/components/Button.jsx", // webpack alias
+            "@feature/cart -> src/features/cart/index.js",     // babel regex alias
+            "@lib/strings -> src/lib/strings.js",              // tangle.toml alias
+            "rootmod -> src/roots/rootmod.js",                 // babel root
+            "theme -> src/shared/theme.js",                    // webpack resolve.modules
+            "utils -> src/utils/index.js",                     // webpack `utils$`
+            "utils/other -> utils/other",                      // `$` is exact: unresolved
+            "~/components/Card -> src/components/Card.jsx",    // babel alias
+            // "legacy-lib" is aliased to `false`: no dependency at all.
+        ]
+    );
+}

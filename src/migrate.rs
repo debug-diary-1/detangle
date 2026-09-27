@@ -276,6 +276,13 @@ pub fn convert(v: &Value) -> Imported {
                     }
                 }
                 "tsConfig" => opts.tsconfig = val.get("fileName").and_then(Value::as_str).map(String::from),
+                "webpackConfig" => {
+                    opts.webpack_config = val.get("fileName").and_then(Value::as_str).map(String::from);
+                    if val.get("env").is_some() || val.get("arguments").is_some() {
+                        warnings.push("options.webpackConfig env/arguments aren't passed on (the config is called with an empty env in development mode)".into());
+                    }
+                }
+                "babelConfig" => opts.babel_config = val.get("fileName").and_then(Value::as_str).map(String::from),
                 "tsPreCompilationDeps" => {
                     // true / "specify": type-only imports are dependencies (and
                     // count toward cycles).
@@ -373,7 +380,9 @@ mod tests {
                 "tsConfig": { "fileName": "tsconfig.json" },
                 "tsPreCompilationDeps": true,
                 "reporterOptions": { "dot": {} },
-                "webpackConfig": { "fileName": "webpack.config.js" }
+                "webpackConfig": { "fileName": "webpack.config.js" },
+                "babelConfig": { "fileName": ".babelrc" },
+                "exoticRequireStrings": ["want"]
             }
         });
         let imp = convert(&v);
@@ -393,7 +402,10 @@ mod tests {
         let w = imp.warnings.join("\n");
         assert!(w.contains("'fancy' skipped: to.exoticallyRequired"), "{w}");
         assert!(w.contains("'bundled' skipped: dependency type \"npm-bundled\""), "{w}");
-        assert!(w.contains("options.webpackConfig"), "{w}");
+        assert_eq!(o.webpack_config.as_deref(), Some("webpack.config.js"));
+        assert_eq!(o.babel_config.as_deref(), Some(".babelrc"));
+        assert!(!w.contains("webpackConfig") && !w.contains("babelConfig"), "{w}");
+        assert!(w.contains("options.exoticRequireStrings"), "{w}");
         assert!(!w.contains("reporterOptions") && !w.contains("doNotFollow"), "{w}");
         // Round-trips through TOML.
         let text = to_toml(&imp, Path::new("rules.config.js")).unwrap();

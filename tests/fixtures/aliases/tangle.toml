@@ -1,0 +1,9 @@
+[options]
+webpack_config = "webpack.config.js"
+babel_config = "babel.config.js"
+aliases = { "@lib" = "./src/lib" }
+
+[[forbidden]]
+name = "not-to-unresolvable"
+severity = "error"
+to = { could_not_resolve = true }

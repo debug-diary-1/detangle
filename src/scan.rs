@@ -22,6 +22,7 @@ use oxc_span::SourceType;
 use rayon::prelude::*;
 use serde::Serialize;
 
+use crate::aliases::{Aliases, Rewrite};
 use crate::config::Options;
 use crate::sfc;
 
@@ -123,7 +124,7 @@ impl Session {
         let paths = discover(root, dir, opts)?;
         let walk_ms = ms(t);
         let t = Instant::now();
-        let resolver = make_resolver(root, opts);
+        let resolver = make_resolver(root, opts)?;
         let files: Vec<ScannedFile> = paths.into_par_iter().map(|p| parse_file(p, None).0).collect();
         let mut s = Session {
             root: root.to_path_buf(),
@@ -184,7 +185,7 @@ impl Session {
                     reused.into_par_iter().map(|(p, prev)| parse_file(p, prev)).collect();
                 work.reparsed = parsed.iter().filter(|(_, fresh)| *fresh).count();
                 self.files = parsed.into_iter().map(|(f, _)| f).collect();
-                self.resolver = make_resolver(&self.root, &self.opts);
+                self.resolver = make_resolver(&self.root, &self.opts)?;
                 self.resolve_all();
                 self.reindex();
                 work.reresolved = self.files.len();
@@ -281,6 +282,15 @@ pub fn discover(root: &Path, dir: &Path, opts: &Options) -> Result<Vec<PathBuf>>
     Ok(files)
 }
 
+fn with_extra(mut base: Vec<String>, extra: &[String]) -> Vec<String> {
+    for e in extra {
+        if !base.contains(e) {
+            base.push(e.clone());
+        }
+    }
+    base
+}
+
 /// The main resolver honours tsconfig; `plain` ignores it. A tsconfig that
 /// can't be loaded (e.g. `extends` a package that isn't installed) makes the
 /// main resolver fail for *every* import in its scope, so failures are
@@ -288,6 +298,7 @@ pub fn discover(root: &Path, dir: &Path, opts: &Options) -> Result<Vec<PathBuf>>
 struct Resolvers {
     main: Resolver,
     plain: Resolver,
+    aliases: Aliases,
 }
 
 impl Resolvers {
@@ -299,7 +310,8 @@ impl Resolvers {
     }
 }
 
-fn make_resolver(root: &Path, opts: &Options) -> Resolvers {
+fn make_resolver(root: &Path, opts: &Options) -> Result<Resolvers> {
+    let aliases = Aliases::load(root, opts)?;
     let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
     let tsconfig = match &opts.tsconfig {
         Some(p) => TsconfigDiscovery::Manual(TsconfigOptions {
@@ -310,9 +322,9 @@ fn make_resolver(root: &Path, opts: &Options) -> Resolvers {
     };
     let main = Resolver::new(ResolveOptions {
         tsconfig: Some(tsconfig),
-        extensions: s(&[
+        extensions: with_extra(s(&[
             ".ts", ".tsx", ".d.ts", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs", ".json", ".node", ".vue", ".svelte",
-        ]),
+        ]), &aliases.extensions),
         // TS ESM projects write `./foo.js` while the file on disk is `foo.ts`.
         extension_alias: vec![
             // Prefer TS source, then the real runtime file, then its typings.
@@ -323,10 +335,12 @@ fn make_resolver(root: &Path, opts: &Options) -> Resolvers {
         ],
         condition_names: s(&["import", "require", "node", "default", "types"]),
         main_fields: s(&["module", "main", "types"]),
+        // webpack's resolve.modules (e.g. `src` or an absolute directory).
+        modules: with_extra(s(&["node_modules"]), &aliases.modules),
         ..ResolveOptions::default()
     });
     let plain = main.clone_with_options(ResolveOptions { tsconfig: None, ..main.options().clone() });
-    Resolvers { main, plain }
+    Ok(Resolvers { main, plain, aliases })
 }
 
 thread_local! {
@@ -403,6 +417,22 @@ fn extract(alloc: &Allocator, path: &Path, source: &str) -> (Vec<(String, Import
     (c.out, errors)
 }
 
+/// A resolved path is an npm package if it lives in node_modules.
+fn classify(p: &Path, spec: &str) -> Target {
+    if !p.components().any(|c| c.as_os_str() == "node_modules") {
+        return Target::Local(p.to_path_buf());
+    }
+    // Prefer the name as written (`lodash/fp` → `lodash`); fall back to the
+    // path for aliases, `#imports` and absolute specifiers.
+    let from_path = package_from_path(p);
+    let pkg = if is_bare(spec) && !spec.starts_with('#') && from_path.as_deref().is_none_or(|n| package_name(spec) == n) {
+        package_name(spec).to_string()
+    } else {
+        from_path.unwrap_or_else(|| spec.to_string())
+    };
+    Target::Npm(pkg)
+}
+
 pub fn has_source_ext(p: &Path) -> bool {
     p.extension().and_then(|e| e.to_str()).is_some_and(|e| SOURCE_EXTS.contains(&e))
 }
@@ -440,6 +470,27 @@ fn package_from_path(p: &Path) -> Option<String> {
 }
 
 fn resolve(resolver: &Resolvers, from: &Path, spec: &str) -> Option<Target> {
+    // Aliases (webpack / babel / tangle.toml) replace the specifier outright.
+    match resolver.aliases.rewrite(spec) {
+        Some(Rewrite::Ignore) => return None,
+        Some(Rewrite::Candidates(cands)) => {
+            for c in &cands {
+                if let Ok(res) = resolver.resolve_file(from, c) {
+                    return Some(classify(res.path(), c));
+                }
+            }
+            return Some(Target::Unresolved);
+        }
+        None => {}
+    }
+    // Babel `root`: bare specifiers are also looked up in these directories.
+    if is_bare(spec) && !is_builtin(spec) {
+        for r in &resolver.aliases.roots {
+            if let Ok(res) = resolver.resolve_file(from, &r.join(spec).to_string_lossy()) {
+                return Some(classify(res.path(), spec));
+            }
+        }
+    }
     if is_builtin(spec) {
         // `node:fs` ≡ `fs`, but `node:sqlite` / `node:test` only exist with the
         // prefix (plain `sqlite` is an npm package), so keep it for those.
@@ -448,19 +499,7 @@ fn resolve(resolver: &Resolvers, from: &Path, spec: &str) -> Option<Target> {
         return Some(Target::Builtin(name.to_string()));
     }
     match resolver.resolve_file(from, spec) {
-        Ok(res) => {
-            let p = res.path();
-            if p.components().any(|c| c.as_os_str() == "node_modules") {
-                let pkg = if is_bare(spec) && !spec.starts_with('#') {
-                    package_name(spec).to_string()
-                } else {
-                    package_from_path(p).unwrap_or_else(|| spec.to_string())
-                };
-                Some(Target::Npm(pkg))
-            } else {
-                Some(Target::Local(p.to_path_buf()))
-            }
-        }
+        Ok(res) => Some(classify(res.path(), spec)),
         Err(ResolveError::Ignored(_)) => None,
         Err(ResolveError::Builtin { .. }) => Some(Target::Builtin(spec.to_string())),
         Err(_) if is_bare(spec) && !spec.starts_with('#') => {

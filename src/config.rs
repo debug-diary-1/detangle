@@ -149,6 +149,17 @@ pub struct Options {
     pub ignore_type_only: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tsconfig: Option<String>,
+    /// Import aliases, e.g. `"@" = "./src"` (`./` = relative to the root).
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub aliases: std::collections::BTreeMap<String, String>,
+    /// Take `resolve.alias` / `resolve.modules` / `resolve.extensions` from
+    /// this webpack config (evaluated with Node).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub webpack_config: Option<String>,
+    /// Take babel-plugin-module-resolver's `alias` / `root` from this Babel
+    /// config (.babelrc, babel.config.js or package.json).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub babel_config: Option<String>,
 }
 
 impl Default for Options {
@@ -161,6 +172,9 @@ impl Default for Options {
             cycles_ignore_type_only: true,
             ignore_type_only: false,
             tsconfig: None,
+            aliases: Default::default(),
+            webpack_config: None,
+            babel_config: None,
         }
     }
 }
