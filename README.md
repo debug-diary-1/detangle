@@ -217,16 +217,34 @@ tangle check --write-baseline .tangle-baseline.json   # record today's violation
 tangle check --baseline .tangle-baseline.json         # fail only on new ones
 ```
 
-## Migrating an existing JavaScript rules config
-
-If your rules live in a JavaScript config (a `.js`, `.cjs`, `.mjs` or `.json` file exporting `forbidden`, `allowed` and `required` rules plus `options`), tangle can run it directly or convert it. JavaScript configs are evaluated with Node, so `extends` chains that point at preset packages work too. Plain JSON configs don't need Node.
+## Migrating to tangle
 
 ```sh
-tangle check -c rules.config.js                   # run it as is
-tangle init --from rules.config.js                # convert it to tangle.toml
+tangle migrate --dry-run   # preview the generated tangle.toml
+tangle migrate             # write tangle.toml (+ .tangle-baseline.json)
+tangle check               # same checks as before, much faster
 ```
 
-Rule names, severities, regexes (including `$1` groups and lookarounds), `allowed`, `allowedSeverity`, `required`, module rules, `via`/`viaOnly`, licenses, dependency types and the `exclude`, `includeOnly`, `tsConfig`, `tsPreCompilationDeps`, `webpackConfig` (with its `env` and `arguments.mode`) and `babelConfig` options all carry over. A rule that uses something tangle can't honour exactly (for example `scope: "folder"` or the `npm-bundled` type) is skipped with a warning rather than silently loosened. A skipped `allowed` rule gets a louder warning, because dropping it adds violations.
+`tangle migrate` looks at the project root, converts every dependency-rule setup it finds into one `tangle.toml`, and tells you what to change:
+
+| Source | What's converted |
+|---|---|
+| **JavaScript rules configs** (`.js`, `.cjs`, `.mjs` or `.json` files declaring `forbidden`, `allowed` or `required` rules). These are recognised by content, not file name. | Every rule, `extends` presets, options, and the known-violations file they point at |
+| **ESLint** (`eslint.config.*`, `.eslintrc.{js,cjs,json}`, `package.json` `eslintConfig`) | `import/no-cycle`, `import/no-restricted-paths` (zones, `except`, `basePath`, messages) and `import/no-extraneous-dependencies` (dev/optional/peer globs), also under `import-x`. `files`, `ignores` and `overrides` scoping carry over (an `"off"` for test files becomes a `path_not`), and so do the `import/resolver` webpack and TypeScript settings. |
+| **madge** (`.madgerc`, `package.json` `madge`, or `madge --circular` in a script) | A circular-dependency rule, `excludeRegExp`, `tsConfig`, `webpackConfig`, `skipTypeImports` |
+| **Known-violation files** (JSON arrays of `{ from, to, rule: { name } }`) | `.tangle-baseline.json`, applied automatically through `options.baseline` |
+
+Rules found in several places (for example a madge cycle check and a cycle rule) are merged, keeping the stricter severity. Anything that can't be converted exactly is listed at the top of `tangle.toml` for review instead of being silently loosened. `package.json` scripts that ran the old tools get a suggested `tangle check` replacement.
+
+**Switching CI without surprises:** tangle finds cycles that other tools miss, so the first run may report more than before. `tangle check --write-baseline` records today's findings. From then on, `tangle check` fails only on new violations.
+
+You can also run a JavaScript rules config directly without converting it: `tangle check -c rules.config.js`.
+
+### Verified against the tools themselves
+
+- **ESLint 9 + eslint-plugin-import 2.32**, on a project using all three rules with zones, `except`, file-scoped overrides and dev-dependency globs: tangle's migrated config reports **exactly the same 7 violations**, rule for rule, file for file, import for import.
+- **madge 8 on excalidraw** (873 modules): madge's own dependency graph puts 168 files on cycles. `madge --circular` lists 128 of them; tangle reports all 168, with no extras, in 0.03 s against madge's 2.5 s.
+- **A JavaScript rules config with known violations:** all 14 known violations were carried into the baseline. The only findings left were genuine cycle dependencies the original setup never reported, each shown with its cycle.
 
 ## Cycle detection
 

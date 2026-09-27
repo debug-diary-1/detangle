@@ -12,6 +12,7 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 use serde_json::{Map, Value, json};
 
+use super::Imported;
 use crate::config::{Config, Options, Pat};
 use crate::rules::canonical_type;
 
@@ -20,10 +21,6 @@ pub fn is_js_config(path: &Path) -> bool {
     path.extension().and_then(|e| e.to_str()).is_some_and(|e| matches!(e, "js" | "cjs" | "mjs" | "json"))
 }
 
-pub struct Imported {
-    pub config: Config,
-    pub warnings: Vec<String>,
-}
 
 /// Loads (via Node) and merges `extends`, printing plain JSON.
 const LOADER: &str = r#"
@@ -259,6 +256,7 @@ fn regex_option(v: &Value, name: &str, warnings: &mut Vec<String>) -> Option<Pat
 
 pub fn convert(v: &Value) -> Imported {
     let mut warnings = vec![];
+    let mut known_violations = None;
     let mut config = Config::empty();
     let mut opts = Options { ignore_type_only: true, ..Options::default() };
 
@@ -298,7 +296,8 @@ pub fn convert(v: &Value) -> Imported {
                     opts.ignore_type_only = !on;
                     opts.cycles_ignore_type_only = !on;
                 }
-                "knownViolations" => warnings.push("options.knownViolations: use `tangle check --baseline` instead".into()),
+                // Converted to a tangle baseline by `tangle migrate`.
+                "knownViolations" => known_violations = val.as_str().map(String::from),
                 k if HARMLESS_OPTIONS.contains(&k) => {}
                 other => warnings.push(format!("options.{other} isn't supported (ignored)")),
             }
@@ -340,7 +339,13 @@ pub fn convert(v: &Value) -> Imported {
             Err(why) => warnings.push(format!("required rule '{}' skipped: {why}", label(r, i))),
         }
     }
-    Imported { config, warnings }
+    let summary = format!(
+        "{} forbidden, {} allowed, {} required rule(s)",
+        config.forbidden.len(),
+        config.allowed.len(),
+        config.required.len()
+    );
+    Imported { config, warnings, summary, known_violations }
 }
 
 /// Renders an imported config as a commented `tangle.toml`.
@@ -390,7 +395,8 @@ mod tests {
                 "reporterOptions": { "dot": {} },
                 "webpackConfig": { "fileName": "webpack.config.js", "env": { "production": true }, "arguments": { "mode": "production" } },
                 "babelConfig": { "fileName": ".babelrc" },
-                "exoticRequireStrings": ["want"]
+                "exoticRequireStrings": ["want"],
+                "knownViolations": "known.json"
             }
         });
         let imp = convert(&v);
@@ -416,6 +422,7 @@ mod tests {
         assert_eq!(o.babel_config.as_deref(), Some(".babelrc"));
         assert!(!w.contains("webpackConfig") && !w.contains("babelConfig"), "{w}");
         assert!(w.contains("options.exoticRequireStrings"), "{w}");
+        assert_eq!(imp.known_violations.as_deref(), Some("known.json"));
         assert!(!w.contains("reporterOptions") && !w.contains("doNotFollow"), "{w}");
         // Round-trips through TOML.
         let text = to_toml(&imp, Path::new("rules.config.js")).unwrap();

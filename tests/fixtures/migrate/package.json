@@ -1,0 +1,9 @@
+{
+  "name": "migrate-me",
+  "dependencies": { "react": "18" },
+  "scripts": {
+    "deps": "some-dep-checker --config .deps-rules.json src",
+    "cycles": "madge --circular --extensions ts src",
+    "build": "tsc"
+  }
+}

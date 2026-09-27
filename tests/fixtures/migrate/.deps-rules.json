@@ -1,0 +1,7 @@
+{
+  "forbidden": [
+    { "name": "no-circular", "severity": "warn", "from": {}, "to": { "circular": true } },
+    { "name": "app-not-to-test", "severity": "error", "from": { "path": "^src/app" }, "to": { "path": "^test/" } }
+  ],
+  "options": { "knownViolations": "known.json", "tsPreCompilationDeps": true }
+}

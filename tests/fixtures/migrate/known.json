@@ -1,0 +1,1 @@
+[{ "type": "dependency", "from": "src/app/main.ts", "to": "test/helpers.ts", "rule": { "name": "app-not-to-test", "severity": "error" } }]

@@ -76,9 +76,10 @@ enum Cmd {
         /// Ignore violations recorded in this baseline file
         #[arg(long)]
         baseline: Option<PathBuf>,
-        /// Record all current violations to this baseline file and exit 0
-        #[arg(long)]
-        write_baseline: Option<PathBuf>,
+        /// Record all current violations as the baseline and exit 0 (default
+        /// file: options.baseline, else .tangle-baseline.json)
+        #[arg(long, num_args = 0..=1, value_name = "FILE")]
+        write_baseline: Option<Option<PathBuf>>,
     },
     /// Export the dependency graph (dot, mermaid, json)
     Graph {
@@ -149,6 +150,18 @@ enum Cmd {
         #[arg(long, default_value_t = 10)]
         top: usize,
     },
+    /// Convert existing dependency rules (JS rules configs, ESLint import
+    /// rules, madge) and known-violation files into tangle.toml
+    Migrate {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Print the tangle.toml instead of writing it
+        #[arg(long)]
+        dry_run: bool,
+        /// Overwrite an existing tangle.toml
+        #[arg(long)]
+        force: bool,
+    },
     /// Write a starter tangle.toml
     Init {
         #[arg(default_value = ".")]
@@ -177,8 +190,11 @@ enum GraphFormat {
 
 pub struct Analysis {
     pub graph: Graph,
+    /// Violations, minus those in the configured baseline.
     pub violations: Vec<Violation>,
     pub config_path: Option<PathBuf>,
+    /// How many violations the baseline suppressed.
+    pub suppressed: usize,
 }
 
 /// A loaded project whose scan can be kept up to date incrementally.
@@ -224,9 +240,22 @@ impl Project {
     }
 
     fn analyze(&self) -> Result<Analysis> {
+        self.analyze_with(true)
+    }
+
+    /// The configured baseline file, if any (it may not exist yet).
+    fn baseline_path(&self) -> Option<PathBuf> {
+        self.cfg.options.baseline.as_ref().map(|b| self.root.join(b))
+    }
+
+    fn analyze_with(&self, use_baseline: bool) -> Result<Analysis> {
         let graph = Graph::build(&self.root, self.session.files(), self.session.work, &self.cfg.options);
-        let violations = rules::evaluate(&graph, &self.cfg)?;
-        Ok(Analysis { graph, violations, config_path: self.config_path.clone() })
+        let mut violations = rules::evaluate(&graph, &self.cfg)?;
+        let suppressed = match self.baseline_path().filter(|p| use_baseline && p.is_file()) {
+            Some(p) => rules::apply_baseline(&graph, &mut violations, &p)?,
+            None => 0,
+        };
+        Ok(Analysis { graph, violations, config_path: self.config_path.clone(), suppressed })
     }
 
     /// Applies filesystem changes and re-analyses. Returns the new analysis
@@ -324,16 +353,20 @@ fn run() -> Result<ExitCode> {
             }
         }
         Cmd::Check { target, format, strict, baseline, write_baseline } => {
-            let mut a = analyze(&target.path, target.config.as_deref(), target.mode.as_deref())?;
+            let project = Project::open(&target.path, target.config.as_deref(), target.mode.as_deref())?.announce();
             if let Some(path) = write_baseline {
+                let path = path.or_else(|| project.baseline_path()).unwrap_or_else(|| PathBuf::from(".tangle-baseline.json"));
+                let a = project.analyze_with(false)?;
                 rules::write_baseline(&a.graph, &a.violations, &path)?;
                 eprintln!("wrote {} violations to {}", a.violations.len(), path.display());
                 return Ok(ExitCode::SUCCESS);
             }
-            let suppressed = match &baseline {
-                Some(b) => rules::apply_baseline(&a.graph, &mut a.violations, b)?,
-                None => 0,
-            };
+            let mut a = project.analyze()?;
+            let suppressed = a.suppressed
+                + match &baseline {
+                    Some(b) => rules::apply_baseline(&a.graph, &mut a.violations, b)?,
+                    None => 0,
+                };
             match format {
                 CheckFormat::Text => print!("{}", report::text(&a.graph, &a.violations, suppressed)),
                 CheckFormat::Json => println!(
@@ -450,6 +483,86 @@ fn run() -> Result<ExitCode> {
             let a = analyze(&target.path, target.config.as_deref(), target.mode.as_deref())?;
             print!("{}", report::stats(&a.graph, &a.violations, top));
         }
+        Cmd::Migrate { path, dry_run, force } => {
+            let dir = std::fs::canonicalize(&path).with_context(|| format!("{} not found", path.display()))?;
+            let root = config::find_root(&dir);
+            let sources = migrate::discover(&root);
+            if sources.is_empty() {
+                println!("No existing dependency rules found in {}.", root.display());
+                println!("Looked for: JS/JSON rules configs (forbidden/allowed/required), ESLint import rules, madge.");
+                println!("Start from tangle's defaults with `tangle init`, or pass a config: `tangle init --from FILE`.");
+                return Ok(ExitCode::SUCCESS);
+            }
+            let m = migrate::migrate(&root, &sources)?;
+            const BASELINE: &str = ".tangle-baseline.json";
+            // Always reference the baseline file (ignored while it doesn't exist),
+            // so `tangle check --write-baseline` works straight away.
+            let text = migrate::render(&m, Some(BASELINE))?;
+            // Never write a config tangle can't load.
+            let parsed: Config = toml::from_str(&text).context("internal error: generated tangle.toml doesn't parse")?;
+            rules::validate(&parsed).context("internal error: generated rules are invalid")?;
+
+            let out = root.join(config::CONFIG_FILE);
+            if dry_run {
+                print!("{text}");
+            } else if out.exists() && !force {
+                bail!("{} already exists (use --force to overwrite, or --dry-run to preview)", out.display());
+            }
+            let e = |s: String| if dry_run { eprintln!("{s}") } else { println!("{s}") };
+            e(p.bold("Converted"));
+            for (label, summary) in &m.converted {
+                e(format!("  {} {label}  {}", p.green("✓"), p.dim(summary)));
+            }
+            if let Some((from, entries)) = &m.baseline {
+                e(format!("  {} {from}  {}", p.green("✓"), p.dim(&format!("{} known violations → {BASELINE}", entries.len()))));
+            }
+            for label in &m.empty {
+                e(format!("  {} {label}  {}", p.dim("·"), p.dim("nothing to convert")));
+            }
+            if !m.merged.is_empty() {
+                e(format!("{} {}", p.bold("Merged duplicates"), p.dim(&format!("({})", m.merged.len()))));
+                for w in &m.merged {
+                    e(format!("  {w}"));
+                }
+            }
+            if !m.warnings.is_empty() {
+                e(p.bold(&format!("Needs review ({}) — also noted at the top of tangle.toml", m.warnings.len())));
+                for w in &m.warnings {
+                    e(format!("  {} {w}", p.yellow("!")));
+                }
+            }
+            if !m.scripts.is_empty() {
+                e(p.bold("Update these package.json scripts"));
+                for (name, cmd) in &m.scripts {
+                    e(format!("  \"{name}\": {}", p.dim(&format!("{cmd:?}"))));
+                    e(format!("  {}  \"{name}\": \"tangle check\"", p.green("→")));
+                }
+            }
+            if dry_run {
+                return Ok(ExitCode::SUCCESS);
+            }
+            std::fs::write(&out, &text)?;
+            if let Some((_, entries)) = &m.baseline {
+                std::fs::write(root.join(BASELINE), serde_json::to_string_pretty(entries)? + "\n")?;
+            }
+            println!("{} {}", p.green("wrote"), out.display());
+            // Show where things stand right away.
+            let a = Project::open(&root, None, None)?.analyze()?;
+            let (err, warn, info) = report::counts(&a.violations);
+            println!(
+                "{} {err} errors, {warn} warnings, {info} info{} — see them with `tangle check` or `tangle report --open`",
+                p.bold("Now:"),
+                if a.suppressed > 0 { format!(" ({} baselined)", a.suppressed) } else { String::new() }
+            );
+            if !a.violations.is_empty() {
+                println!(
+                    "{}",
+                    p.dim(&format!(
+                        "To switch CI over without new failures, accept today's findings with `tangle check --write-baseline` (writes {BASELINE}); new violations will still fail."
+                    ))
+                );
+            }
+        }
         Cmd::Init { path, from, force } => {
             let file = path.join(config::CONFIG_FILE);
             if file.exists() && !force {
@@ -474,6 +587,13 @@ fn run() -> Result<ExitCode> {
                     }
                 }
                 None => {
+                    let existing = migrate::discover(&config::find_root(&std::fs::canonicalize(&path)?));
+                    if !existing.is_empty() && !force {
+                        let names: Vec<String> = existing.iter().map(|s| s.label(&path)).collect();
+                        println!("Found existing dependency rules: {}", names.join(", "));
+                        println!("Run `tangle migrate` to convert them (or `tangle init --force` for the defaults).");
+                        return Ok(ExitCode::SUCCESS);
+                    }
                     std::fs::write(&file, config::DEFAULT_CONFIG)?;
                     println!("{} {}", p.green("created"), file.display());
                 }

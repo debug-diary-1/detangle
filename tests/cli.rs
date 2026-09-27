@@ -397,3 +397,80 @@ fn dotenv_precedence() {
     assert_eq!(with_vars, ["dotenv/vars", "expanded/vars-x"]);
     assert_eq!(disabled, ["dotenv/none", "expanded/none"]);
 }
+
+#[test]
+fn migrate_dry_run_merges_every_source() {
+    let out = Command::new(env!("CARGO_BIN_EXE_tangle"))
+        .args(["migrate", "tests/fixtures/migrate", "--dry-run"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let toml_text = String::from_utf8(out.stdout).unwrap();
+    let summary = String::from_utf8(out.stderr).unwrap();
+    // Nothing is written in a dry run.
+    assert!(!std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/migrate/tangle.toml").exists());
+
+    let cfg: toml::Value = toml::from_str(&toml_text).unwrap();
+    let names: Vec<&str> = cfg["forbidden"].as_array().unwrap().iter().map(|r| r["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["no-circular", "app-not-to-test", "import/no-cycle", "import/no-restricted-paths"]);
+    // madge's and the rules config's circular rules merged at the stricter severity.
+    assert_eq!(cfg["forbidden"][0]["severity"].as_str(), Some("error"));
+    // ESLint: the test-file override turned into path_not; the zone kept its message.
+    assert_eq!(cfg["forbidden"][2]["from"]["path_not"].as_str(), Some(r"^(?:.*/)?[^/]*\.test\.ts$"));
+    assert_eq!(cfg["forbidden"][3]["comment"].as_str(), Some("lib must not depend on app"));
+    let options = &cfg["options"];
+    assert_eq!(options["exclude_path"].as_str(), Some(r"\.stories\.ts$")); // madge
+    assert!(options["exclude"].as_array().unwrap().iter().any(|g| g.as_str() == Some("generated/**"))); // ESLint ignorePatterns
+    assert_eq!(options["baseline"].as_str(), Some(".tangle-baseline.json"));
+
+    for expected in [
+        "known.json  1 known violations",
+        "maxDepth 3 isn't supported",
+        "\"deps\": \"some-dep-checker --config .deps-rules.json src\"",
+        "\"cycles\": \"madge --circular --extensions ts src\"",
+        "\"cycles\": \"tangle check\"",
+    ] {
+        assert!(summary.contains(expected), "missing {expected:?} in:\n{summary}");
+    }
+}
+
+#[test]
+fn migrate_writes_config_and_baseline() {
+    let dir = std::env::temp_dir().join(format!("tangle-migrate-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    copy_dir(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/migrate"), &dir);
+    let run = |args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_tangle")).args(args).current_dir(&dir).env("NO_COLOR", "1").output().unwrap();
+        (String::from_utf8(out.stdout).unwrap(), out.status.code().unwrap())
+    };
+    let (out, code) = run(&["migrate"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(dir.join("tangle.toml").is_file() && dir.join(".tangle-baseline.json").is_file());
+    // A second run refuses to overwrite.
+    assert_ne!(run(&["migrate"]).1, 0);
+    // The known violation is baselined; the lib ⇄ app cycle is new.
+    let (out, _) = run(&["check", "-f", "json"]);
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let rules: Vec<&str> = v.as_array().unwrap().iter().map(|x| x["rule"].as_str().unwrap()).collect();
+    assert!(!rules.contains(&"app-not-to-test"), "{rules:?}");
+    assert!(rules.contains(&"no-circular") && rules.contains(&"import/no-restricted-paths"), "{rules:?}");
+    // Accept today's findings; check is then clean.
+    assert_eq!(run(&["check", "--write-baseline"]).1, 0);
+    assert_eq!(run(&["check"]).1, 0);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for e in std::fs::read_dir(from).unwrap() {
+        let e = e.unwrap();
+        let target = to.join(e.file_name());
+        if e.file_type().unwrap().is_dir() {
+            copy_dir(&e.path(), &target);
+        } else {
+            std::fs::copy(e.path(), target).unwrap();
+        }
+    }
+}

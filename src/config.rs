@@ -164,6 +164,10 @@ pub struct Options {
     /// config (.babelrc, babel.config.js or package.json).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub babel_config: Option<String>,
+    /// Known violations to ignore (a file written by `--write-baseline` or
+    /// `tangle migrate`), relative to the root.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub baseline: Option<String>,
     /// How Vite / webpack / Babel configs are evaluated.
     #[serde(default, skip_serializing_if = "ConfigEnv::is_default")]
     pub config_env: ConfigEnv,
@@ -270,6 +274,7 @@ impl Default for Options {
             webpack_config: None,
             vite_config: None,
             config_env: ConfigEnv::default(),
+            baseline: None,
             babel_config: None,
         }
     }
