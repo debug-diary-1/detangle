@@ -113,7 +113,7 @@ enum Outcome {
 /// files change; `r` forces a rebuild either way.
 pub fn run(
     initial: Analysis,
-    mut rebuild: impl FnMut(&Changes) -> Result<(Analysis, String)>,
+    mut rebuild: impl FnMut(&Changes) -> Result<(Option<Analysis>, String)>,
     mut watcher: Option<Watcher>,
 ) -> Result<()> {
     let mut terminal = ratatui::init();
@@ -136,7 +136,10 @@ pub fn run(
             drop(app);
             status = Some(match rebuild(&changed) {
                 Ok((a, summary)) => {
-                    analysis = a;
+                    // `None`: nothing the explorer shows changed.
+                    if let Some(a) = a {
+                        analysis = a;
+                    }
                     summary
                 }
                 Err(e) => format!("✖ reload failed: {e:#}"),

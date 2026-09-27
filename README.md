@@ -57,7 +57,8 @@ The project root is the nearest ancestor containing `tangle.toml`, or else `pack
 
 | Change | Work redone | VS Code `src/` |
 |---|---|---|
-| Edit a file | re-parse and re-resolve only that file, then rebuild the graph and rerun the rules | ~70 ms |
+| Edit a file without changing its imports | re-parse and re-resolve only that file; the analysis is kept, since the graph can't have changed | ~5 ms |
+| Edit a file's imports | re-parse and re-resolve only that file, then rebuild the graph and rerun the rules | ~50 ms |
 | Add, remove or rename a file or folder | walk the tree again and re-resolve every import (the new file can change what `./foo` points to); only new or changed files are re-parsed | ~170 ms |
 | Change `tsconfig`, `package.json` or `tangle.toml`, or press `r` | full rebuild | ~300 ms |
 

@@ -340,19 +340,24 @@ impl Project {
     /// Applies filesystem changes and re-analyses. Returns the new analysis
     /// and a one-line description of the work done. On error (e.g. a
     /// half-edited tangle.toml) the previous state is kept.
-    fn rebuild(&mut self, changes: &watch::Changes) -> Result<(Analysis, String)> {
+    /// Returns `None` for the analysis when it can't have changed: the edited
+    /// files still import exactly what they did (the common case of editing
+    /// code rather than imports).
+    fn rebuild(&mut self, changes: &watch::Changes) -> Result<(Option<Analysis>, String)> {
         let t = std::time::Instant::now();
         if changes.config {
             *self = Project::open(&self.dir, self.config_arg.as_deref(), self.mode_arg.as_deref())?;
         } else {
             self.session.update(&changes.paths.iter().cloned().collect::<Vec<_>>())?;
         }
-        let a = self.analyze()?;
         let w = self.session.work;
+        let a = if w.graph_changed { Some(self.analyze()?) } else { None };
         let work = if changes.config {
             format!("full rebuild of {} files", w.reparsed)
         } else if w.walked && w.reresolved > w.reparsed {
             format!("{} reparsed, all re-resolved", w.reparsed)
+        } else if a.is_none() {
+            report::plural(w.reparsed, "file") + " reparsed, imports unchanged"
         } else {
             report::plural(w.reparsed, "file") + " reparsed"
         };
@@ -431,6 +436,8 @@ fn run() -> Result<ExitCode> {
             let root = config::find_root(&dir);
             let mut watcher = watch::Watcher::new(&root)?;
             let mut project: Option<Project> = None;
+            // The analysis on screen, kept while edits don't change imports.
+            let mut shown: Option<Analysis> = None;
             let mut changes = watch::Changes::full();
             loop {
                 // Incremental when we have a project; otherwise (first run, or
@@ -440,7 +447,7 @@ fn run() -> Result<ExitCode> {
                     None => Project::open(&t.path, t.config.as_deref(), t.mode.as_deref()).and_then(|p| {
                         let a = p.analyze()?;
                         project = Some(p);
-                        Ok((a, None))
+                        Ok((Some(a), None))
                     }),
                 };
                 print!("\x1b[2J\x1b[3J\x1b[H");
@@ -449,7 +456,12 @@ fn run() -> Result<ExitCode> {
                         if let Some(s) = status {
                             println!("{}\n", p.dim(&s));
                         }
-                        print!("{}", report::text(&a.graph, &a.violations, 0, &report::Stale::none()));
+                        if a.is_some() {
+                            shown = a;
+                        }
+                        if let Some(a) = &shown {
+                            print!("{}", report::text(&a.graph, &a.violations, 0, &report::Stale::none()));
+                        }
                     }
                     Err(e) => println!("{} {e:#}", p.red("error:")),
                 }

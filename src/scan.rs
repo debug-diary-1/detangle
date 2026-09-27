@@ -122,7 +122,7 @@ impl Detect {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Target {
     Local(PathBuf),
     Npm(String),
@@ -130,7 +130,7 @@ pub enum Target {
     Unresolved,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Import {
     pub specifier: String,
     pub flags: ImportFlags,
@@ -298,6 +298,9 @@ pub struct Work {
     pub walked: bool,
     pub reparsed: usize,
     pub reresolved: usize,
+    /// Some file's resolved imports or parse errors changed, or files came
+    /// or went: the graph must be rebuilt.
+    pub graph_changed: bool,
     pub scan_ms: f64,
 }
 
@@ -353,7 +356,7 @@ impl Session {
         };
         s.reindex();
         let n = s.files.len();
-        s.work = Work { walked: true, reparsed: n, reresolved: n, scan_ms: ms(t) };
+        s.work = Work { walked: true, reparsed: n, reresolved: n, graph_changed: true, scan_ms: ms(t) };
         Ok(s)
     }
 
@@ -403,6 +406,7 @@ impl Session {
                 self.resolve_all();
                 self.reindex();
                 work.reresolved = self.files.len();
+                work.graph_changed = true;
                 work.scan_ms = ms(t);
                 self.work = work;
                 return Ok(());
@@ -435,6 +439,8 @@ impl Session {
         work.reparsed = updated.len();
         work.reresolved = updated.len();
         for (i, f) in updated {
+            let old = &self.files[i];
+            work.graph_changed |= old.imports != f.imports || old.parse_errors != f.parse_errors;
             self.files[i] = f;
         }
         work.scan_ms = ms(t);
@@ -1212,28 +1218,33 @@ export const f = (x) => [module.require("./g"), process.getBuiltinModule("fs"), 
         w("src/feat/x.ts", "import '../b'");
         let mut s = Session::new(&root, &src, &opts).unwrap();
 
-        let mut step = |name: &str, changed: &[&str], expect_walk: bool| {
+        let mut step = |name: &str, changed: &[&str], expect_walk: bool, expect_graph: bool| {
             let paths: Vec<PathBuf> = changed.iter().map(|p| root.join(p)).collect();
             s.update(&paths).unwrap();
             assert_eq!(s.work.walked, expect_walk, "{name}: walked");
+            assert_eq!(s.work.graph_changed, expect_graph, "{name}: graph changed");
             let fresh = Session::new(&root, &src, &opts).unwrap();
             assert_eq!(snapshot(&s), snapshot(&fresh), "{name}: incremental != full");
         };
 
         w("src/b.ts", "import './a'");
-        step("edit", &["src/b.ts"], false);
+        step("edit", &["src/b.ts"], false, true);
+        w("src/b.ts", "import './a'; const x = 1;");
+        step("edit without import changes", &["src/b.ts"], false, false);
+        w("src/b.ts", "import './a'; const = ;");
+        step("new parse error", &["src/b.ts"], false, true);
         w("src/c.ts", "export {}"); // a.ts's './c' now resolves
-        step("add file", &["src/c.ts"], true);
+        step("add file", &["src/c.ts"], true, true);
         std::fs::remove_file(root.join("src/b.ts")).unwrap(); // './b' now unresolved
-        step("delete file", &["src/b.ts"], true);
+        step("delete file", &["src/b.ts"], true, true);
         std::fs::rename(root.join("src/feat"), root.join("src/feature")).unwrap();
-        step("rename dir", &["src/feat", "src/feature"], true);
+        step("rename dir", &["src/feat", "src/feature"], true, true);
         w("src/a.ts", "import './c'; import './x';");
         w("src/a.ts", "import './c'; import './y';"); // same size, same instant
-        step("same-size edit", &["src/a.ts"], false);
+        step("same-size edit", &["src/a.ts"], false, true);
         w("src/tmp.ts", "import './c'");
         std::fs::rename(root.join("src/tmp.ts"), root.join("src/c.ts")).unwrap(); // atomic save
-        step("atomic save", &["src/tmp.ts", "src/c.ts"], false); // file set unchanged: no walk
+        step("atomic save", &["src/tmp.ts", "src/c.ts"], false, true); // file set unchanged: no walk
         std::fs::remove_dir_all(&tmp).unwrap();
     }
 
