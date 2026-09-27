@@ -213,7 +213,7 @@ fn path_spans(id: &str, kind: ModuleKind) -> Vec<Span<'static>> {
 
 fn edge_tags(e: &Edge) -> Vec<Span<'static>> {
     let mut v = vec![];
-    for t in &e.types {
+    for t in e.types {
         let (label, color) = match *t {
             "npm-dev" => ("dev", Color::Magenta),
             "npm-peer" => ("peer", Color::Magenta),

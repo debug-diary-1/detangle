@@ -5,6 +5,7 @@ use std::collections::{HashSet, VecDeque};
 use rustc_hash::FxHashMap as HashMap;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use petgraph::algo::tarjan_scc;
 use petgraph::graph::{DiGraph, NodeIndex};
@@ -49,14 +50,16 @@ pub struct Module {
 pub struct Edge {
     pub from: usize,
     pub to: usize,
-    pub specifier: String,
+    /// Shared with the scan's import (no copy per edge).
+    pub specifier: Arc<str>,
     /// When the file imports the target more than once: every import
     /// (specifier and kind). `flags` merges them.
     #[serde(skip)]
-    pub each: Vec<(String, ImportFlags)>,
+    pub each: Vec<(Arc<str>, ImportFlags)>,
     pub flags: ImportFlags,
-    /// Dependency types, e.g. `["npm-dev", "type-only"]`.
-    pub types: Vec<&'static str>,
+    /// Dependency types, e.g. `["npm-dev", "type-only"]`. Interned: edges
+    /// share the few distinct lists (see `intern_types`).
+    pub types: &'static [&'static str],
     pub circular: bool,
     /// npm package declared in more than one package.json section.
     #[serde(skip)]
@@ -67,9 +70,9 @@ impl Edge {
     /// The individual imports behind the edge: (specifier, kind).
     pub fn imports(&self) -> Vec<(&str, ImportFlags)> {
         if self.each.is_empty() {
-            vec![(self.specifier.as_str(), self.flags)]
+            vec![(&*self.specifier, self.flags)]
         } else {
-            self.each.iter().map(|(s, f)| (s.as_str(), *f)).collect()
+            self.each.iter().map(|(s, f)| (&**s, *f)).collect()
         }
     }
 }
@@ -211,7 +214,7 @@ impl Graph {
                             specifier: imp.specifier.clone(),
                             each: vec![],
                             flags: imp.flags,
-                            types: vec![],
+                            types: &[],
                             circular: false,
                             multi_type: false,
                         });
@@ -303,11 +306,7 @@ impl Graph {
                         g.members[i].push(mi);
                         let ge = &mut g.edges[i];
                         ge.flags = ge.flags.merge(e.flags);
-                        for t in &e.types {
-                            if !ge.types.contains(t) {
-                                ge.types.push(t);
-                            }
-                        }
+                        ge.types = union_types(ge.types, e.types);
                     }
                     None => {
                         seen.insert((a, b), g.edges.len());
@@ -317,8 +316,8 @@ impl Graph {
                 }
             }
             for ge in &mut g.edges {
-                ge.types.retain(|t| !IMPORT_KIND_TYPES.contains(t));
-                ge.types = edge_types(std::mem::take(&mut ge.types), ge.flags);
+                let base = ge.types.iter().copied().filter(|t| !IMPORT_KIND_TYPES.contains(t)).collect();
+                ge.types = edge_types(base, ge.flags);
             }
         }
         g.link();
@@ -425,11 +424,7 @@ impl Graph {
                             let fe = &mut f.edges[i];
                             fe.flags = fe.flags.merge(e.flags);
                             fe.multi_type |= e.multi_type;
-                            for ty in &e.types {
-                                if !fe.types.contains(ty) {
-                                    fe.types.push(ty);
-                                }
-                            }
+                            fe.types = union_types(fe.types, e.types);
                         }
                         None => {
                             seen.insert((xi, t), f.edges.len());
@@ -449,8 +444,9 @@ impl Graph {
             }
             // `type-only` etc. describe the merged edge, not any one import.
             for fe in &mut f.edges {
-                fe.types.retain(|t| !matches!(*t, "type-only" | "dynamic" | "require" | "reexport" | "resource"));
-                fe.types = edge_types(std::mem::take(&mut fe.types), fe.flags);
+                let base =
+                    fe.types.iter().copied().filter(|t| !matches!(*t, "type-only" | "dynamic" | "require" | "reexport" | "resource")).collect();
+                fe.types = edge_types(base, fe.flags);
             }
             f.couplings = (0..f.modules.len())
                 .map(|i| (ca.get(&i).copied().unwrap_or(0), ce.get(&i).copied().unwrap_or(0)))
@@ -699,7 +695,7 @@ impl Graph {
 
 /// `base` is the kind of target — for npm packages every package.json
 /// section declaring it (e.g. `["npm", "npm-dev"]`), primary first.
-fn edge_types(base: Vec<&'static str>, f: ImportFlags) -> Vec<&'static str> {
+fn edge_types(base: Vec<&'static str>, f: ImportFlags) -> &'static [&'static str] {
     let mut t = base;
     if f.type_only {
         t.push("type-only");
@@ -731,7 +727,44 @@ fn edge_types(base: Vec<&'static str>, f: ImportFlags) -> Vec<&'static str> {
     if f.builtin_call {
         t.push("process-get-builtin-module");
     }
-    t
+    intern_types(t)
+}
+
+/// `a` plus the types of `b` it lacks, in order.
+fn union_types(a: &'static [&'static str], b: &'static [&'static str]) -> &'static [&'static str] {
+    if b.iter().all(|t| a.contains(t)) {
+        return a;
+    }
+    let mut v = a.to_vec();
+    v.extend(b.iter().filter(|t| !a.contains(t)));
+    intern_types(v)
+}
+
+/// The shared copy of a list of dependency types. Only a few dozen distinct
+/// lists occur, so each is allocated once for the life of the process
+/// instead of once per edge.
+fn intern_types(t: Vec<&'static str>) -> &'static [&'static str] {
+    static ALL: std::sync::LazyLock<std::sync::Mutex<HashSet<&'static [&'static str]>>> =
+        std::sync::LazyLock::new(Default::default);
+    thread_local! {
+        static LOCAL: std::cell::RefCell<HashMap<Vec<&'static str>, &'static [&'static str]>> = Default::default();
+    }
+    LOCAL.with(|local| {
+        if let Some(&s) = local.borrow().get(&t) {
+            return s;
+        }
+        let mut all = ALL.lock().unwrap();
+        let s = match all.get(t.as_slice()) {
+            Some(&s) => s,
+            None => {
+                let s: &'static [&'static str] = Box::leak(t.clone().into_boxed_slice());
+                all.insert(s);
+                s
+            }
+        };
+        local.borrow_mut().insert(t, s);
+        s
+    })
 }
 
 /// Dependency types derived from how a module is imported (not what it is).

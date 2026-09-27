@@ -5,7 +5,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::time::SystemTime;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
@@ -132,7 +132,8 @@ pub enum Target {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Import {
-    pub specifier: String,
+    /// Shared with the scan's raw imports and the graph's edges.
+    pub specifier: Arc<str>,
     pub flags: ImportFlags,
     pub target: Target,
 }
@@ -243,7 +244,7 @@ mod cache {
             .iter()
             .map(|(rel, e)| {
                 let path = root.join(rel);
-                let raw = e.imports.iter().map(|(s, b)| (s.clone(), ImportFlags::from_bits(*b))).collect();
+                let raw = e.imports.iter().map(|(s, b)| (Arc::from(s.as_str()), ImportFlags::from_bits(*b))).collect();
                 let file = ScannedFile { path: path.clone(), imports: vec![], parse_errors: e.errors, raw, stamp: parse_meta(&e.meta) };
                 let hash = (content && !e.hash.is_empty()).then(|| e.hash.clone());
                 (path, Hit { file, hash })
@@ -263,7 +264,7 @@ mod cache {
                 if let Some(e) = loaded.get(&rel).filter(|e| e.meta == m) {
                     return Some((rel, e.clone()));
                 }
-                let imports = f.raw.iter().map(|(s, fl)| (s.clone(), fl.to_bits())).collect();
+                let imports = f.raw.iter().map(|(s, fl)| (s.to_string(), fl.to_bits())).collect();
                 let hash = if content { hash(&std::fs::read(&f.path).ok()?) } else { String::new() };
                 Some((rel, Entry { meta: m, hash, errors: f.parse_errors, imports }))
             })
@@ -288,7 +289,7 @@ pub struct ScannedFile {
     pub imports: Vec<Import>,
     pub parse_errors: usize,
     /// Unresolved imports, kept so a file can be re-resolved without re-parsing.
-    raw: Vec<(String, ImportFlags)>,
+    raw: Vec<(Arc<str>, ImportFlags)>,
     stamp: Stamp,
 }
 
@@ -712,7 +713,7 @@ impl DirMemo {
     }
 }
 
-fn extract(alloc: &Allocator, path: &Path, source: &str, detect: &Detect) -> (Vec<(String, ImportFlags)>, usize) {
+fn extract(alloc: &Allocator, path: &Path, source: &str, detect: &Detect) -> (Vec<(Arc<str>, ImportFlags)>, usize) {
     let mut c = Collector { out: vec![], decorator_depth: 0, detect };
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
     if !matches!(ext, "vue" | "svelte") {
@@ -847,7 +848,7 @@ fn resolve(resolver: &Resolvers, from: &Path, spec: &str) -> Option<Target> {
 }
 
 struct Collector<'d> {
-    out: Vec<(String, ImportFlags)>,
+    out: Vec<(Arc<str>, ImportFlags)>,
     decorator_depth: usize,
     detect: &'d Detect,
 }
@@ -863,7 +864,7 @@ static JSDOC_BRACKET: std::sync::LazyLock<regex::Regex> =
 
 impl Collector<'_> {
     fn push(&mut self, spec: &str, flags: ImportFlags) {
-        self.out.push((spec.to_string(), flags));
+        self.out.push((spec.into(), flags));
     }
 
     /// Imports written in comments: triple-slash directives and (when
@@ -1033,7 +1034,7 @@ mod tests {
 
     fn specs(src: &str) -> Vec<(String, ImportFlags)> {
         let alloc = Allocator::default();
-        extract(&alloc, Path::new("x.ts"), src, &Detect::default()).0
+        extract(&alloc, Path::new("x.ts"), src, &Detect::default()).0.into_iter().map(|(s, f)| (s.to_string(), f)).collect()
     }
 
     #[test]
@@ -1082,11 +1083,11 @@ define("id", ["./a", "require", "exports"], function (a) { require(["./b"], () =
 /** @param {import("./d.js").D} x */
 export const f = (x) => [module.require("./g"), process.getBuiltinModule("fs"), other.require("./no")];
 "#;
-        let plain: Vec<String> = extract(&alloc, Path::new("x.js"), src, &Detect::default()).0.into_iter().map(|(s, _)| s).collect();
+        let plain: Vec<String> = extract(&alloc, Path::new("x.js"), src, &Detect::default()).0.into_iter().map(|(s, _)| s.to_string()).collect();
         assert_eq!(plain, ["./a", "./b", "./e.d.ts", "node", "./legacy"]);
         let detect = Detect { jsdoc: true, builtin_calls: true, exotic: vec!["module.require".into()] };
         let got = extract(&alloc, Path::new("x.js"), src, &detect).0;
-        let names: Vec<&str> = got.iter().map(|(s, _)| s.as_str()).collect();
+        let names: Vec<&str> = got.iter().map(|(s, _)| &**s).collect();
         assert_eq!(names, ["./a", "./b", "./g", "fs", "./e.d.ts", "node", "./legacy", "./c.js", "./d.js"]);
         let f = |i: usize| got[i].1;
         assert!(f(0).amd && f(1).amd && f(2).exotic == 1 && f(3).builtin_call);
@@ -1180,7 +1181,7 @@ export const f = (x) => [module.require("./g"), process.getBuiltinModule("fs"), 
         let vue = "<template><Child/></template>\n<script setup lang=\"ts\">\nimport Child from './Child.vue'\nimport type { P } from './types'\n</script>\n";
         let (got, errors) = extract(&alloc, Path::new("A.vue"), vue, &Detect::default());
         assert_eq!(errors, 0);
-        assert_eq!(got.iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>(), ["./Child.vue", "./types"]);
+        assert_eq!(got.iter().map(|(s, _)| &**s).collect::<Vec<_>>(), ["./Child.vue", "./types"]);
         assert!(got[1].1.type_only);
         let svelte = "<script>\n  import Button from './Button.svelte';\n  $: doubled = count * 2;\n</script>\n<Button />";
         let (got, errors) = extract(&alloc, Path::new("B.svelte"), svelte, &Detect::default());

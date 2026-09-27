@@ -961,7 +961,7 @@ mod tests {
             ScannedFile::for_test(
                 root.join(name),
                 deps.iter()
-                    .map(|d| Import { specifier: d.to_string(), flags: ImportFlags::default(), target: T::Local(root.join(d)) })
+                    .map(|d| Import { specifier: (*d).into(), flags: ImportFlags::default(), target: T::Local(root.join(d)) })
                     .collect(),
             )
         };
@@ -995,7 +995,7 @@ mod tests {
             ScannedFile::for_test(
                 root.join(name),
                 deps.iter()
-                    .map(|d| Import { specifier: d.to_string(), flags: ImportFlags::default(), target: T::Local(root.join(d)) })
+                    .map(|d| Import { specifier: (*d).into(), flags: ImportFlags::default(), target: T::Local(root.join(d)) })
                     .collect(),
             )
         };
@@ -1057,7 +1057,7 @@ mod tests {
             ScannedFile::for_test(
                 root.join(name),
                 deps.iter()
-                    .map(|d| Import { specifier: d.to_string(), flags: ImportFlags::default(), target: T::Local(root.join(d)) })
+                    .map(|d| Import { specifier: (*d).into(), flags: ImportFlags::default(), target: T::Local(root.join(d)) })
                     .collect(),
             )
         };

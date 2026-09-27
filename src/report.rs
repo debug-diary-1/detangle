@@ -55,7 +55,7 @@ pub fn counts(vs: &[Violation]) -> (usize, usize, usize) {
 fn imports<'g>(g: &'g Graph, v: &Violation) -> impl Iterator<Item = (&'g str, &'g str, &'g str)> {
     v.imports.iter().map(|&i| {
         let e = &g.edges[i];
-        (g.modules[e.from].id.as_str(), e.specifier.as_str(), g.modules[e.to].id.as_str())
+        (g.modules[e.from].id.as_str(), &*e.specifier, g.modules[e.to].id.as_str())
     })
 }
 
@@ -529,7 +529,7 @@ pub fn graph_json<'g>(g: &'g Graph, vs: &'g [Violation], view: &GraphView) -> im
                     .map(|edge| DependencyJson {
                         module: &g.modules[edge.to].id,
                         specifier: &edge.specifier,
-                        types: &edge.types,
+                        types: edge.types,
                         circular: edge.circular,
                     })
                     .collect(),
