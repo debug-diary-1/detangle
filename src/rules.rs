@@ -878,22 +878,56 @@ fn baseline_key(g: &Graph, v: &Violation) -> BaselineEntry {
     }
 }
 
-pub fn write_baseline(g: &Graph, vs: &[Violation], path: &Path) -> Result<()> {
-    let entries: Vec<_> = vs.iter().map(|v| baseline_key(g, v)).collect();
-    std::fs::write(path, serde_json::to_string_pretty(&entries)? + "\n")?;
-    Ok(())
+fn read_baseline(path: &Path) -> Result<Vec<BaselineEntry>> {
+    let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))
 }
 
-/// Removes baselined violations; returns how many were suppressed.
-pub fn apply_baseline(g: &Graph, vs: &mut Vec<Violation>, path: &Path) -> Result<usize> {
-    let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    let known: HashSet<BaselineEntry> = serde_json::from_str::<Vec<_>>(&text)
-        .with_context(|| format!("parsing {}", path.display()))?
-        .into_iter()
-        .collect();
+/// Writes the baseline. With `shrink_only`, an existing baseline only loses
+/// the entries that no longer occur: new violations aren't added.
+/// Returns how many entries were written.
+pub fn write_baseline(g: &Graph, vs: &[Violation], path: &Path, shrink_only: bool) -> Result<usize> {
+    let current: Vec<BaselineEntry> = vs.iter().map(|v| baseline_key(g, v)).collect();
+    let entries = if shrink_only && path.is_file() {
+        let now: HashSet<&BaselineEntry> = current.iter().collect();
+        read_baseline(path)?.into_iter().filter(|e| now.contains(e)).collect()
+    } else {
+        current
+    };
+    std::fs::write(path, serde_json::to_string_pretty(&entries)? + "\n")?;
+    Ok(entries.len())
+}
+
+/// What applying a baseline did.
+#[derive(Debug, Default)]
+pub struct BaselineUse {
+    /// Violations suppressed.
+    pub suppressed: usize,
+    /// Entries that no longer occur (fixed since the baseline was written).
+    pub stale: Vec<BaselineEntry>,
+}
+
+/// Removes baselined violations.
+pub fn apply_baseline(g: &Graph, vs: &mut Vec<Violation>, path: &Path) -> Result<BaselineUse> {
+    let entries = read_baseline(path)?;
+    let known: HashSet<&BaselineEntry> = entries.iter().collect();
+    let mut seen: HashSet<BaselineEntry> = HashSet::new();
     let before = vs.len();
-    vs.retain(|v| !known.contains(&baseline_key(g, v)));
-    Ok(before - vs.len())
+    vs.retain(|v| {
+        let key = baseline_key(g, v);
+        let hit = known.contains(&key);
+        if hit {
+            seen.insert(key);
+        }
+        !hit
+    });
+    let mut stale: Vec<BaselineEntry> = vec![];
+    for e in entries {
+        if !seen.contains(&e) && !stale.contains(&e) {
+            stale.push(e);
+        }
+    }
+    Ok(BaselineUse { suppressed: before - vs.len(), stale })
 }
 
 #[cfg(test)]

@@ -18,7 +18,7 @@ use std::process::ExitCode;
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
-use crate::config::{Config, Severity};
+use crate::config::Config;
 use crate::graph::{Graph, ModuleKind};
 use crate::report::Paint;
 use crate::rules::Violation;
@@ -81,6 +81,9 @@ enum Cmd {
         /// file: options.baseline, else .tangle-baseline.json)
         #[arg(long, num_args = 0..=1, value_name = "FILE")]
         write_baseline: Option<Option<PathBuf>>,
+        /// How --write-baseline updates an existing baseline
+        #[arg(long, value_enum, default_value_t = BaselineMode::Full, requires = "write_baseline")]
+        baseline_mode: BaselineMode,
     },
     /// Export the dependency graph (dot, mermaid, json)
     Graph {
@@ -179,7 +182,22 @@ enum Cmd {
 enum CheckFormat {
     Text,
     Json,
+    /// GitHub Actions annotations
     Github,
+    /// Markdown, e.g. for a pull-request comment or job summary
+    Markdown,
+    /// TeamCity service messages
+    Teamcity,
+    /// Azure DevOps logging commands
+    Azure,
+}
+
+#[derive(Clone, Copy, PartialEq, ValueEnum)]
+enum BaselineMode {
+    /// Record every current violation
+    Full,
+    /// Only drop entries that no longer occur; never add new ones
+    ShrinkOnly,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -196,6 +214,8 @@ pub struct Analysis {
     pub config_path: Option<PathBuf>,
     /// How many violations the baseline suppressed.
     pub suppressed: usize,
+    /// Baseline entries that no longer occur.
+    pub stale: Vec<rules::BaselineEntry>,
 }
 
 /// A loaded project whose scan can be kept up to date incrementally.
@@ -257,11 +277,11 @@ impl Project {
         let mut graph = Graph::build(&self.root, self.session.files(), self.session.work, &self.cfg.options);
         graph.assign_groups(&self.groups, self.cfg.options.group_match == config::GroupMatch::Deepest);
         let mut violations = rules::evaluate(&graph, &self.cfg)?;
-        let suppressed = match self.baseline_path().filter(|p| use_baseline && p.is_file()) {
+        let used = match self.baseline_path().filter(|p| use_baseline && p.is_file()) {
             Some(p) => rules::apply_baseline(&graph, &mut violations, &p)?,
-            None => 0,
+            None => Default::default(),
         };
-        Ok(Analysis { graph, violations, config_path: self.config_path.clone(), suppressed })
+        Ok(Analysis { graph, violations, config_path: self.config_path.clone(), suppressed: used.suppressed, stale: used.stale })
     }
 
     /// Applies filesystem changes and re-analyses. Returns the new analysis
@@ -350,7 +370,7 @@ fn run() -> Result<ExitCode> {
                         if let Some(s) = status {
                             println!("{}\n", p.dim(&s));
                         }
-                        print!("{}", report::text(&a.graph, &a.violations, 0));
+                        print!("{}", report::text(&a.graph, &a.violations, 0, &report::Stale::none()));
                     }
                     Err(e) => println!("{} {e:#}", p.red("error:")),
                 }
@@ -358,35 +378,46 @@ fn run() -> Result<ExitCode> {
                 changes = watcher.wait();
             }
         }
-        Cmd::Check { target, format, strict, baseline, write_baseline } => {
+        Cmd::Check { target, format, strict, baseline, write_baseline, baseline_mode } => {
             let project = Project::open(&target.path, target.config.as_deref(), target.mode.as_deref())?.announce();
             if let Some(path) = write_baseline {
                 let path = path.or_else(|| project.baseline_path()).unwrap_or_else(|| PathBuf::from(".tangle-baseline.json"));
                 let a = project.analyze_with(false)?;
-                rules::write_baseline(&a.graph, &a.violations, &path)?;
-                eprintln!("wrote {} violations to {}", a.violations.len(), path.display());
+                let n = rules::write_baseline(&a.graph, &a.violations, &path, baseline_mode == BaselineMode::ShrinkOnly)?;
+                eprintln!("wrote {n} violations to {}", path.display());
                 return Ok(ExitCode::SUCCESS);
             }
             let mut a = project.analyze()?;
-            let suppressed = a.suppressed
-                + match &baseline {
-                    Some(b) => rules::apply_baseline(&a.graph, &mut a.violations, b)?,
-                    None => 0,
-                };
+            let mut suppressed = a.suppressed;
+            if let Some(b) = &baseline {
+                let used = rules::apply_baseline(&a.graph, &mut a.violations, b)?;
+                suppressed += used.suppressed;
+                a.stale.extend(used.stale);
+            }
+            let stale = report::Stale { entries: &a.stale, severity: project.cfg.options.baseline_stale };
+            let (g, vs) = (&a.graph, &a.violations);
             match format {
-                CheckFormat::Text => print!("{}", report::text(&a.graph, &a.violations, suppressed)),
-                CheckFormat::Json => println!(
-                    "{}",
-                    serde_json::to_string_pretty(&report::violations_json(&a.graph, &a.violations))?
-                ),
-                CheckFormat::Github => {
-                    print!("{}", report::github(&a.graph, &a.violations));
-                    eprint!("{}", report::text(&a.graph, &a.violations, suppressed));
+                CheckFormat::Text => print!("{}", report::text(g, vs, suppressed, &stale)),
+                CheckFormat::Json => {
+                    let mut all = report::violations_json(g, vs).as_array().cloned().unwrap_or_default();
+                    all.extend(report::stale_json(&stale));
+                    println!("{}", serde_json::to_string_pretty(&all)?)
+                }
+                CheckFormat::Markdown => print!("{}", report::markdown(g, vs, &stale)),
+                CheckFormat::Github | CheckFormat::Teamcity | CheckFormat::Azure => {
+                    print!(
+                        "{}",
+                        match format {
+                            CheckFormat::Github => report::github(g, vs, &stale),
+                            CheckFormat::Teamcity => report::teamcity(g, vs, &stale),
+                            _ => report::azure(g, vs, &stale),
+                        }
+                    );
+                    eprint!("{}", report::text(g, vs, suppressed, &stale));
                 }
             }
-            let failing = a.violations.iter().any(|v| {
-                v.severity == Severity::Error || (strict && v.severity == Severity::Warn)
-            });
+            let (errors, warnings, _) = report::totals(vs, &stale);
+            let failing = errors > 0 || (strict && warnings > 0);
             return Ok(if failing { ExitCode::FAILURE } else { ExitCode::SUCCESS });
         }
         Cmd::Graph { target, format, collapse, focus, externals, no_types, output } => {

@@ -17,6 +17,8 @@ tangle                        # interactive explorer; rebuilds live as you edit
 tangle watch                  # re-run the rules on every change
 tangle check                  # run the rules; exit 1 on errors (CI)
 tangle check -f github        # GitHub Actions annotations on the PR
+tangle check -f markdown      # summary + details for a PR comment or job summary
+tangle check -f teamcity      # TeamCity inspections (also: -f azure for Azure DevOps)
 tangle check --strict         # also fail on warnings
 tangle report --open          # self-contained HTML report
 tangle stats                  # overview + hotspots
@@ -267,7 +269,10 @@ It follows the system light or dark theme. VS Code's 113k dependencies produce a
 ```sh
 tangle check --write-baseline .tangle-baseline.json   # record today's violations
 tangle check --baseline .tangle-baseline.json         # fail only on new ones
+tangle check --write-baseline --baseline-mode shrink-only   # drop fixed entries, never add new ones
 ```
+
+With `options.baseline_stale = "warn"` (or `"info"`, `"error"`), entries that no longer occur are reported as `stale-baseline-entry`, so the baseline doesn't silently keep permission for violations that were fixed.
 
 ## Migrating to tangle
 

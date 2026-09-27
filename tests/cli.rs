@@ -689,3 +689,45 @@ fn rule_conditions_match_the_js_rules_tool() {
     .collect();
     assert_eq!(got, want);
 }
+
+#[test]
+fn ci_formats_and_baseline_maintenance() {
+    let dir = std::env::temp_dir().join(format!("tangle-ci-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    copy_dir(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/nx-options"), &dir);
+    let run = |args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_tangle")).args(args).current_dir(&dir).env("NO_COLOR", "1").output().unwrap();
+        (String::from_utf8(out.stdout).unwrap(), out.status.code().unwrap())
+    };
+    run(&["migrate"]);
+    let (md, code) = run(&["check", "-f", "markdown"]);
+    assert_eq!(code, 1);
+    assert!(md.contains("❌ **13 errors, 0 warnings, 0 info**"), "{md}");
+    assert!(md.contains("| `@nx/enforce-module-boundaries` | error | 13 |"), "{md}");
+    assert!(md.contains("  - via `libs/ui/src/more.js` importing `@org/plain`"), "{md}");
+    let (tc, _) = run(&["check", "-f", "teamcity"]);
+    assert_eq!(tc.lines().filter(|l| l.starts_with("##teamcity[inspectionType ")).count(), 1);
+    assert!(tc.contains("file='apps/app/src/static.js' SEVERITY='ERROR'"), "{tc}");
+    let (az, _) = run(&["check", "-f", "azure"]);
+    assert!(az.contains("##vso[task.logissue type=error;sourcepath=libs/ui/src/self.js;code=@nx/enforce-module-boundaries;]"), "{az}");
+    assert!(az.ends_with("##vso[task.complete result=Failed;]13 errors, 0 warnings, 0 info\n"), "{az}");
+
+    // Baseline: fix some violations, add a new one.
+    run(&["check", "--write-baseline", "b.json"]);
+    std::fs::write(dir.join("libs/feat/src/index.js"), "export const feat = 1;\n").unwrap();
+    std::fs::write(dir.join("libs/util/src/new.js"), "import { ui } from \"@org/ui\";\nexport const n = ui;\n").unwrap();
+    let cfg = std::fs::read_to_string(dir.join("tangle.toml")).unwrap().replace("[options]", "[options]\nbaseline_stale = \"warn\"");
+    std::fs::write(dir.join("tangle.toml"), cfg).unwrap();
+    let (json, _) = run(&["check", "--baseline", "b.json", "-f", "json"]);
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let stale = v.as_array().unwrap().iter().filter(|x| x["rule"] == "stale-baseline-entry").count();
+    assert_eq!(stale, 3, "{json}");
+    run(&["check", "--write-baseline", "b.json", "--baseline-mode", "shrink-only"]);
+    let kept: Vec<serde_json::Value> = serde_json::from_str(&std::fs::read_to_string(dir.join("b.json")).unwrap()).unwrap();
+    // Fixed entries dropped; the new violation isn't added.
+    assert_eq!(kept.len(), 10);
+    let (text, code) = run(&["check", "--baseline", "b.json"]);
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert_eq!(code, 1);
+    assert!(text.contains("libs/util/src/new.js") && !text.contains("stale-baseline-entry"), "{text}");
+}

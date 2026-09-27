@@ -9,7 +9,7 @@ use serde_json::json;
 
 use crate::config::Severity;
 use crate::graph::{Graph, ModuleKind};
-use crate::rules::Violation;
+use crate::rules::{BaselineEntry, Violation};
 
 pub struct Paint(bool);
 
@@ -58,7 +58,7 @@ fn imports<'g>(g: &'g Graph, v: &Violation) -> impl Iterator<Item = (&'g str, &'
     })
 }
 
-pub fn text(g: &Graph, vs: &[Violation], suppressed: usize) -> String {
+pub fn text(g: &Graph, vs: &[Violation], suppressed: usize, stale: &Stale) -> String {
     let p = Paint::stdout();
     let mut out = String::new();
     // Group by rule, preserving the severity-first order from `evaluate`.
@@ -113,7 +113,18 @@ pub fn text(g: &Graph, vs: &[Violation], suppressed: usize) -> String {
         }
         out.push('\n');
     }
-    let (e, w, i) = counts(vs);
+    let stale_list = stale.reported();
+    if !stale_list.is_empty() {
+        let _ = writeln!(out, "{} {} {}", p.severity(stale.severity), p.bold(STALE_RULE), p.dim(&format!("({})", stale_list.len())));
+        let _ = writeln!(out, "  {}", p.dim(STALE_COMMENT));
+        for e in stale_list {
+            let target = e.to.as_ref().map(|t| format!(" {} {t}", p.dim("→"))).unwrap_or_default();
+            let _ = writeln!(out, "  {} {}{target}", p.dim(&format!("{}:", e.rule)), e.from);
+        }
+        out.push('\n');
+    }
+    let (e, w, i) = totals(vs, stale);
+    let status_empty = vs.is_empty() && stale_list.is_empty();
     let summary = format!(
         "{} modules, {} dependencies, {} · {:.0}ms",
         g.local_count(),
@@ -121,7 +132,7 @@ pub fn text(g: &Graph, vs: &[Violation], suppressed: usize) -> String {
         plural(g.cycles.len(), "cycle"),
         g.total_ms()
     );
-    let status = if vs.is_empty() {
+    let status = if status_empty {
         p.green(&p.bold("✔ no violations"))
     } else {
         let mark = if e > 0 { p.red("✖") } else { p.yellow("⚠") };
@@ -135,43 +146,251 @@ pub fn text(g: &Graph, vs: &[Violation], suppressed: usize) -> String {
     out
 }
 
+/// Baseline entries that no longer occur, and how to report them.
+pub struct Stale<'a> {
+    pub entries: &'a [BaselineEntry],
+    pub severity: Severity,
+}
+
+pub const STALE_RULE: &str = "stale-baseline-entry";
+const STALE_COMMENT: &str =
+    "This baseline entry no longer occurs. Remove fixed entries with `tangle check --write-baseline --baseline-mode shrink-only`.";
+
+impl Stale<'_> {
+    pub fn none() -> Stale<'static> {
+        Stale { entries: &[], severity: Severity::Off }
+    }
+
+    /// The entries to report (none when reporting is off).
+    pub fn reported(&self) -> &[BaselineEntry] {
+        if self.severity == Severity::Off { &[] } else { self.entries }
+    }
+}
+
+/// Errors, warnings and info, stale baseline entries included.
+pub fn totals(vs: &[Violation], stale: &Stale) -> (usize, usize, usize) {
+    let (mut e, mut w, mut i) = counts(vs);
+    let n = stale.reported().len();
+    match stale.severity {
+        Severity::Error => e += n,
+        Severity::Warn => w += n,
+        Severity::Info => i += n,
+        Severity::Off => {}
+    }
+    (e, w, i)
+}
+
+/// One annotation for a CI system: a finding on a file.
+struct Finding {
+    rule: String,
+    severity: Severity,
+    comment: Option<String>,
+    file: String,
+    message: String,
+}
+
+/// Violations (group ones on each import behind them) and stale entries.
+fn findings(g: &Graph, vs: &[Violation], stale: &Stale) -> Vec<Finding> {
+    let mut out = vec![];
+    for v in vs {
+        let base = |file: &str, message: String| Finding {
+            rule: v.rule.clone(),
+            severity: v.severity,
+            comment: v.comment.clone(),
+            file: file.to_string(),
+            message,
+        };
+        if !v.imports.is_empty() {
+            for (file, specifier, _) in imports(g, v) {
+                out.push(base(file, format!("imports {specifier} ({} → {})", v.source_id(g), v.target_id(g).unwrap_or(""))));
+            }
+            continue;
+        }
+        let message = if v.cycle.len() > 1 {
+            format!("cycle: {}", v.cycle_ids(g).join(" → "))
+        } else {
+            v.target_id(g).map(|t| format!("depends on {t}")).unwrap_or_default()
+        };
+        out.push(base(v.source_id(g), message));
+    }
+    for e in stale.reported() {
+        out.push(Finding {
+            rule: STALE_RULE.into(),
+            severity: stale.severity,
+            comment: Some(STALE_COMMENT.into()),
+            file: e.from.clone(),
+            message: format!("{}: {}{}", e.rule, e.from, e.to.as_ref().map(|t| format!(" → {t}")).unwrap_or_default()),
+        });
+    }
+    out
+}
+
+impl Finding {
+    fn text(&self) -> String {
+        match &self.comment {
+            Some(c) if self.message.is_empty() => c.clone(),
+            Some(c) => format!("{}\n{c}", self.message),
+            None => self.message.clone(),
+        }
+    }
+}
+
 /// GitHub Actions workflow commands → inline PR annotations.
-pub fn github(g: &Graph, vs: &[Violation]) -> String {
+pub fn github(g: &Graph, vs: &[Violation], stale: &Stale) -> String {
     let esc = |s: &str| s.replace('%', "%25").replace('\r', "%0D").replace('\n', "%0A");
     let mut out = String::new();
-    for v in vs {
-        let level = match v.severity {
+    for f in findings(g, vs, stale) {
+        let level = match f.severity {
             Severity::Error => "error",
             Severity::Warn => "warning",
             _ => "notice",
         };
-        let mut msg = match v.target_id(g) {
-            Some(t) => format!("depends on {t}"),
-            None => String::new(),
+        let _ = writeln!(out, "::{level} file={},title={}::{}", f.file, f.rule, esc(&f.text()));
+    }
+    out
+}
+
+/// TeamCity service messages: an inspection type per rule, an inspection
+/// per finding.
+pub fn teamcity(g: &Graph, vs: &[Violation], stale: &Stale) -> String {
+    let esc = |s: &str| {
+        s.replace('|', "||").replace('\'', "|'").replace('\n', "|n").replace('\r', "|r").replace('[', "|[").replace(']', "|]")
+    };
+    let all = findings(g, vs, stale);
+    let mut out = String::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+    for f in &all {
+        if seen.insert(&f.rule) {
+            let _ = writeln!(
+                out,
+                "##teamcity[inspectionType id='{0}' name='{0}' description='{1}' category='tangle']",
+                esc(&f.rule),
+                esc(f.comment.as_deref().unwrap_or(&f.rule))
+            );
+        }
+    }
+    for f in &all {
+        let severity = match f.severity {
+            Severity::Error => "ERROR",
+            Severity::Warn => "WARNING",
+            _ => "INFO",
         };
-        if v.cycle.len() > 1 {
-            msg = format!("cycle: {}", v.cycle_ids(g).join(" → "));
-        }
-        if let Some(c) = &v.comment {
-            msg = if msg.is_empty() { c.clone() } else { format!("{msg}\n{c}") };
-        }
-        // Group violations are annotated on the imports behind them.
-        if !v.imports.is_empty() {
-            for (file, specifier, _) in imports(g, v) {
-                let what = format!("imports {specifier} ({} → {})\n{msg}", v.source_id(g), v.target_id(g).unwrap_or(""));
-                let _ = writeln!(out, "::{level} file={file},title={}::{}", v.rule, esc(&what));
-            }
-            continue;
-        }
         let _ = writeln!(
             out,
-            "::{level} file={},title={}::{}",
-            v.source_id(g),
-            v.rule,
-            esc(&msg)
+            "##teamcity[inspection typeId='{}' message='{}' file='{}' SEVERITY='{severity}']",
+            esc(&f.rule),
+            esc(&f.message),
+            esc(&f.file)
         );
     }
     out
+}
+
+/// Azure DevOps logging commands: an issue per finding, then the result.
+pub fn azure(g: &Graph, vs: &[Violation], stale: &Stale) -> String {
+    let prop = |s: &str| s.replace('%', "%25").replace(';', "%3B").replace('\r', "%0D").replace('\n', "%0A").replace(']', "%5D");
+    let msg = |s: &str| s.replace('%', "%25").replace('\r', "%0D").replace('\n', "%0A");
+    let mut out = String::new();
+    for f in findings(g, vs, stale) {
+        let kind = if f.severity == Severity::Error { "error" } else { "warning" };
+        let _ = writeln!(out, "##vso[task.logissue type={kind};sourcepath={};code={};]{}", prop(&f.file), prop(&f.rule), msg(&f.text()));
+    }
+    let (e, w, i) = totals(vs, stale);
+    let result = if e > 0 {
+        "Failed"
+    } else if w + i > 0 {
+        "SucceededWithIssues"
+    } else {
+        "Succeeded"
+    };
+    let _ = writeln!(out, "##vso[task.complete result={result};]{}, {}, {i} info", plural(e, "error"), plural(w, "warning"));
+    out
+}
+
+/// Markdown, e.g. for a pull-request comment or a CI job summary.
+pub fn markdown(g: &Graph, vs: &[Violation], stale: &Stale) -> String {
+    let cell = |s: &str| s.replace('|', "\\|").replace('\n', " ");
+    let code = |s: &str| format!("`{}`", s.replace('`', "'"));
+    let mut out = String::from("## Dependency check\n\n");
+    let (e, w, i) = totals(vs, stale);
+    let summary = format!(
+        "{} modules, {} dependencies, {}",
+        g.local_count(),
+        g.edges.len(),
+        plural(g.cycles.len(), "cycle")
+    );
+    if e + w + i == 0 {
+        let _ = writeln!(out, "✅ **No rule violations.** {summary}");
+        return out;
+    }
+    let mark = if e > 0 { "❌" } else { "⚠️" };
+    let _ = writeln!(out, "{mark} **{}, {}, {i} info** · {summary}\n", plural(e, "error"), plural(w, "warning"));
+    // Rules, severity first, as `evaluate` sorts them.
+    let mut rules: Vec<(&str, Severity, Option<&str>, Vec<&Violation>)> = vec![];
+    for v in vs {
+        match rules.iter_mut().find(|r| r.0 == v.rule) {
+            Some(r) => {
+                if r.2 != v.comment.as_deref() {
+                    r.2 = None;
+                }
+                r.3.push(v);
+            }
+            None => rules.push((&v.rule, v.severity, v.comment.as_deref(), vec![v])),
+        }
+    }
+    let _ = writeln!(out, "| Rule | Severity | Violations | Description |\n|---|---|---:|---|");
+    for (rule, sev, comment, list) in &rules {
+        let _ = writeln!(out, "| {} | {} | {} | {} |", code(rule), sev.as_str(), list.len(), cell(comment.unwrap_or("")));
+    }
+    let stale_list = stale.reported();
+    if !stale_list.is_empty() {
+        let _ = writeln!(out, "| {} | {} | {} | {} |", code(STALE_RULE), stale.severity.as_str(), stale_list.len(), cell(STALE_COMMENT));
+    }
+    let total = vs.len() + stale_list.len();
+    let _ = writeln!(out, "\n<details>\n<summary>All {total} findings</summary>\n");
+    for (rule, sev, comment, list) in &rules {
+        let _ = writeln!(out, "### {} ({})\n", code(rule), sev.as_str());
+        for v in list {
+            let target = v.target_id(g).map(|t| format!(" → {}", code(t))).unwrap_or_default();
+            let _ = writeln!(out, "- {}{target}", code(v.source_id(g)));
+            if comment.is_none()
+                && let Some(c) = &v.comment
+            {
+                let _ = writeln!(out, "  - {}", cell(c));
+            }
+            if v.cycle.len() > 1 {
+                let _ = writeln!(out, "  - cycle: {}", v.cycle_ids(g).iter().map(|c| code(c)).collect::<Vec<_>>().join(" → "));
+            }
+            for (file, specifier, _) in imports(g, v) {
+                let _ = writeln!(out, "  - via {} importing {}", code(file), code(specifier));
+            }
+        }
+        out.push('\n');
+    }
+    if !stale_list.is_empty() {
+        let _ = writeln!(out, "### {} ({})\n", code(STALE_RULE), stale.severity.as_str());
+        for e in stale_list {
+            let target = e.to.as_ref().map(|t| format!(" → {}", code(t))).unwrap_or_default();
+            let _ = writeln!(out, "- {}: {}{target}", code(&e.rule), code(&e.from));
+        }
+        out.push('\n');
+    }
+    out.push_str("</details>\n");
+    out
+}
+
+/// Stale entries as JSON violation records.
+pub fn stale_json(stale: &Stale) -> Vec<serde_json::Value> {
+    stale
+        .reported()
+        .iter()
+        .map(|e| {
+            json!({
+                "rule": STALE_RULE, "severity": stale.severity, "comment": STALE_COMMENT, "scope": "module",
+                "from": e.from, "to": e.to, "cycle": [], "imports": [], "baseline_rule": e.rule,
+            })
+        })
+        .collect()
 }
 
 pub fn violations_json(g: &Graph, vs: &[Violation]) -> serde_json::Value {

@@ -139,6 +139,10 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
+fn is_off(s: &Severity) -> bool {
+    *s == Severity::Off
+}
+
 fn yes() -> bool {
     true
 }
@@ -186,6 +190,9 @@ pub struct Options {
     /// `tangle migrate`), relative to the root.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub baseline: Option<String>,
+    /// Report baseline entries that no longer occur, with this severity.
+    #[serde(skip_serializing_if = "is_off")]
+    pub baseline_stale: Severity,
     /// Discover Nx projects (project.json, package.json "nx") on every run
     /// and treat each as a group with its tags (+ `projectType:<type>`).
     #[serde(skip_serializing_if = "is_false")]
@@ -324,6 +331,7 @@ impl Default for Options {
             vite_config: None,
             config_env: ConfigEnv::default(),
             baseline: None,
+            baseline_stale: Severity::Off,
             nx_projects: false,
             group_match: GroupMatch::First,
             jsdoc_imports: false,
