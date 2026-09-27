@@ -1,0 +1,219 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>detangle — fast dependency rules for JavaScript and TypeScript</title>
+<meta name="description" content="Find import cycles, enforce architecture boundaries and explore the dependency graph of JavaScript and TypeScript projects. 200× faster than the JavaScript rules tool.">
+<style>
+  :root {
+    --bg: #fbfaf8; --fg: #1d1c1a; --muted: #625f59; --line: #e4e1db;
+    --card: #ffffff; --code-bg: #f2f0ec; --accent: #2d6a4f; --accent-fg: #ffffff;
+    --bar: #2d6a4f; --bar-slow: #c9c4bb;
+    color-scheme: light;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #141413; --fg: #ecebe8; --muted: #a29f98; --line: #2c2b28;
+      --card: #1b1b19; --code-bg: #22221f; --accent: #6fcf97; --accent-fg: #0f1a14;
+      --bar: #6fcf97; --bar-slow: #4a4843;
+      color-scheme: dark;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  }
+  code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }
+  a { color: var(--accent); }
+  .wrap { max-width: 760px; margin: 0 auto; padding-inline: 20px; }
+  header { border-bottom: 1px solid var(--line); }
+  header .wrap { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding-block: 14px; }
+  .logo { font-weight: 700; font-size: 18px; letter-spacing: -0.01em; color: var(--fg); text-decoration: none; }
+  nav { display: flex; gap: 18px; flex-wrap: wrap; font-size: 15px; }
+  nav a { color: var(--muted); text-decoration: none; }
+  nav a:hover { color: var(--fg); }
+  .hero { padding-block: 56px 28px; }
+  h1 { font-size: clamp(30px, 5vw, 42px); line-height: 1.15; letter-spacing: -0.02em; margin: 0 0 14px; }
+  .lede { font-size: 18px; color: var(--muted); margin: 0; max-width: 620px; }
+  h2 { font-size: 22px; letter-spacing: -0.01em; margin: 48px 0 12px; }
+  p { margin: 0 0 14px; }
+  .bench { margin-top: 28px; border: 1px solid var(--line); border-radius: 10px; background: var(--card); padding: 18px 20px; }
+  .bench-title { font-size: 14px; color: var(--muted); margin-bottom: 12px; }
+  .row { display: grid; grid-template-columns: 170px 1fr 70px; align-items: center; gap: 12px; margin: 8px 0; font-size: 15px; }
+  .track { height: 12px; border-radius: 6px; background: transparent; }
+  .fill { height: 100%; border-radius: 6px; background: var(--bar-slow); }
+  .fill.fast { background: var(--bar); min-width: 4px; }
+  .row .t { text-align: right; font-variant-numeric: tabular-nums; }
+  .bench-note { font-size: 13px; color: var(--muted); margin-top: 10px; }
+  .tabs { display: flex; gap: 4px; flex-wrap: wrap; border-bottom: 1px solid var(--line); }
+  .tab {
+    appearance: none; border: 0; background: none; color: var(--muted); font: inherit; font-size: 15px;
+    padding: 8px 12px; cursor: pointer; border-bottom: 2px solid transparent; margin-bottom: -1px;
+  }
+  .tab[aria-selected="true"] { color: var(--fg); border-bottom-color: var(--accent); }
+  .panel[hidden] { display: none; }
+  .code { position: relative; margin: 12px 0 16px; }
+  pre {
+    margin: 0; background: var(--code-bg); border-radius: 8px; padding: 14px 16px; padding-right: 72px;
+    overflow-x: auto; font-size: 14px; line-height: 1.55;
+  }
+  .c { color: var(--muted); }
+  .copy {
+    position: absolute; top: 8px; right: 8px; font: inherit; font-size: 12px; color: var(--muted);
+    background: var(--card); border: 1px solid var(--line); border-radius: 6px; padding: 3px 9px; cursor: pointer;
+  }
+  .copy:hover { color: var(--fg); }
+  :not(pre) > code { background: var(--code-bg); padding: 1px 5px; border-radius: 4px; font-size: 0.9em; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 14px; margin-top: 8px; }
+  .card { border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; background: var(--card); }
+  .card b { display: block; margin-bottom: 4px; }
+  .card span { color: var(--muted); font-size: 15px; }
+  footer { border-top: 1px solid var(--line); margin-top: 64px; }
+  footer .wrap { padding-block: 22px 32px; color: var(--muted); font-size: 14px; display: flex; gap: 16px; flex-wrap: wrap; justify-content: space-between; }
+  @media (max-width: 520px) {
+    .row { grid-template-columns: 1fr 60px; }
+    .row .track { grid-column: 1 / -1; order: 3; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <div class="wrap">
+    <a class="logo" href="./">detangle</a>
+    <nav>
+      <a href="#install">Install</a>
+      <a href="#start">Quick start</a>
+      <a href="#rules">Rules</a>
+      <a href="https://github.com/debug-diary-1/detangle/blob/main/docs/reference.md">Reference</a>
+      <a href="https://github.com/debug-diary-1/detangle">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main class="wrap">
+  <section class="hero">
+    <h1>Keep your JavaScript and TypeScript dependencies clean.</h1>
+    <p class="lede">detangle finds import cycles, enforces boundaries between parts of your code, and lets you explore the dependency graph. It works with React, Vue, Svelte and Angular projects, and it's fast enough to run on every save.</p>
+
+    <div class="bench" role="figure" aria-label="Benchmark on VS Code's source: detangle 0.2 seconds, the JavaScript rules tool 40 seconds">
+      <div class="bench-title">Checking VS Code's <code>src/</code> (10,000 modules, 113,000 imports)</div>
+      <div class="row"><span><b>detangle</b></span><div class="track"><div class="fill fast" style="width:0.5%"></div></div><span class="t"><b>0.2 s</b></span></div>
+      <div class="row"><span>JavaScript rules tool</span><div class="track"><div class="fill" style="width:100%"></div></div><span class="t">40 s</span></div>
+      <div class="bench-note">Same machine, same rules. detangle also uses 160 MB of memory against 3.7 GB.</div>
+    </div>
+  </section>
+
+  <section id="install">
+    <h2>Install</h2>
+    <div class="tabs" role="tablist" aria-label="Install with">
+      <button class="tab" role="tab" aria-selected="true" aria-controls="p-npm" id="t-npm">npm</button>
+      <button class="tab" role="tab" aria-selected="false" aria-controls="p-brew" id="t-brew">Homebrew</button>
+      <button class="tab" role="tab" aria-selected="false" aria-controls="p-cargo" id="t-cargo">Cargo</button>
+      <button class="tab" role="tab" aria-selected="false" aria-controls="p-bin" id="t-bin">Binary</button>
+    </div>
+    <div class="panel" role="tabpanel" id="p-npm" aria-labelledby="t-npm">
+      <div class="code"><pre>npm install --save-dev detangle</pre></div>
+      <p>Or run it once without installing: <code>npx detangle check</code>. npm downloads only the binary for your platform; no Rust needed.</p>
+    </div>
+    <div class="panel" role="tabpanel" id="p-brew" aria-labelledby="t-brew" hidden>
+      <div class="code"><pre>brew install debug-diary-1/tap/detangle</pre></div>
+      <p>For macOS and Linux.</p>
+    </div>
+    <div class="panel" role="tabpanel" id="p-cargo" aria-labelledby="t-cargo" hidden>
+      <div class="code"><pre>cargo install detangle</pre></div>
+      <p>Builds from source; needs Rust 1.88 or later.</p>
+    </div>
+    <div class="panel" role="tabpanel" id="p-bin" aria-labelledby="t-bin" hidden>
+      <p>Download the archive for your platform from the <a href="https://github.com/debug-diary-1/detangle/releases/latest">latest release</a>, unpack it and put <code>detangle</code> on your <code>PATH</code>. Builds are available for macOS, Linux (glibc and musl) and Windows, on x64 and arm64.</p>
+    </div>
+  </section>
+
+  <section id="start">
+    <h2>Quick start</h2>
+    <p>Run these in your project's root:</p>
+    <div class="code"><pre><span class="c"># find cycles, unresolvable imports and more</span>
+detangle check
+
+<span class="c"># explore the graph interactively; it updates as you edit</span>
+detangle
+
+<span class="c"># write a starter config, then an HTML report</span>
+detangle init
+detangle report --open</pre></div>
+    <div class="grid">
+      <div class="card"><b><code>detangle why</code></b><span>The shortest import chain from one module to another.</span></div>
+      <div class="card"><b><code>detangle graph</code></b><span>Diagrams in Mermaid, DOT, D2 or JSON, filtered to what matters.</span></div>
+      <div class="card"><b><code>detangle affected</code></b><span>The modules, or tests, a change can affect.</span></div>
+    </div>
+  </section>
+
+  <section id="rules">
+    <h2>Write your own rules</h2>
+    <p>Rules live in <code>detangle.toml</code>. Paths are regular expressions, matched against paths relative to your project root.</p>
+    <div class="code"><pre><span class="c"># features may not import each other</span>
+[[forbidden]]
+name = "no-cross-feature"
+severity = "error"
+from = { path = '^src/features/([^/]+)/' }
+to = { path = '^src/features/', path_not = '^src/features/$1/' }</pre></div>
+    <p>Rules can also cover dead files, npm package licenses, runtime-only cycles, groups of folders and Nx projects. See the <a href="https://github.com/debug-diary-1/detangle/blob/main/docs/reference.md#rules">rules reference</a>.</p>
+  </section>
+
+  <section id="ci">
+    <h2>Run it in CI</h2>
+    <p>In a GitHub Actions workflow, violations appear as annotations on the pull request:</p>
+    <div class="code"><pre>- run: npx detangle check -f github</pre></div>
+    <p>Adopting rules on an existing codebase? <code>detangle check --write-baseline</code> records today's violations, so CI fails only on new ones.</p>
+  </section>
+
+  <section id="migrate">
+    <h2>Coming from another tool</h2>
+    <p><code>detangle migrate</code> converts your existing setup into a <code>detangle.toml</code>: JavaScript rules configs, ESLint import rules, Nx module boundaries, eslint-plugin-boundaries and madge.</p>
+    <div class="code"><pre>detangle migrate --dry-run   <span class="c"># preview</span>
+detangle migrate             <span class="c"># write detangle.toml</span></pre></div>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <span>detangle is open source under MIT or Apache-2.0.</span>
+    <span><a href="https://github.com/debug-diary-1/detangle">GitHub</a> · <a href="https://www.npmjs.com/package/detangle">npm</a> · <a href="https://github.com/debug-diary-1/detangle/blob/main/docs/reference.md">Reference</a></span>
+  </div>
+</footer>
+
+<script>
+  // Install tabs.
+  const tabs = [...document.querySelectorAll('.tab')];
+  tabs.forEach((tab) => tab.addEventListener('click', () => {
+    tabs.forEach((t) => {
+      const on = t === tab;
+      t.setAttribute('aria-selected', String(on));
+      document.getElementById(t.getAttribute('aria-controls')).hidden = !on;
+    });
+  }));
+  // Copy buttons on code blocks (comments are left out of the copied text).
+  document.querySelectorAll('.code').forEach((box) => {
+    const pre = box.querySelector('pre');
+    const button = document.createElement('button');
+    button.className = 'copy';
+    button.type = 'button';
+    button.textContent = 'Copy';
+    button.addEventListener('click', async () => {
+      const clone = pre.cloneNode(true);
+      clone.querySelectorAll('.c').forEach((c) => c.remove());
+      const text = clone.textContent.split('\n').map((l) => l.trimEnd()).filter((l) => l).join('\n');
+      try {
+        await navigator.clipboard.writeText(text);
+        button.textContent = 'Copied';
+      } catch {
+        button.textContent = 'Select and copy';
+      }
+      setTimeout(() => (button.textContent = 'Copy'), 1500);
+    });
+    box.appendChild(button);
+  });
+</script>
+</body>
+</html>
