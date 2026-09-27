@@ -255,7 +255,7 @@ impl Project {
 
     fn analyze_with(&self, use_baseline: bool) -> Result<Analysis> {
         let mut graph = Graph::build(&self.root, self.session.files(), self.session.work, &self.cfg.options);
-        graph.assign_groups(&self.groups);
+        graph.assign_groups(&self.groups, self.cfg.options.group_match == config::GroupMatch::Deepest);
         let mut violations = rules::evaluate(&graph, &self.cfg)?;
         let suppressed = match self.baseline_path().filter(|p| use_baseline && p.is_file()) {
             Some(p) => rules::apply_baseline(&graph, &mut violations, &p)?,

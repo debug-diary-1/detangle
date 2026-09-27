@@ -360,12 +360,18 @@ impl<'g> Ctx<'g> {
         self.meta[pkg].as_ref()
     }
 
-    fn edge_has_type(&mut self, e: &Edge, t: &str) -> bool {
+    /// Does one import (`spec`, `flags`) behind edge `e` have type `t`?
+    fn import_has_type(&mut self, e: &Edge, spec: &str, flags: crate::scan::ImportFlags, t: &str) -> bool {
         let g = self.g;
         match t {
-            "import" => !e.flags.require && !e.flags.dynamic,
-            "relative" => e.specifier.starts_with('.') || e.specifier.starts_with('/'),
-            "aliased" => g.modules[e.to].kind == ModuleKind::Local && is_bare(&e.specifier),
+            "type-only" => flags.type_only,
+            "dynamic" => flags.dynamic,
+            "require" => flags.require,
+            "reexport" => flags.reexport,
+            "resource" => flags.resource,
+            "import" => !flags.require && !flags.dynamic,
+            "relative" => spec.starts_with('.') || spec.starts_with('/'),
+            "aliased" => g.modules[e.to].kind == ModuleKind::Local && is_bare(spec),
             "deprecated" => {
                 g.modules[e.to].kind == ModuleKind::Npm && self.pkg_meta(e.from, &g.modules[e.to].id).is_some_and(|m| m.deprecated)
             }
@@ -392,12 +398,18 @@ impl Compiled<'_> {
         self.source.matches(&cx.names(m))
     }
 
-    /// Conditions on a single import: its specifier and dependency types.
+    /// Conditions on single imports (specifier and dependency types): some
+    /// import behind the dependency must satisfy them all.
     fn import_ok(&self, cx: &mut Ctx, e: &Edge) -> bool {
-        self.types.as_ref().is_none_or(|l| l.iter().any(|x| cx.edge_has_type(e, x)))
-            && !self.types_not.as_ref().is_some_and(|l| l.iter().any(|x| cx.edge_has_type(e, x)))
-            && self.specifier.as_ref().is_none_or(|r| matches(r, &e.specifier))
-            && !self.specifier_not.as_ref().is_some_and(|r| matches(r, &e.specifier))
+        if self.types.is_none() && self.types_not.is_none() && self.specifier.is_none() && self.specifier_not.is_none() {
+            return true;
+        }
+        e.imports().into_iter().any(|(spec, flags)| {
+            self.types.as_ref().is_none_or(|l| l.iter().any(|x| cx.import_has_type(e, spec, flags, x)))
+                && !self.types_not.as_ref().is_some_and(|l| l.iter().any(|x| cx.import_has_type(e, spec, flags, x)))
+                && self.specifier.as_ref().is_none_or(|r| matches(r, spec))
+                && !self.specifier_not.as_ref().is_some_and(|r| matches(r, spec))
+        })
     }
 
     /// Modules reachable from `from` through dynamic imports only.
@@ -704,7 +716,10 @@ pub fn evaluate(g: &Graph, cfg: &Config) -> Result<Vec<Violation>> {
             .then_with(|| a.rule.cmp(&b.rule))
             .then_with(|| a.source_id(g).cmp(b.source_id(g)))
             .then_with(|| a.target_id(g).cmp(&b.target_id(g)))
+            .then_with(|| a.comment.cmp(&b.comment))
     });
+    // Rules converted into several variants can report the same finding twice.
+    out.dedup_by(|a, b| a.rule == b.rule && a.scope == b.scope && a.from == b.from && a.to == b.to && a.comment == b.comment);
     Ok(out)
 }
 

@@ -10,7 +10,7 @@ use std::path::Path;
 use anyhow::Result;
 use serde_json::{Value, json};
 
-use super::glob::{Plain, has_magic, to_regex};
+use super::glob::{self, Part, Plain, has_magic, to_regex};
 use super::{Imported, run_node};
 use crate::config::{Config, FromSpec, GroupDef, Options, Pat, Rule, Scope, Severity, ToSpec};
 
@@ -36,7 +36,10 @@ const strs = (x) => [].concat(x || []).flat(Infinity).filter((s) => typeof s ===
 const pick = (rules) => Object.fromEntries(Object.entries(rules || {}).filter(([k]) =>
   /^(import|import-x|i)\/(no-cycle|no-restricted-paths|no-extraneous-dependencies)$/.test(k) ||
   /^@(nx|nrwl\/nx)\/enforce-module-boundaries$/.test(k) || /^boundaries\//.test(k)));
-const boundaries = (s) => (s && (s['boundaries/elements'] || s['boundaries/ignore'])) ? { elements: s['boundaries/elements'] || null, ignore: strs(s['boundaries/ignore']) } : null;
+const boundaries = (s) => s && Object.keys(s).some((k) => k.startsWith('boundaries/')) ? {
+  elements: s['boundaries/elements'] || null, ignore: s['boundaries/ignore'] || null, include: s['boundaries/include'] || null,
+  nodes: s['boundaries/dependency-nodes'] || null, files: s['boundaries/files'] || null,
+} : null;
 const resolver = (s) => (s || {})['import/resolver'] || (s || {})['import-x/resolver'] || null;
 const warnings = [];
 
@@ -160,14 +163,21 @@ pub fn import(file: &Path, root: &Path) -> Result<Imported> {
     };
     let strs = |x: &Value| -> Vec<String> { x.as_array().map(|a| a.iter().filter_map(|s| s.as_str().map(String::from)).collect()).unwrap_or_default() };
 
-    // boundaries/elements (the last definition wins, as settings merge).
+    // boundaries settings (per key, the last definition wins, as settings merge).
     let items = v["items"].as_array().cloned().unwrap_or_default();
-    let elements: Vec<Value> = items
-        .iter()
-        .filter_map(|i| i["boundaries"]["elements"].as_array().cloned())
-        .next_back()
-        .unwrap_or_default();
-    let ctx = Ctx { prefix: prefix.clone(), elements: elements.clone() };
+    let setting = |key: &str| items.iter().filter_map(|i| i["boundaries"].get(key).filter(|v| !v.is_null()).cloned()).next_back();
+    let mut ctx = Ctx {
+        prefix: prefix.clone(),
+        elements: setting("elements").and_then(|e| e.as_array().cloned()).unwrap_or_default(),
+        parsed: vec![],
+        ignore: setting("ignore").map(|v| strs(&v)).unwrap_or_default(),
+        include: setting("include").map(|v| strs(&v)).unwrap_or_default(),
+        nodes: setting("nodes"),
+    };
+    ctx.parsed = boundary_elements(&ctx);
+    if setting("files").is_some() {
+        warnings.push("boundaries/files (file descriptors) aren't converted".into());
+    }
     let mut groups = vec![];
     let mut nx = false;
 
@@ -196,15 +206,16 @@ pub fn import(file: &Path, root: &Path) -> Result<Imported> {
                 last_opts.insert(name.clone(), opts.clone());
             }
             let short = name.rsplit('/').next().unwrap_or(&name).to_string();
-            let boundary_rule = name == "boundaries/element-types" || name == "boundaries/dependencies";
+            const BOUNDARIES: &[&str] = &["element-types", "dependencies", "entry-point", "external", "no-unknown", "no-unknown-dependencies"];
+            let boundary_rule = name.starts_with("boundaries/") && BOUNDARIES.contains(&short.as_str());
             if name.starts_with("boundaries/") && !boundary_rule {
                 if sev != Severity::Off {
-                    warnings.push(format!("{name} isn't converted (only boundaries/dependencies and element-types are)"));
+                    warnings.push(format!("{name} isn't converted"));
                 }
                 continue;
             }
             if boundary_rule && sev != Severity::Off && groups.is_empty() {
-                groups = boundary_groups(&ctx, &mut warnings);
+                groups = boundary_groups(&ctx, &ctx.parsed);
             }
             if short == "enforce-module-boundaries" && sev != Severity::Off {
                 nx = true;
@@ -261,6 +272,10 @@ pub fn import(file: &Path, root: &Path) -> Result<Imported> {
     let mut config = Config::empty();
     config.options = options;
     config.options.nx_projects = nx;
+    if !groups.is_empty() {
+        // Like the plugin, a file belongs to its innermost element.
+        config.options.group_match = crate::config::GroupMatch::Deepest;
+    }
     config.groups = groups;
     config.forbidden = active.into_iter().map(|(_, a)| a.rule).collect();
     let summary = describe(&config.forbidden, scoped);
@@ -319,8 +334,14 @@ fn group_rule(name: &str, sev: Severity, comment: &str, from: FromSpec, to: ToSp
 
 struct Ctx {
     prefix: String,
-    /// `boundaries/elements` settings.
+    /// `boundaries/elements` settings, raw and parsed.
     elements: Vec<Value>,
+    parsed: Vec<Element>,
+    /// `boundaries/ignore` / `boundaries/include` globs.
+    ignore: Vec<String>,
+    include: Vec<String>,
+    /// `boundaries/dependency-nodes`.
+    nodes: Option<Value>,
 }
 
 const NPM_TYPES: &[&str] = &["npm", "npm-dev", "npm-peer", "npm-optional", "npm-undeclared"];
@@ -555,47 +576,124 @@ fn convert_nx(full: &str, sev: Severity, o: &Value, warnings: &mut Vec<String>) 
     out.into_iter().map(finish).collect()
 }
 
-/// `boundaries/elements` → `[[groups]]` (one group type per element type).
-fn boundary_groups(ctx: &Ctx, warnings: &mut Vec<String>) -> Vec<GroupDef> {
-    let mut out = vec![];
+/// One pattern of a `boundaries/elements` descriptor: a regex over element
+/// ids (the element's folder, or the file itself in file mode) whose
+/// wildcards are capture groups, numbered as the plugin captures them.
+#[derive(Clone)]
+struct ElemPattern {
+    parts: Vec<Part>,
+    /// Captured value name → wildcard index (the last one wins, as a
+    /// `capture` name beats the same `baseCapture` name).
+    names: Vec<(String, usize)>,
+    folder: bool,
+}
+
+impl ElemPattern {
+    /// The id regex (unanchored), with wildcard `k` narrowed to `over[k]`.
+    /// Every wildcard stays a capture group, so `$N` is wildcard `N - 1`.
+    fn render(&self, over: &[(usize, String)]) -> String {
+        let mut wild = 0;
+        self.parts
+            .iter()
+            .map(|p| match p {
+                Part::Lit(l) => l.clone(),
+                Part::Wild(w) => {
+                    let re = over.iter().find(|(k, _)| *k == wild).map_or(w.as_str(), |(_, r)| r.as_str());
+                    wild += 1;
+                    format!("({re})")
+                }
+            })
+            .collect()
+    }
+
+    fn group(&self, name: &str) -> Option<usize> {
+        self.names.iter().rev().find(|(n, _)| n == name).map(|(_, k)| *k)
+    }
+}
+
+struct Element {
+    ty: String,
+    patterns: Vec<ElemPattern>,
+}
+
+/// `boundaries/elements` as patterns (captures, `basePattern`, modes).
+fn boundary_elements(ctx: &Ctx) -> Vec<Element> {
+    let mut out: Vec<Element> = vec![];
     for e in &ctx.elements {
         let Some(ty) = e.get("type").and_then(Value::as_str) else { continue };
-        let patterns = strings(e.get("pattern").unwrap_or(&Value::Null));
+        let mode = e.get("mode").and_then(Value::as_str).unwrap_or("folder");
+        let partial = e.get("partialMatch") != Some(&json!(false));
+        let base = e.get("basePattern").and_then(Value::as_str).filter(|_| partial);
+        let (capture, base_capture) = (strings(e.get("capture").unwrap_or(&Value::Null)), strings(e.get("baseCapture").unwrap_or(&Value::Null)));
+        let mut patterns = vec![];
+        for p in strings(e.get("pattern").unwrap_or(&Value::Null)) {
+            // Matched from the right (any leading folders) unless the whole
+            // path must match; `basePattern` must match from the root.
+            let mut parts = vec![];
+            let mut names: Vec<(String, usize)> = vec![];
+            if let Some(b) = base {
+                parts = glob::parts(b.trim_end_matches('/'));
+                parts.push(Part::Lit("/(?:.*/)?".into()));
+                names.extend(base_capture.iter().cloned().zip(0..));
+            } else if partial && mode != "full" {
+                parts.push(Part::Lit("(?:.*/)?".into()));
+            }
+            let offset = parts.iter().filter(|p| matches!(p, Part::Wild(_))).count();
+            parts.extend(glob::parts(p.trim_end_matches('/')));
+            names.extend(capture.iter().cloned().zip(offset..));
+            patterns.push(ElemPattern { parts, names, folder: !partial || !matches!(mode, "file" | "full") });
+        }
         if patterns.is_empty() {
             continue;
         }
-        let mode = e.get("mode").and_then(Value::as_str).unwrap_or("folder");
-        let base = e.get("basePattern").and_then(Value::as_str);
-        let alts: Vec<String> = patterns
-            .iter()
-            .map(|p| {
-                let body = glob_body(p);
-                // Matched from the right (as if prefixed with `**/`) unless basePattern is set.
-                let left = match base {
-                    Some(b) => format!("{}/", glob_body(b.trim_end_matches('/'))),
-                    None if mode == "full" => String::new(),
-                    None => "(?:.*/)?".into(),
-                };
-                match mode {
-                    "file" | "full" => format!("{left}{body}$"),
-                    _ => format!("{left}{body}(?:/|$)"),
-                }
-            })
-            .collect();
-        let path = format!("^(?:{})", alts.join("|"));
-        let path = if ctx.prefix.is_empty() { path } else { format!("^{}/(?:{})", fancy_regex::escape(&ctx.prefix), &path[1..]) };
-        if e.get("capture").is_some() || e.get("baseCapture").is_some() {
-            warnings.push(format!("boundaries element \"{ty}\": captures aren't converted (rules using them are skipped)"));
+        match out.iter_mut().find(|x| x.ty == ty) {
+            Some(x) => x.patterns.extend(patterns),
+            None => out.push(Element { ty: ty.into(), patterns }),
         }
-        out.push(GroupDef { name: ty.into(), path: Pat(path), tags: vec![] });
     }
     out
 }
 
-/// A glob as an unanchored regex fragment.
-fn glob_body(g: &str) -> String {
-    let r = to_regex(g, Plain::Exact, false, "");
-    r.trim_start_matches('^').trim_end_matches('$').to_string()
+impl Ctx {
+    fn anchor(&self, body: &str) -> String {
+        if self.prefix.is_empty() { format!("^(?:{body})$") } else { format!("^{}/(?:{body})$", fancy_regex::escape(&self.prefix)) }
+    }
+
+    /// Files `boundaries/ignore` / `boundaries/include` leave out, as a regex.
+    fn ignored(&self) -> Option<String> {
+        let re = |globs: &[String]| globs.iter().map(|g| to_regex(g, Plain::Exact, false, &self.prefix)).collect::<Vec<_>>();
+        let mut alts = re(&self.ignore);
+        if !self.include.is_empty() {
+            alts.push(format!("(?!(?:{}))", re(&self.include).join("|")));
+        }
+        (!alts.is_empty()).then(|| Pat::any(&alts).0)
+    }
+
+    /// Import kinds `boundaries/dependency-nodes` leaves unchecked.
+    fn unchecked_kinds(&self) -> Option<Vec<String>> {
+        let nodes = strings(self.nodes.as_ref()?);
+        let kinds: Vec<String> = [("require", "require"), ("dynamic-import", "dynamic"), ("export", "reexport")]
+            .into_iter()
+            .filter(|(node, _)| !nodes.iter().any(|n| n == node))
+            .map(|(_, ty)| ty.to_string())
+            .collect();
+        (!kinds.is_empty()).then_some(kinds)
+    }
+}
+
+/// `boundaries/elements` → `[[groups]]` (one group type per element type).
+/// Ignored files belong to no group, so no rule sees them.
+fn boundary_groups(ctx: &Ctx, elements: &[Element]) -> Vec<GroupDef> {
+    let skip = ctx.ignored().map(|i| format!("(?!{i})")).unwrap_or_default();
+    elements
+        .iter()
+        .map(|e| {
+            let alts: Vec<String> =
+                e.patterns.iter().map(|p| format!("{}{}", p.render(&[]), if p.folder { "(?:/|$)" } else { "$" })).collect();
+            let path = ctx.anchor(&alts.join("|"));
+            GroupDef { name: e.ty.clone(), path: Pat(format!("^{skip}{}", path.trim_start_matches('^').trim_end_matches('$'))), tags: vec![] }
+        })
+        .collect()
 }
 
 /// Which element types a boundaries selector matches.
@@ -615,106 +713,338 @@ impl TypeSel {
     }
 }
 
-/// Parses a boundaries selector into type matchers. Supports the legacy form
-/// (`"type"`, `["type", {…}]`, lists) and v6+ objects (`{ element: { type } }`,
-/// `{ to: { element: { types: { anyOf } } } }`). `Err` = can't convert exactly.
-fn type_selectors(v: &Value) -> Result<Vec<TypeSel>, String> {
+/// Captured-value conditions (all must hold): key → micromatch patterns.
+type Captured = Vec<(String, Vec<String>)>;
+
+/// A selector: element types, plus conditions on captured values.
+#[derive(Clone)]
+struct Sel {
+    types: TypeSel,
+    captured: Captured,
+}
+
+fn captured_conditions(v: &Value) -> Result<Vec<Captured>, String> {
+    let one = |o: &Value| -> Result<Captured, String> {
+        o.as_object()
+            .ok_or(format!("captured selector {o} isn't an object"))?
+            .iter()
+            .map(|(k, v)| match v {
+                Value::String(_) | Value::Array(_) => Ok((k.clone(), strings(v))),
+                other => Err(format!("captured value {other} isn't supported")),
+            })
+            .collect()
+    };
+    match v {
+        // An array of objects: any of them.
+        Value::Array(a) => a.iter().map(one).collect(),
+        o => Ok(vec![one(o)?]),
+    }
+}
+
+/// Parses a boundaries selector. Supports the legacy form (`"type"`,
+/// `["type", { captured }]`, lists) and v6+ objects (`{ element: { type,
+/// types, captured } }`, `{ to: … }`). `Err` = can't convert exactly.
+fn selectors(v: &Value) -> Result<Vec<Sel>, String> {
     let one = |s: &str| {
         let (neg, pat) = s.strip_prefix('!').map_or((false, s), |p| (true, p));
-        TypeSel { patterns: vec![pat.to_string()], negate: neg }
+        Sel { types: TypeSel { patterns: vec![pat.to_string()], negate: neg }, captured: vec![] }
     };
     match v {
         Value::Null => Ok(vec![]),
         Value::String(s) => Ok(vec![one(s)]),
         Value::Array(a) if a.len() == 2 && a[0].is_string() && a[1].is_object() => {
-            Err(format!("selector {v} uses captures"))
+            let base = one(a[0].as_str().unwrap_or_default());
+            Ok(captured_conditions(&a[1])?.into_iter().map(|captured| Sel { captured, ..base.clone() }).collect())
         }
-        Value::Array(a) => a.iter().map(type_selectors).collect::<Result<Vec<_>, _>>().map(|v| v.concat()),
+        Value::Array(a) => a.iter().map(selectors).collect::<Result<Vec<_>, _>>().map(|v| v.concat()),
         Value::Object(o) => {
             if let Some(inner) = o.get("to").or_else(|| o.get("from")) {
-                return type_selectors(inner);
+                return selectors(inner);
             }
             let Some(el) = o.get("element") else {
-                return Err(format!("selector {v} isn't about element types (files/modules aren't converted)"));
+                return Err(format!("selector {v} isn't about elements (files/modules aren't converted)"));
             };
-            let extra: Vec<&String> = el.as_object().map(|e| e.keys().filter(|k| *k != "type" && *k != "types").collect()).unwrap_or_default();
+            let extra: Vec<&String> =
+                el.as_object().map(|e| e.keys().filter(|k| !["type", "types", "captured"].contains(&k.as_str())).collect()).unwrap_or_default();
             if !extra.is_empty() {
                 return Err(format!("selector {v} uses {extra:?}"));
             }
-            if let Some(t) = el.get("type").and_then(Value::as_str) {
-                return Ok(vec![one(t)]);
-            }
-            match el.get("types") {
-                Some(Value::Object(t)) if t.contains_key("anyOf") => Ok(vec![TypeSel { patterns: strings(&t["anyOf"]), negate: false }]),
-                Some(Value::Object(t)) if t.contains_key("noneOf") => Ok(vec![TypeSel { patterns: strings(&t["noneOf"]), negate: true }]),
-                Some(other) => Ok(vec![TypeSel { patterns: strings(other), negate: false }]),
-                None => Ok(vec![TypeSel::any()]),
+            let types = if let Some(t) = el.get("type").and_then(Value::as_str) {
+                one(t).types
+            } else {
+                match el.get("types") {
+                    Some(Value::Object(t)) if t.contains_key("anyOf") => TypeSel { patterns: strings(&t["anyOf"]), negate: false },
+                    Some(Value::Object(t)) if t.contains_key("noneOf") => TypeSel { patterns: strings(&t["noneOf"]), negate: true },
+                    Some(other) => TypeSel { patterns: strings(other), negate: false },
+                    None => TypeSel::any(),
+                }
+            };
+            match el.get("captured") {
+                None => Ok(vec![Sel { types, captured: vec![] }]),
+                Some(c) => Ok(captured_conditions(c)?.into_iter().map(|captured| Sel { types: types.clone(), captured }).collect()),
             }
         }
         _ => Err(format!("selector {v} isn't supported")),
     }
 }
 
-/// `boundaries/dependencies` (v6+ `policies`) and `boundaries/element-types`
-/// (legacy `rules`): replays the policies in order — the last matching one
-/// wins, starting from `default` — to get each from→to type's verdict.
-fn convert_boundaries(full: &str, sev: Severity, o: &Value, ctx: &Ctx, warnings: &mut Vec<String>) -> Vec<Rule> {
-    let types: Vec<String> = ctx.elements.iter().filter_map(|e| e.get("type").and_then(Value::as_str).map(String::from)).collect();
-    if types.is_empty() {
-        warnings.push(format!("{full}: no boundaries/elements settings found"));
-        return vec![];
+/// A condition on one side of a dependency, as a regex on element ids.
+#[derive(Clone, PartialEq)]
+enum Cond {
+    True,
+    Never,
+    Re(String),
+}
+
+/// A captured-value pattern as a regex. Templates (`{{ from.element.captured.x }}`,
+/// `{{ from.x }}`, legacy `${from.x}`) may only refer to the source's
+/// captures, from a condition on the target: they become `$N` backreferences.
+fn value_regex(value: &str, on_target: bool, from: &ElemPattern) -> Result<Option<String>, String> {
+    let template = regex::Regex::new(r"\{\{\s*([^}]+?)\s*\}\}|\$\{([^}]+)\}").expect("valid");
+    let mut out = String::new();
+    let mut last = 0;
+    for c in template.captures_iter(value) {
+        let m = c.get(0).expect("match");
+        out.push_str(&glob::body(&value[last..m.start()]));
+        last = m.end();
+        let expr = c.get(1).or_else(|| c.get(2)).expect("group").as_str().trim();
+        let key = ["from.element.captured.", "from.captured.", "from."].iter().find_map(|p| expr.strip_prefix(p));
+        let (Some(key), true) = (key, on_target) else {
+            return Err(format!("template {} isn't converted (only a target's condition on the source's captured values is)", m.as_str()));
+        };
+        match from.group(key) {
+            Some(k) => out.push_str(&format!("${}", k + 1)),
+            // An unknown value renders empty, which matches nothing.
+            None => return Ok(None),
+        }
     }
-    let default_allow = o.get("default").and_then(Value::as_str) != Some("disallow");
+    out.push_str(&glob::body(&value[last..]));
+    Ok(Some(out))
+}
+
+/// Captured-value conditions on an element pattern. `from` is the source's
+/// pattern, for templates in conditions on the target.
+fn cond(ctx: &Ctx, p: &ElemPattern, captured: &Captured, from: Option<&ElemPattern>) -> Result<Cond, String> {
+    if captured.is_empty() {
+        return Ok(Cond::True);
+    }
+    let mut over = vec![];
+    for (key, values) in captured {
+        let Some(k) = p.group(key) else { return Ok(Cond::Never) };
+        let mut alts = vec![];
+        for v in values {
+            match from {
+                Some(f) => alts.extend(value_regex(v, true, f)?),
+                None if v.contains("{{") || v.contains("${") => return Err(format!("template in {v:?} isn't converted")),
+                None => alts.push(glob::body(v)),
+            }
+        }
+        if alts.is_empty() {
+            return Ok(Cond::Never);
+        }
+        over.push((k, alts.join("|")));
+    }
+    Ok(Cond::Re(ctx.anchor(&p.render(&over))))
+}
+
+/// Several target patterns: any of them.
+fn cond_any(conds: Vec<Cond>) -> Cond {
+    if conds.contains(&Cond::True) {
+        return Cond::True;
+    }
+    let res: Vec<String> = conds.into_iter().filter_map(|c| if let Cond::Re(r) = c { Some(r) } else { None }).collect();
+    if res.is_empty() { Cond::Never } else { Cond::Re(Pat::any(&res).0) }
+}
+
+/// One policy effect (allow or disallow) as it applies to a pair of element
+/// types: alternatives of (source, target) captured conditions.
+struct Effect {
+    allow: bool,
+    alts: Vec<(Captured, Captured)>,
+    message: Option<String>,
+}
+
+/// Replays last-match-wins policies with captured-value conditions, as
+/// rules for the source pattern `fp`. An import is reported when a holding
+/// `disallow` isn't followed by a holding `allow`, or (default disallow)
+/// when no `allow` holds. A later `allow`'s condition must be false: on the
+/// source *or* the target side, so each such clause may double the rules.
+#[allow(clippy::too_many_arguments)]
+fn conditional_rules(
+    ctx: &Ctx,
+    full: &str,
+    sev: Severity,
+    effects: &[Effect],
+    default_allow: bool,
+    from: (&str, &ElemPattern),
+    to: &Element,
+    fallback: &str,
+    warnings: &mut Vec<String>,
+) -> Vec<Rule> {
+    let (fty, fp) = from;
+    let side = |f: &Captured, t: &Captured| -> Result<(Cond, Cond), String> {
+        let fc = cond(ctx, fp, f, None)?;
+        let tc = cond_any(to.patterns.iter().map(|tp| cond(ctx, tp, t, Some(fp))).collect::<Result<_, _>>()?);
+        Ok((fc, tc))
+    };
+    let mut out = vec![];
+    let mut terms: Vec<(Option<&Effect>, Captured, Captured, usize)> = vec![];
+    for (i, e) in effects.iter().enumerate().filter(|(_, e)| !e.allow) {
+        for (f, t) in &e.alts {
+            terms.push((Some(e), f.clone(), t.clone(), i + 1));
+        }
+    }
+    if !default_allow {
+        terms.push((None, vec![], vec![], 0));
+    }
+    'terms: for (effect, f, t, later) in terms {
+        let (fpos, tpos) = match side(&f, &t) {
+            Ok(c) => c,
+            Err(why) => {
+                warnings.push(format!("{full}: {why}"));
+                continue;
+            }
+        };
+        if fpos == Cond::Never || tpos == Cond::Never {
+            continue;
+        }
+        // Clauses: no later allow may hold.
+        let mut forced_f: Vec<String> = vec![];
+        let mut forced_t: Vec<String> = vec![];
+        let mut either: Vec<(String, String)> = vec![];
+        for e in effects[later..].iter().filter(|e| e.allow) {
+            for (af, at) in &e.alts {
+                match side(af, at) {
+                    Err(why) => {
+                        warnings.push(format!("{full}: {why}"));
+                        continue 'terms;
+                    }
+                    Ok((Cond::Never, _)) | Ok((_, Cond::Never)) => {}
+                    Ok((Cond::True, Cond::True)) => continue 'terms,
+                    Ok((Cond::True, Cond::Re(r))) => forced_t.push(r),
+                    Ok((Cond::Re(r), Cond::True)) => forced_f.push(r),
+                    Ok((Cond::Re(a), Cond::Re(b))) => either.push((a, b)),
+                }
+            }
+        }
+        if either.len() > 6 {
+            warnings.push(format!("{full}: too many captured-value conditions to convert for {fty} → {}", to.ty));
+            continue;
+        }
+        for choice in 0..1u32 << either.len() {
+            let (mut nf, mut nt) = (forced_f.clone(), forced_t.clone());
+            for (bit, (a, b)) in either.iter().enumerate() {
+                if choice >> bit & 1 == 0 { nf.push(a.clone()) } else { nt.push(b.clone()) }
+            }
+            let re = |c: &Cond| if let Cond::Re(r) = c { Some(Pat(r.clone())) } else { None };
+            out.push(group_rule(
+                full,
+                sev,
+                effect.and_then(|e| e.message.as_deref()).unwrap_or(fallback),
+                FromSpec {
+                    tags: Some(vec![fty.into()]),
+                    // Always the source pattern, so `$N` refer to its captures.
+                    path: re(&fpos).or_else(|| Some(Pat(ctx.anchor(&fp.render(&[]))))),
+                    path_not: (!nf.is_empty()).then(|| Pat::any(&nf)),
+                    ..Default::default()
+                },
+                ToSpec { tags: Some(vec![to.ty.clone()]), path: re(&tpos), path_not: (!nt.is_empty()).then(|| Pat::any(&nt)), ..Default::default() },
+            ));
+        }
+    }
+    out
+}
+
+/// A `boundaries/dependencies` policy.
+struct Policy {
+    from: Vec<Sel>,
+    allow: Vec<Sel>,
+    disallow: Vec<Sel>,
+    message: Option<String>,
+}
+
+/// Parses policies' selectors; unconvertible ones are skipped with a warning.
+fn parse_policies(full: &str, o: &Value, warnings: &mut Vec<String>) -> Vec<Policy> {
     let policies = o.get("policies").or_else(|| o.get("rules")).and_then(Value::as_array).cloned().unwrap_or_default();
-    let mut compiled = vec![];
+    let mut out = vec![];
     for (i, p) in policies.iter().enumerate() {
         if p.get("importKind").is_some() {
             warnings.push(format!("{full}: importKind isn't converted (the policy applies to all imports)"));
         }
         let parsed = (|| -> Result<_, String> {
             let from = match p.get("from") {
-                None => vec![TypeSel::any()],
-                Some(f) => type_selectors(f)?,
+                None => vec![Sel { types: TypeSel::any(), captured: vec![] }],
+                Some(f) => selectors(f)?,
             };
-            Ok((from, type_selectors(p.get("allow").unwrap_or(&Value::Null))?, type_selectors(p.get("disallow").unwrap_or(&Value::Null))?))
+            Ok((from, selectors(p.get("allow").unwrap_or(&Value::Null))?, selectors(p.get("disallow").unwrap_or(&Value::Null))?))
         })();
         match parsed {
-            Ok((from, allow, disallow)) => compiled.push((from, allow, disallow, p.get("message").and_then(Value::as_str).map(String::from))),
+            Ok((from, allow, disallow)) => {
+                out.push(Policy { from, allow, disallow, message: p.get("message").and_then(Value::as_str).map(String::from) })
+            }
             Err(why) => warnings.push(format!("{full}: policy #{} skipped — {why}", i + 1)),
         }
     }
-    let hits = |sel: &[TypeSel], ty: &str| sel.iter().any(|s| s.matches(ty));
+    out
+}
+
+/// `boundaries/dependencies` (v6+ `policies`) and `boundaries/element-types`
+/// (legacy `rules`): replays the policies in order — the last matching one
+/// wins, a `disallow` beats an `allow` in the same policy, and without a
+/// match the import is disallowed unless `default` is "allow".
+fn convert_boundaries(full: &str, sev: Severity, o: &Value, ctx: &Ctx, elements: &[Element], warnings: &mut Vec<String>) -> Vec<Rule> {
+    if elements.is_empty() {
+        warnings.push(format!("{full}: no boundaries/elements settings found"));
+        return vec![];
+    }
+    let default_allow = o.get("default").and_then(Value::as_str) == Some("allow");
+    let compiled = parse_policies(full, o, warnings);
     let mut out = vec![];
-    for from_ty in &types {
+    for from in elements {
         let mut denied: Vec<String> = vec![];
         let mut message = None;
-        for to_ty in &types {
-            let mut allowed = default_allow;
-            let mut msg = None;
-            for (from, allow, disallow, m) in &compiled {
-                if !hits(from, from_ty) {
-                    continue;
-                }
-                if hits(allow, to_ty) {
-                    allowed = true;
-                }
-                if hits(disallow, to_ty) {
-                    allowed = false;
-                    msg = m.clone();
+        for to in elements {
+            // The policy effects that can apply to this pair, in order.
+            let mut effects: Vec<Effect> = vec![];
+            for p in &compiled {
+                for (is_allow, sel) in [(true, &p.allow), (false, &p.disallow)] {
+                    let alts: Vec<(Captured, Captured)> = p
+                        .from
+                        .iter()
+                        .filter(|f| f.types.matches(&from.ty))
+                        .flat_map(|f| sel.iter().filter(|t| t.types.matches(&to.ty)).map(|t| (f.captured.clone(), t.captured.clone())))
+                        .collect();
+                    if !alts.is_empty() {
+                        effects.push(Effect { allow: is_allow, alts, message: if is_allow { None } else { p.message.clone() } });
+                    }
                 }
             }
+            let fallback = format!("Elements of type \"{}\" can't import elements of type \"{}\".", from.ty, to.ty);
+            if effects.iter().any(|e| e.alts.iter().any(|(f, t)| !f.is_empty() || !t.is_empty())) {
+                for fp in &from.patterns {
+                    out.extend(conditional_rules(ctx, full, sev, &effects, default_allow, (&from.ty, fp), to, &fallback, warnings));
+                }
+                continue;
+            }
+            // No conditions: a plain verdict for the pair.
+            let mut allowed = default_allow;
+            let mut msg = None;
+            for e in &effects {
+                allowed = e.allow;
+                msg = e.message.clone();
+            }
             if !allowed {
-                denied.push(to_ty.clone());
+                denied.push(to.ty.clone());
                 message = message.or(msg);
             }
         }
         if !denied.is_empty() {
-            let comment = message.unwrap_or_else(|| format!("Elements of type \"{from_ty}\" can't import {}.", denied.join(", ")));
+            let comment = message.unwrap_or_else(|| format!("Elements of type \"{}\" can't import {}.", from.ty, denied.join(", ")));
             out.push(group_rule(
                 full,
                 sev,
                 &comment,
-                FromSpec { tags: Some(vec![from_ty.clone()]), ..Default::default() },
+                FromSpec { tags: Some(vec![from.ty.clone()]), ..Default::default() },
                 ToSpec { tags: Some(denied), ..Default::default() },
             ));
         }
@@ -722,12 +1052,200 @@ fn convert_boundaries(full: &str, sev: Severity, o: &Value, ctx: &Ctx, warnings:
     out
 }
 
+/// Glob lists from an entry-point / external policy effect.
+fn effect_globs(v: Option<&Value>) -> Vec<Value> {
+    match v {
+        None | Some(Value::Null) => vec![],
+        Some(Value::Array(a)) if a.len() == 2 && a[0].is_string() && a[1].is_object() => vec![Value::Array(a.clone())],
+        Some(Value::Array(a)) => a.clone(),
+        Some(other) => vec![other.clone()],
+    }
+}
+
+/// Last-match-wins over one-sided (target) conditions: rules with
+/// `to_re(disallowed)` and `to_not(later allowed)`. `effects` are
+/// (allow, regexes, message) in order.
+fn one_sided(effects: &[(bool, Vec<String>, Option<String>)], default_allow: bool) -> Vec<(Option<Pat>, Option<Pat>, Option<String>)> {
+    let mut out = vec![];
+    let allows_after = |i: usize| -> Vec<String> { effects[i..].iter().filter(|e| e.0).flat_map(|e| e.1.clone()).collect() };
+    for (i, (allow, res, msg)) in effects.iter().enumerate() {
+        if !allow && !res.is_empty() {
+            let later = allows_after(i + 1);
+            out.push((Some(Pat::any(res)), (!later.is_empty()).then(|| Pat::any(&later)), msg.clone()));
+        }
+    }
+    if !default_allow {
+        let all = allows_after(0);
+        out.push((None, (!all.is_empty()).then(|| Pat::any(&all)), None));
+    }
+    out
+}
+
+/// `boundaries/entry-point`: other elements may import an element only
+/// through the files its policies allow (paths inside the element).
+fn convert_entry_point(full: &str, sev: Severity, o: &Value, ctx: &Ctx, elements: &[Element], warnings: &mut Vec<String>) -> Vec<Rule> {
+    let default_allow = o.get("default").and_then(Value::as_str) == Some("allow");
+    let policies = parse_policies_raw(o);
+    let all_types: Vec<String> = elements.iter().map(|e| e.ty.clone()).collect();
+    let mut out = vec![];
+    for el in elements {
+        if el.patterns.iter().any(|p| !p.folder) {
+            warnings.push(format!("{full}: element type \"{}\" isn't a folder element, so its entry points aren't converted", el.ty));
+            continue;
+        }
+        let root = el.patterns.iter().map(|p| p.render(&[])).collect::<Vec<_>>().join("|");
+        let file = |globs: &[Value]| -> Result<Vec<String>, String> {
+            globs
+                .iter()
+                .map(|g| match g.as_str() {
+                    Some(g) if !g.contains("${") && !g.contains("{{") => Ok(ctx.anchor(&format!("(?:{root})/(?:{})", glob::body(g)))),
+                    _ => Err(format!("entry {g} isn't converted")),
+                })
+                .collect()
+        };
+        let mut effects = vec![];
+        for (i, p) in policies.iter().enumerate() {
+            let targets = match selectors(p.get("target").or_else(|| p.get("to")).unwrap_or(&Value::Null)) {
+                Ok(t) => t,
+                Err(why) => {
+                    warnings.push(format!("{full}: policy #{} skipped — {why}", i + 1));
+                    continue;
+                }
+            };
+            if !targets.iter().any(|t| t.types.matches(&el.ty)) {
+                continue;
+            }
+            if targets.iter().any(|t| !t.captured.is_empty()) {
+                warnings.push(format!("{full}: policy #{} uses captured values, which entry-point conversion ignores", i + 1));
+            }
+            for (allow, key) in [(true, "allow"), (false, "disallow")] {
+                match file(&effect_globs(p.get(key))) {
+                    Ok(res) if !res.is_empty() => effects.push((allow, res, p.get("message").and_then(Value::as_str).map(String::from))),
+                    Ok(_) => {}
+                    Err(why) => warnings.push(format!("{full}: policy #{} skipped — {why}", i + 1)),
+                }
+            }
+        }
+        for (path, path_not, msg) in one_sided(&effects, default_allow) {
+            out.push(rule(
+                full,
+                sev,
+                msg.as_deref().unwrap_or(&format!("Elements of type \"{}\" must be imported through their entry point.", el.ty)),
+                FromSpec { tags: Some(all_types.clone()), ..Default::default() },
+                ToSpec { tags: Some(vec![el.ty.clone()]), cross_group: Some(true), path, path_not, ..Default::default() },
+            ));
+        }
+    }
+    out
+}
+
+fn parse_policies_raw(o: &Value) -> Vec<Value> {
+    o.get("policies").or_else(|| o.get("rules")).and_then(Value::as_array).cloned().unwrap_or_default()
+}
+
+/// `boundaries/external`: which external and core modules each element
+/// type may import (module name globs, optionally with a path inside it).
+fn convert_external(full: &str, sev: Severity, o: &Value, elements: &[Element], warnings: &mut Vec<String>) -> Vec<Rule> {
+    let default_allow = o.get("default").and_then(Value::as_str) == Some("allow");
+    let policies = parse_policies_raw(o);
+    let module = |m: &Value| -> Result<String, String> {
+        let (name, opts) = match m {
+            Value::String(s) => (s.as_str(), None),
+            Value::Array(a) => (a[0].as_str().unwrap_or_default(), a.get(1)),
+            _ => return Err(format!("module selector {m} isn't supported")),
+        };
+        if opts.and_then(|o| o.get("specifiers")).is_some() {
+            return Err(format!("{m}: `specifiers` (imported names) aren't converted"));
+        }
+        let paths = opts.and_then(|o| o.get("path")).map(strings).unwrap_or_default();
+        let module = glob::body(name);
+        Ok(if paths.is_empty() {
+            format!("^{module}(?:/.*)?$")
+        } else {
+            let inner: Vec<String> = paths.iter().map(|p| glob::body(p.trim_start_matches('/'))).collect();
+            format!("^{module}/(?:{})$", inner.join("|"))
+        })
+    };
+    let mut kinds: Vec<String> = NPM_TYPES.iter().map(|s| s.to_string()).collect();
+    kinds.push("core".into());
+    let mut out = vec![];
+    for el in elements {
+        let mut effects = vec![];
+        for (i, p) in policies.iter().enumerate() {
+            let from = match p.get("from").map(selectors).unwrap_or(Ok(vec![Sel { types: TypeSel::any(), captured: vec![] }])) {
+                Ok(f) => f,
+                Err(why) => {
+                    warnings.push(format!("{full}: policy #{} skipped — {why}", i + 1));
+                    continue;
+                }
+            };
+            if !from.iter().any(|f| f.types.matches(&el.ty)) {
+                continue;
+            }
+            for (allow, key) in [(true, "allow"), (false, "disallow")] {
+                match effect_globs(p.get(key)).iter().map(module).collect::<Result<Vec<_>, _>>() {
+                    Ok(res) if !res.is_empty() => effects.push((allow, res, p.get("message").and_then(Value::as_str).map(String::from))),
+                    Ok(_) => {}
+                    Err(why) => warnings.push(format!("{full}: policy #{} skipped — {why}", i + 1)),
+                }
+            }
+        }
+        for (specifier, specifier_not, msg) in one_sided(&effects, default_allow) {
+            out.push(rule(
+                full,
+                sev,
+                msg.as_deref().unwrap_or(&format!("Elements of type \"{}\" can't import this module.", el.ty)),
+                FromSpec { tags: Some(vec![el.ty.clone()]), ..Default::default() },
+                ToSpec { dependency_types: Some(kinds.clone()), specifier, specifier_not, ..Default::default() },
+            ));
+        }
+    }
+    out
+}
+
+/// `boundaries/no-unknown(-dependencies)`: elements may not import local
+/// files that belong to no element (ignored files excepted).
+fn convert_no_unknown(full: &str, sev: Severity, o: &Value, ctx: &Ctx, elements: &[Element], warnings: &mut Vec<String>) -> Vec<Rule> {
+    if o.get("require").and_then(Value::as_str).is_some_and(|r| r == "file" || r == "all") {
+        warnings.push(format!("{full}: require = {} (file descriptors) isn't converted", o["require"]));
+        return vec![];
+    }
+    let types: Vec<String> = elements.iter().map(|e| e.ty.clone()).collect();
+    vec![rule(
+        full,
+        sev,
+        "Dependencies to unknown elements and files are not allowed.",
+        FromSpec { tags: Some(types.clone()), ..Default::default() },
+        ToSpec {
+            dependency_types: Some(vec!["local".into()]),
+            tags_not: Some(types),
+            path_not: ctx.ignored().map(Pat),
+            ..Default::default()
+        },
+    )]
+}
+
 fn convert(full: &str, short: &str, sev: Severity, opts: &[Value], ctx: &Ctx, warnings: &mut Vec<String>) -> Vec<Rule> {
     let prefix = ctx.prefix.as_str();
     let o = opts.first().cloned().unwrap_or(json!({}));
     match short {
         "enforce-module-boundaries" => convert_nx(full, sev, &o, warnings),
-        "element-types" | "dependencies" if full.starts_with("boundaries/") => convert_boundaries(full, sev, &o, ctx, warnings),
+        _ if full.starts_with("boundaries/") => {
+            let els = &ctx.parsed;
+            let mut rules = match short {
+                "element-types" | "dependencies" => convert_boundaries(full, sev, &o, ctx, els, warnings),
+                "entry-point" => convert_entry_point(full, sev, &o, ctx, els, warnings),
+                "external" => convert_external(full, sev, &o, els, warnings),
+                _ => convert_no_unknown(full, sev, &o, ctx, els, warnings),
+            };
+            // Import kinds the plugin was told not to check.
+            if let Some(kinds) = ctx.unchecked_kinds() {
+                for r in &mut rules {
+                    r.to.dependency_types_not.get_or_insert_with(Vec::new).extend(kinds.clone());
+                }
+            }
+            rules
+        }
         "no-cycle" => {
             // The plugin searches breadth-first up to maxDepth imports beyond
             // the imported module, so it finds cycles of up to maxDepth + 1.

@@ -281,6 +281,7 @@ fn merge_options(list: Vec<(String, Options)>, warnings: &mut Vec<String>) -> Op
         take!(ignore_type_only);
         take!(cycles_ignore_type_only);
         take!(nx_projects);
+        take!(group_match);
         for g in &o.exclude {
             if !out.exclude.contains(g) {
                 out.exclude.push(g.clone());

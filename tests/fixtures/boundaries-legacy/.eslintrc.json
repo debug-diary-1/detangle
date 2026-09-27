@@ -1,0 +1,21 @@
+{
+  "root": true,
+  "settings": {
+    "boundaries/elements": [
+      { "type": "feature", "pattern": "features/*", "basePattern": "src/domains/*", "baseCapture": ["domain"], "capture": ["feature"] },
+      { "type": "shared", "pattern": "src/shared/*" }
+    ],
+    "boundaries/include": ["src/**"],
+    "boundaries/dependency-nodes": ["import"]
+  },
+  "rules": {
+    "boundaries/element-types": ["error", {
+      "default": "disallow",
+      "rules": [
+        { "from": ["feature"], "allow": [["feature", { "domain": "${from.domain}" }], "shared"] },
+        { "from": [["feature", { "domain": "billing" }]], "allow": [["feature", { "domain": "shop" }]] },
+        { "from": ["shared"], "allow": [] }
+      ]
+    }]
+  }
+}

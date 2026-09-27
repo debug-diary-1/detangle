@@ -189,9 +189,27 @@ pub struct Options {
     /// and treat each as a group with its tags (+ `projectType:<type>`).
     #[serde(skip_serializing_if = "is_false")]
     pub nx_projects: bool,
+    /// Which group a module joins when several match: "first" (the first
+    /// definition) or "deepest" (the one matching the longest path).
+    #[serde(skip_serializing_if = "GroupMatch::is_default")]
+    pub group_match: GroupMatch,
     /// How Vite / webpack / Babel configs are evaluated.
     #[serde(default, skip_serializing_if = "ConfigEnv::is_default")]
     pub config_env: ConfigEnv,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GroupMatch {
+    #[default]
+    First,
+    Deepest,
+}
+
+impl GroupMatch {
+    fn is_default(&self) -> bool {
+        *self == GroupMatch::First
+    }
 }
 
 /// What JS build configs see when tangle evaluates them.
@@ -297,6 +315,7 @@ impl Default for Options {
             config_env: ConfigEnv::default(),
             baseline: None,
             nx_projects: false,
+            group_match: GroupMatch::First,
             babel_config: None,
         }
     }

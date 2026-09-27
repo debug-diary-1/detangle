@@ -49,6 +49,10 @@ pub struct Edge {
     pub from: usize,
     pub to: usize,
     pub specifier: String,
+    /// When the file imports the target more than once: every import
+    /// (specifier and kind). `flags` merges them.
+    #[serde(skip)]
+    pub each: Vec<(String, ImportFlags)>,
     pub flags: ImportFlags,
     /// Dependency types, e.g. `["npm-dev", "type-only"]`.
     pub types: Vec<&'static str>,
@@ -56,6 +60,17 @@ pub struct Edge {
     /// npm package declared in more than one package.json section.
     #[serde(skip)]
     pub multi_type: bool,
+}
+
+impl Edge {
+    /// The individual imports behind the edge: (specifier, kind).
+    pub fn imports(&self) -> Vec<(&str, ImportFlags)> {
+        if self.each.is_empty() {
+            vec![(self.specifier.as_str(), self.flags)]
+        } else {
+            self.each.iter().map(|(s, f)| (s.as_str(), *f)).collect()
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, Serialize)]
@@ -160,7 +175,14 @@ impl Graph {
                     }
                 };
                 match seen.get(&to) {
-                    Some(&e) => g.edges[e].flags = g.edges[e].flags.merge(imp.flags),
+                    Some(&e) => {
+                        let edge = &mut g.edges[e];
+                        if edge.each.is_empty() {
+                            edge.each.push((edge.specifier.clone(), edge.flags));
+                        }
+                        edge.each.push((imp.specifier.clone(), imp.flags));
+                        edge.flags = edge.flags.merge(imp.flags);
+                    }
                     None => {
                         seen.insert(to, g.edges.len());
                         bases.push(base);
@@ -168,6 +190,7 @@ impl Graph {
                             from,
                             to,
                             specifier: imp.specifier.clone(),
+                            each: vec![],
                             flags: imp.flags,
                             types: vec![],
                             circular: false,
@@ -198,9 +221,10 @@ impl Graph {
         self.find_cycles(self.cycles_ignore_type_only);
     }
 
-    /// Assigns modules to groups (first matching definition wins), gives
-    /// them their group's tags, and builds the group graph.
-    pub fn assign_groups(&mut self, defs: &[crate::groups::Group]) {
+    /// Assigns modules to groups (the first matching definition, or with
+    /// `deepest` the one matching the longest path), gives them their
+    /// group's tags, and builds the group graph.
+    pub fn assign_groups(&mut self, defs: &[crate::groups::Group], deepest: bool) {
         let mut g = Graph {
             root: self.root.clone(),
             modules: vec![],
@@ -225,7 +249,14 @@ impl Graph {
                 if self.modules[m].kind != ModuleKind::Local {
                     continue;
                 }
-                let Some((def, (label, root))) = defs.iter().find_map(|d| d.instance(&self.modules[m].id).map(|i| (d, i))) else {
+                let id = &self.modules[m].id;
+                let found = if deepest {
+                    // Longest root wins; among equals, the first definition.
+                    defs.iter().filter_map(|d| d.instance(id).map(|i| (d, i))).rev().max_by_key(|(_, (_, root))| root.len())
+                } else {
+                    defs.iter().find_map(|d| d.instance(id).map(|i| (d, i)))
+                };
+                let Some((def, (label, root))) = found else {
                     continue;
                 };
                 let i = match g.index[ModuleKind::Local as usize].get(&label) {
@@ -261,7 +292,7 @@ impl Graph {
                     None => {
                         seen.insert((a, b), g.edges.len());
                         g.members.push(vec![mi]);
-                        g.edges.push(Edge { from: a, to: b, circular: false, ..e.clone() });
+                        g.edges.push(Edge { from: a, to: b, circular: false, each: vec![], ..e.clone() });
                     }
                 }
             }
@@ -382,7 +413,7 @@ impl Graph {
                         }
                         None => {
                             seen.insert((xi, t), f.edges.len());
-                            f.edges.push(Edge { from: xi, to: t, circular: false, ..e.clone() });
+                            f.edges.push(Edge { from: xi, to: t, circular: false, each: vec![], ..e.clone() });
                         }
                     }
                 }

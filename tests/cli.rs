@@ -616,3 +616,40 @@ fn nx_options_match_nx() {
     ]);
     assert_eq!(migrated_flagged_imports("nx-options"), expected);
 }
+
+#[test]
+fn boundaries_captures_match_eslint_plugin_boundaries() {
+    // Exactly what real eslint-plugin-boundaries 7.2 reports: captured values
+    // compared through `{{ from.element.captured.x }}`, `{{ from.x }}` and legacy
+    // `${from.x}` templates, a literal captured value in a later disallow,
+    // components nested in modules (the innermost element wins), no policy
+    // matching component → module (no `default`, so disallowed), ignored test
+    // files, entry-point, external (a banned subpath too) and no-unknown.
+    let expected = pairs(&[
+        ("src/app/main.js", "../misc/stuff.js"),
+        ("src/helpers/format/index.js", "../internal/index.js"),
+        ("src/helpers/format/index.js", "fs"),
+        ("src/helpers/format/index.js", "lodash/fp"),
+        ("src/modules/auth/components/login/index.js", "../../../cart/components/list/index.js"),
+        ("src/modules/auth/components/login/index.js", "../../index.js"),
+        ("src/modules/auth/components/login/index.js", "lodash"),
+        ("src/modules/auth/index.js", "../../helpers/format/util.js"),
+        ("src/modules/auth/index.js", "../../helpers/internal/index.js"),
+        ("src/modules/auth/index.js", "../cart/components/list/index.js"),
+    ]);
+    assert_eq!(migrated_flagged_imports("boundaries-captures"), expected);
+}
+
+#[test]
+fn boundaries_legacy_syntax_matches_eslint_plugin_boundaries() {
+    // Exactly what real eslint-plugin-boundaries 7.2 reports for the legacy
+    // `element-types` format: `["type", { captured }]` selectors on both sides
+    // (`${from.domain}` and a literal source condition), basePattern +
+    // baseCapture, boundaries/include (scripts/ is left out) and
+    // dependency-nodes ["import"] (require(), import() and re-exports unchecked).
+    let expected = pairs(&[
+        ("src/domains/shop/features/list/index.js", "../../../billing/features/pay/index.js"),
+        ("src/shared/util/index.js", "../../domains/shop/features/cart/index.js"),
+    ]);
+    assert_eq!(migrated_flagged_imports("boundaries-legacy"), expected);
+}

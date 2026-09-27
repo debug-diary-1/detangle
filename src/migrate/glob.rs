@@ -32,6 +32,58 @@ pub fn to_regex(glob: &str, plain: Plain, match_base: bool, prefix: &str) -> Str
     format!("^{}{base}{}$", escape(&prefix), translate(g))
 }
 
+/// A glob as an unanchored regex (no captures).
+pub fn body(g: &str) -> String {
+    translate(g.trim_start_matches("./"))
+}
+
+/// A piece of a glob: literal regex text, or a wildcard (`*`, `**`, `?`,
+/// `{a,b}`), which micromatch-style captures number in order.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Part {
+    Lit(String),
+    Wild(String),
+}
+
+/// Splits a glob into literal text and wildcards, each as regex.
+pub fn parts(g: &str) -> Vec<Part> {
+    let chars: Vec<char> = g.trim_start_matches("./").chars().collect();
+    let mut out: Vec<Part> = vec![];
+    let lit = |out: &mut Vec<Part>, s: &str| match out.last_mut() {
+        Some(Part::Lit(l)) => l.push_str(s),
+        _ => out.push(Part::Lit(s.to_string())),
+    };
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '*' if chars.get(i + 1) == Some(&'*') => {
+                out.push(Part::Wild(".*".into()));
+                i += 2;
+                continue;
+            }
+            '*' => out.push(Part::Wild("[^/]*".into())),
+            '?' => out.push(Part::Wild("[^/]".into())),
+            '{' | '[' => {
+                // Braces and classes: translate the whole construct.
+                let close = if chars[i] == '{' { '}' } else { ']' };
+                match chars[i..].iter().position(|&c| c == close) {
+                    Some(end) => {
+                        let piece: String = chars[i..=i + end].iter().collect();
+                        let re = translate(&piece);
+                        if chars[i] == '{' { out.push(Part::Wild(re)) } else { lit(&mut out, &re) }
+                        i += end + 1;
+                        continue;
+                    }
+                    None => lit(&mut out, &escape(&chars[i].to_string())),
+                }
+            }
+            c => lit(&mut out, &escape(&c.to_string())),
+        }
+        i += 1;
+    }
+    out
+}
+
 fn translate(g: &str) -> String {
     let chars: Vec<char> = g.chars().collect();
     let mut out = String::new();
@@ -144,6 +196,21 @@ mod tests {
         assert!(!m("src/[!_]*.ts", e, false, "", "src/_a.ts"));
         assert!(m("src/{a,b/{c,d}}/x.ts", e, false, "", "src/b/d/x.ts"));
         assert!(m("./src/**", e, false, "", "src/anything/here.js"));
+    }
+
+    #[test]
+    fn capture_parts() {
+        assert_eq!(
+            parts("src/modules/*/components/*.js"),
+            [
+                Part::Lit("src/modules/".into()),
+                Part::Wild("[^/]*".into()),
+                Part::Lit("/components/".into()),
+                Part::Wild("[^/]*".into()),
+                Part::Lit("\\.js".into()),
+            ]
+        );
+        assert_eq!(parts("a/{b,c}"), [Part::Lit("a/".into()), Part::Wild("(?:b|c)".into())]);
     }
 
     #[test]

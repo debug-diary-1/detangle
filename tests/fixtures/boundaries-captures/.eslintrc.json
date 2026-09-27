@@ -1,0 +1,37 @@
+{
+  "root": true,
+  "settings": {
+    "boundaries/elements": [
+      { "type": "app", "pattern": "src/app" },
+      { "type": "module", "pattern": "src/modules/*", "capture": ["module"] },
+      { "type": "component", "pattern": "modules/*/components/*", "capture": ["module", "component"] },
+      { "type": "helper", "pattern": "src/helpers/*", "capture": ["family"] }
+    ],
+    "boundaries/ignore": ["**/*.test.js"]
+  },
+  "rules": {
+    "boundaries/dependencies": ["error", {
+      "policies": [
+        { "from": { "element": { "type": "app" } }, "allow": { "to": { "element": { "types": { "anyOf": ["module", "helper"] } } } } },
+        { "from": { "element": { "type": "module" } }, "allow": [
+          { "to": { "element": { "type": "component", "captured": { "module": "{{ from.element.captured.module }}" } } } },
+          { "to": { "element": { "type": "helper" } } }
+        ] },
+        { "from": { "element": { "type": "component" } }, "allow": [
+          { "to": { "element": { "type": "helper" } } },
+          { "to": { "element": { "type": "component", "captured": { "module": "{{ from.module }}" } } } }
+        ] },
+        { "from": { "element": { "type": "helper" } }, "allow": { "to": { "element": { "type": "helper", "captured": { "family": "${from.family}" } } } } },
+        { "from": { "element": { "type": "module" } }, "disallow": { "to": { "element": { "type": "helper", "captured": { "family": "internal" } } } }, "message": "modules must not use internal helpers" }
+      ]
+    }],
+    "boundaries/entry-point": ["error", { "default": "disallow", "rules": [
+      { "target": ["helper", "component", "module"], "allow": "index.js" }
+    ] }],
+    "boundaries/external": ["error", { "default": "allow", "rules": [
+      { "from": ["component"], "disallow": ["lodash"] },
+      { "from": ["helper"], "disallow": ["fs", ["lodash", { "path": "/fp" }]] }
+    ] }],
+    "boundaries/no-unknown": ["error"]
+  }
+}
