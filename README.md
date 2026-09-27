@@ -68,7 +68,7 @@ tangle checks the filesystem itself to decide whether files were added or remove
 
 ### Parse cache
 
-`--cache` (or `options.cache = true`) keeps each file's parsed imports in `node_modules/.cache/tangle` and re-parses only files that changed. On VS Code's `src/` a warm `check` takes 160 ms instead of 260 ms. Resolution always runs fresh, so installing packages or adding files is never missed. By default, files count as changed when their modification time or size changes. With `--cache-strategy content` (`options.cache_strategy = "content"`), a file whose timestamp changed but whose contents didn't is still reused. That helps fresh CI checkouts once the cache is restored: the first run hashes and rewrites the cache, and later runs are fast again.
+`--cache` (or `options.cache = true`) keeps each file's parsed imports in `node_modules/.cache/tangle` and re-parses only files that changed. On VS Code's `src/` a warm `check` takes about 110 ms instead of 205 ms. Resolution always runs fresh, so installing packages or adding files is never missed. By default, files count as changed when their modification time or size changes. With `--cache-strategy content` (`options.cache_strategy = "content"`), a file whose timestamp changed but whose contents didn't is still reused. That helps fresh CI checkouts once the cache is restored: the first run hashes and rewrites the cache, and later runs are fast again.
 
 ## What it understands
 
