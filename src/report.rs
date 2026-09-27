@@ -50,10 +50,6 @@ pub fn counts(vs: &[Violation]) -> (usize, usize, usize) {
     (n(Severity::Error), n(Severity::Warn), n(Severity::Info))
 }
 
-fn path_str(g: &Graph, path: &[usize]) -> String {
-    path.iter().map(|&m| g.modules[m].id.as_str()).collect::<Vec<_>>().join(" → ")
-}
-
 pub fn text(g: &Graph, vs: &[Violation], suppressed: usize) -> String {
     let p = Paint::stdout();
     let mut out = String::new();
@@ -78,10 +74,11 @@ pub fn text(g: &Graph, vs: &[Violation], suppressed: usize) -> String {
             let _ = writeln!(out, "  {}", p.dim(c));
         }
         for v in list {
-            let from = &g.modules[v.from].id;
+            let vg = v.graph(g);
+            let from = &vg.modules[v.from].id;
             match v.to {
                 Some(t) => {
-                    let to = &g.modules[t];
+                    let to = &vg.modules[t];
                     let target = if to.kind == ModuleKind::Local { to.id.clone() } else { p.cyan(&to.id) };
                     let _ = writeln!(out, "  {} {} {}", from, p.dim("→"), target);
                 }
@@ -90,7 +87,7 @@ pub fn text(g: &Graph, vs: &[Violation], suppressed: usize) -> String {
                 }
             }
             if v.cycle.len() > 1 {
-                let _ = writeln!(out, "    {} {}", p.dim("cycle:"), p.dim(&path_str(g, &v.cycle)));
+                let _ = writeln!(out, "    {} {}", p.dim("cycle:"), p.dim(&v.cycle_ids(g).join(" → ")));
             }
         }
         out.push('\n');
@@ -127,12 +124,12 @@ pub fn github(g: &Graph, vs: &[Violation]) -> String {
             Severity::Warn => "warning",
             _ => "notice",
         };
-        let mut msg = match v.to {
-            Some(t) => format!("depends on {}", g.modules[t].id),
+        let mut msg = match v.target_id(g) {
+            Some(t) => format!("depends on {t}"),
             None => String::new(),
         };
         if v.cycle.len() > 1 {
-            msg = format!("cycle: {}", path_str(g, &v.cycle));
+            msg = format!("cycle: {}", v.cycle_ids(g).join(" → "));
         }
         if let Some(c) = &v.comment {
             msg = if msg.is_empty() { c.clone() } else { format!("{msg}\n{c}") };
@@ -140,7 +137,7 @@ pub fn github(g: &Graph, vs: &[Violation]) -> String {
         let _ = writeln!(
             out,
             "::{level} file={},title={}::{}",
-            g.modules[v.from].id,
+            v.source_id(g),
             v.rule,
             esc(&msg)
         );
@@ -155,9 +152,10 @@ pub fn violations_json(g: &Graph, vs: &[Violation]) -> serde_json::Value {
                 "rule": v.rule,
                 "severity": v.severity,
                 "comment": v.comment,
-                "from": g.modules[v.from].id,
-                "to": v.to.map(|t| &g.modules[t].id),
-                "cycle": v.cycle.iter().map(|&m| &g.modules[m].id).collect::<Vec<_>>(),
+                "scope": v.scope,
+                "from": v.source_id(g),
+                "to": v.target_id(g),
+                "cycle": v.cycle_ids(g),
             })
         })
         .collect()
@@ -365,4 +363,74 @@ pub fn stats(g: &Graph, vs: &[Violation], top: usize) -> String {
     section("Most dependencies (fan-out)", ranked(&|m| g.fan_out(m), Some(ModuleKind::Local)));
     section("Most used packages", ranked(&|m| g.fan_in(m), Some(ModuleKind::Npm)));
     out
+}
+
+const HTML_TEMPLATE: &str = include_str!("report.html");
+
+/// A self-contained HTML report (no external requests).
+pub fn html(g: &Graph, vs: &[Violation], config: Option<&std::path::Path>) -> String {
+    let kind = |k: ModuleKind| match k {
+        ModuleKind::Local => 0,
+        ModuleKind::Npm => 1,
+        ModuleKind::Builtin => 2,
+        ModuleKind::Unresolved => 3,
+    };
+    let mut edges = Vec::with_capacity(g.edges.len() * 3);
+    for e in &g.edges {
+        let f = e.flags;
+        let mut bits = 0u32;
+        for (on, bit) in [
+            (f.type_only, 1),
+            (f.dynamic, 2),
+            (f.require, 4),
+            (f.reexport, 8),
+            (f.resource, 16),
+            (e.circular, 32),
+            (e.types.contains(&"npm-dev"), 64),
+            (e.types.contains(&"npm-peer"), 128),
+            (e.types.contains(&"npm-optional"), 256),
+            (e.types.contains(&"npm-undeclared"), 512),
+        ] {
+            if on {
+                bits |= bit;
+            }
+        }
+        edges.extend([e.from as u32, e.to as u32, bits]);
+    }
+    let mut comments = serde_json::Map::new();
+    for v in vs {
+        if let Some(c) = &v.comment {
+            comments.entry(v.rule.clone()).or_insert_with(|| json!(c));
+        }
+    }
+    let generated = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let data = json!({
+        "project": g.root.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| g.root.display().to_string()),
+        "root": g.root.display().to_string(),
+        "generated": generated,
+        "ms": g.total_ms(),
+        "version": env!("CARGO_PKG_VERSION"),
+        "config": config.map(|p| p.display().to_string()),
+        "m": g.modules.iter().map(|m| &m.id).collect::<Vec<_>>(),
+        "k": g.modules.iter().map(|m| kind(m.kind)).collect::<Vec<_>>(),
+        "cy": g.cycle_of.iter().map(|c| c.map_or(-1, |c| c as i64)).collect::<Vec<_>>(),
+        "e": edges,
+        "cycles": g.cycles,
+        "loops": (0..g.cycles.len()).map(|c| g.representative_cycle(c)).collect::<Vec<_>>(),
+        "v": vs.iter().map(|v| json!({
+            "r": v.rule,
+            "s": v.severity.as_str(),
+            "sc": if v.scope == crate::config::Scope::Folder { "folder" } else { "module" },
+            "f": v.source_id(g),
+            "t": v.target_id(g),
+            "c": v.cycle_ids(g),
+        })).collect::<Vec<_>>(),
+        "rc": comments,
+    });
+    // Keep `</script>` inside strings from closing the data block.
+    let data = data.to_string().replace("</", "<\\/");
+    HTML_TEMPLATE.replacen("/*__TANGLE_DATA__*/", &data, 1)
 }

@@ -216,3 +216,24 @@ fn init_converts_javascript_rule_configs() {
     assert!(toml.contains("#   - forbidden rule 'bundled' skipped"), "{toml}");
     assert!(toml.contains("path_not = \"^src/features/$1/\""), "{toml}");
 }
+
+#[test]
+fn html_report_embeds_the_analysis() {
+    let file = std::env::temp_dir().join(format!("tangle-report-{}.html", std::process::id()));
+    let (out, code) = tangle(&["report", FIXTURE, "-o", file.to_str().unwrap()]);
+    assert_eq!(code, 0, "{out}");
+    let html = std::fs::read_to_string(&file).unwrap();
+    std::fs::remove_file(&file).unwrap();
+    let start = html.find(r#"<script id="data" type="application/json">"#).unwrap();
+    let body = &html[start..];
+    let json = &body[body.find('>').unwrap() + 1..body.find("</script>").unwrap()];
+    // Nothing inside the data block may close the script tag early.
+    assert!(!json.contains("</"));
+    let d: serde_json::Value = serde_json::from_str(json).unwrap();
+    assert_eq!(d["project"], "basic");
+    assert_eq!(d["v"].as_array().unwrap().len(), 7);
+    assert_eq!(d["e"].as_array().unwrap().len() % 3, 0);
+    assert!(d["m"].as_array().unwrap().iter().any(|m| m == "src/features/cart/cart.ts"));
+    // Self-contained: no external resources.
+    assert!(!html.contains("http://") && !html.contains("https://"));
+}

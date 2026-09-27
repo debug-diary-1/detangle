@@ -208,6 +208,11 @@ pub struct Rule {
     pub severity: Severity,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub comment: Option<String>,
+    /// `folder`: evaluate on the folder-level graph (paths match folders
+    /// like `src/billing/`; cycles, instability and dependents are counted
+    /// between folders).
+    #[serde(default, skip_serializing_if = "Scope::is_module")]
+    pub scope: Scope,
     #[serde(default, skip_serializing_if = "FromSpec::is_empty")]
     pub from: FromSpec,
     #[serde(default, skip_serializing_if = "ToSpec::is_empty")]
@@ -239,6 +244,20 @@ pub struct RequiredRule {
     pub comment: Option<String>,
     pub module: ModuleSpec,
     pub to: ToSpec,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Scope {
+    #[default]
+    Module,
+    Folder,
+}
+
+impl Scope {
+    pub fn is_module(&self) -> bool {
+        *self == Scope::Module
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]

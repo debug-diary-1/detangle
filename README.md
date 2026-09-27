@@ -18,6 +18,7 @@ tangle watch                  # re-run the rules on every change
 tangle check                  # run the rules; exit 1 on errors (CI)
 tangle check -f github        # GitHub Actions annotations on the PR
 tangle check --strict         # also fail on warnings
+tangle report --open          # self-contained HTML report
 tangle stats                  # overview + hotspots
 tangle why src/app.ts lodash  # shortest import chain from A to B
 tangle affected --since origin/main --filter '\.test\.ts$'   # tests to run
@@ -127,6 +128,34 @@ module = { path = '\.controller\.ts$' }
 to = { path = 'base-controller' }
 ```
 
+### Folder scope
+
+Add `scope = "folder"` to evaluate a rule on the folder graph instead of the module graph. Every directory stands for its whole subtree, so `src/features/cart` includes `src/features/cart/ui/…`. Folder names have no trailing slash, and root-level files belong to no folder.
+
+```toml
+# features may not depend on each other (as whole subtrees)
+[[forbidden]]
+name = "no-cross-feature"
+scope = "folder"
+from = { path = '^src/features/([^/]+)$' }
+to = { path = '^src/features/', path_not = '^src/features/$1(/|$)' }
+
+# no cycles between folders, even when there are none between modules
+[[forbidden]]
+name = "no-folder-cycles"
+scope = "folder"
+to = { circular = true }
+
+# stable dependencies principle, per folder
+[[forbidden]]
+name = "depend-on-stable-folders"
+scope = "folder"
+from = { path = '^src/' }
+to = { path = '^src/', more_unstable = true }
+```
+
+At folder scope, a module edge `a → b` makes every folder containing `a` but not `b` depend on `b`'s folder. Instability uses module-level coupling across the folder boundary, and cycles are found exactly. `module` rules count dependent folders. `orphan` and `reachable` apply only to modules.
+
 | | conditions |
 |---|---|
 | `from` | `path`, `path_not`, `orphan` |
@@ -134,6 +163,17 @@ to = { path = 'base-controller' }
 | `module` | `path`, `path_not`, `number_of_dependents_less_than`, `number_of_dependents_more_than` (with `from` restricting which dependents count) |
 
 Dependency types: `local`, `npm`, `npm-dev`, `npm-peer`, `npm-optional`, `npm-undeclared`, `core`, `unresolvable`, `type-only`, `dynamic`, `require`, `reexport`, `resource`, `import`, `aliased` (a tsconfig-paths, `#imports` or workspace import of a local file), `deprecated` (the installed package is marked deprecated). A package declared in several `package.json` sections has all of the matching types, for example `npm` and `npm-dev`. npm packages can also be matched as `node_modules/<name>/`.
+
+## HTML report
+
+`tangle report` writes one self-contained HTML file with no external requests, so it can be attached to CI runs or shared as a file. It has:
+
+- **Violations**, grouped by rule, with a filter, severity toggles and the cycle behind every circular dependency.
+- **Modules**, a sortable table (fan-in, fan-out, instability, cycle, violations). Selecting a module shows its imports, its importers, violations in both directions, and the shortest loop through it.
+- **Cycles**, each strongly connected component with its shortest loop.
+- **Folder graph**, an interactive map of folders. It picks a readable depth automatically, colours folder cycles red, and lets you zoom, pan and drag. Double-click a folder to open it, and use the breadcrumbs to go back up.
+
+It follows the system light or dark theme. VS Code's 113k dependencies produce a 3.3 MB report.
 
 ### Adopting rules in a legacy codebase
 

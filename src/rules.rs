@@ -8,7 +8,7 @@ use fancy_regex::Regex;
 use rustc_hash::FxHashMap as HashMap;
 use serde::{Deserialize, Serialize};
 
-use crate::config::{Config, FromSpec, ModuleSpec, Pat, PathSpec, Severity, ToSpec};
+use crate::config::{Config, FromSpec, ModuleSpec, Pat, PathSpec, Rule, Scope, Severity, ToSpec};
 use crate::graph::{Edge, Graph, ModuleKind};
 use crate::scan::is_bare;
 
@@ -19,10 +19,35 @@ pub struct Violation {
     pub rule: String,
     pub severity: Severity,
     pub comment: Option<String>,
+    /// Which graph `from` / `to` / `cycle` index into.
+    pub scope: Scope,
     pub from: usize,
     pub to: Option<usize>,
     /// For circular violations: the cycle, as module indices.
     pub cycle: Vec<usize>,
+}
+
+impl Violation {
+    /// The graph this violation's indices refer to.
+    pub fn graph<'g>(&self, g: &'g Graph) -> &'g Graph {
+        match self.scope {
+            Scope::Module => g,
+            Scope::Folder => g.folders(),
+        }
+    }
+
+    pub fn source_id<'g>(&self, g: &'g Graph) -> &'g str {
+        &self.graph(g).modules[self.from].id
+    }
+
+    pub fn target_id<'g>(&self, g: &'g Graph) -> Option<&'g str> {
+        self.to.map(|t| self.graph(g).modules[t].id.as_str())
+    }
+
+    pub fn cycle_ids<'g>(&self, g: &'g Graph) -> Vec<&'g str> {
+        let sg = self.graph(g);
+        self.cycle.iter().map(|&m| sg.modules[m].id.as_str()).collect()
+    }
 }
 
 /// Dependency types a rule may name, including alternative spellings used by
@@ -214,6 +239,9 @@ fn compile_module(name: &str, m: &ModuleSpec) -> Result<CompiledModule> {
 
 pub fn validate(cfg: &Config) -> Result<()> {
     for r in &cfg.forbidden {
+        if r.scope == Scope::Folder && (r.from.orphan.is_some() || r.to.reachable.is_some()) {
+            bail!("rule '{}': `orphan` and `reachable` only apply to modules, not scope = \"folder\"", r.name);
+        }
         compile(&r.name, &r.from, &r.to)?;
         if let Some(m) = &r.module {
             compile_module(&r.name, m)?;
@@ -411,70 +439,85 @@ fn for_each_edge(cx: &mut Ctx, c: &Compiled, mut f: impl FnMut(usize, Vec<usize>
     }
 }
 
+/// Evaluates one `forbidden` rule against `cx.g` (the module or folder graph).
+fn eval_forbidden(cx: &mut Ctx, rule: &Rule, out: &mut Vec<Violation>) -> Result<()> {
+    let g = cx.g;
+    let n = g.modules.len();
+    let violation = |from, to, cycle| Violation {
+        rule: rule.name.clone(),
+        severity: rule.severity,
+        comment: rule.comment.clone(),
+        scope: rule.scope,
+        from,
+        to,
+        cycle,
+    };
+    if let Some(spec) = &rule.module {
+        let c = compile_module(&rule.name, spec)?;
+        // `from` restricts which dependents are counted.
+        let counted = Source::new(&rule.from.path, &rule.from.path_not, &rule.name)?;
+        let counts_all = counted.path.is_none() && counted.not.is_none();
+        for m in 0..n {
+            let dependents = if counts_all {
+                g.fan_in(m)
+            } else {
+                g.inc[m].iter().filter(|&&i| counted.matches(&cx.names(g.edges[i].from)).is_some()).count()
+            };
+            if c.less_than.is_some_and(|x| dependents >= x) || c.more_than.is_some_and(|x| dependents <= x) {
+                continue;
+            }
+            if c.source.matches(&cx.names(m)).is_some() {
+                out.push(violation(m, None, vec![]));
+            }
+        }
+        return Ok(());
+    }
+    let c = compile(&rule.name, &rule.from, &rule.to)?;
+    if c.from_orphan == Some(true) {
+        for m in 0..n {
+            if g.is_orphan(m) && c.source.matches(&cx.names(m)).is_some() {
+                out.push(violation(m, None, vec![]));
+            }
+        }
+    } else if let Some(reachable) = rule.to.reachable {
+        let entries: Vec<usize> = (0..n)
+            .filter(|&m| g.modules[m].kind == ModuleKind::Local)
+            .filter(|&m| c.source.matches(&[g.modules[m].id.as_str()]).is_some())
+            .collect();
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let reach = g.closure(&entries, true);
+        for m in 0..n {
+            let module = &g.modules[m];
+            if module.kind != ModuleKind::Local || !module.scanned || entries.contains(&m) {
+                continue;
+            }
+            if reach.contains(&m) == reachable && cx.target_matches(&c.target, m, &[]) {
+                out.push(violation(m, None, vec![]));
+            }
+        }
+    } else {
+        for_each_edge(cx, &c, |i, cycle| {
+            let e = &g.edges[i];
+            out.push(violation(e.from, Some(e.to), cycle));
+        });
+    }
+    Ok(())
+}
+
 pub fn evaluate(g: &Graph, cfg: &Config) -> Result<Vec<Violation>> {
     let mut out = vec![];
     let mut cx = Ctx::new(g);
     let n = g.modules.len();
-
+    let mut folder_cx: Option<Ctx> = None;
     for rule in cfg.forbidden.iter().filter(|r| r.severity != Severity::Off) {
-        let violation = |from, to, cycle| Violation {
-            rule: rule.name.clone(),
-            severity: rule.severity,
-            comment: rule.comment.clone(),
-            from,
-            to,
-            cycle,
-        };
-        if let Some(spec) = &rule.module {
-            let c = compile_module(&rule.name, spec)?;
-            // `from` restricts which dependents are counted.
-            let counted = Source::new(&rule.from.path, &rule.from.path_not, &rule.name)?;
-            let counts_all = counted.path.is_none() && counted.not.is_none();
-            for m in 0..n {
-                let dependents = if counts_all {
-                    g.fan_in(m)
-                } else {
-                    g.inc[m].iter().filter(|&&i| counted.matches(&cx.names(g.edges[i].from)).is_some()).count()
-                };
-                if c.less_than.is_some_and(|x| dependents >= x) || c.more_than.is_some_and(|x| dependents <= x) {
-                    continue;
-                }
-                if c.source.matches(&cx.names(m)).is_some() {
-                    out.push(violation(m, None, vec![]));
-                }
+        match rule.scope {
+            Scope::Module => eval_forbidden(&mut cx, rule, &mut out)?,
+            Scope::Folder => {
+                let fcx = folder_cx.get_or_insert_with(|| Ctx::new(g.folders()));
+                eval_forbidden(fcx, rule, &mut out)?;
             }
-            continue;
-        }
-        let c = compile(&rule.name, &rule.from, &rule.to)?;
-        if c.from_orphan == Some(true) {
-            for m in 0..n {
-                if g.is_orphan(m) && c.source.matches(&cx.names(m)).is_some() {
-                    out.push(violation(m, None, vec![]));
-                }
-            }
-        } else if let Some(reachable) = rule.to.reachable {
-            let entries: Vec<usize> = (0..n)
-                .filter(|&m| g.modules[m].kind == ModuleKind::Local)
-                .filter(|&m| c.source.matches(&[g.modules[m].id.as_str()]).is_some())
-                .collect();
-            if entries.is_empty() {
-                continue;
-            }
-            let reach = g.closure(&entries, true);
-            for m in 0..n {
-                let module = &g.modules[m];
-                if module.kind != ModuleKind::Local || !module.scanned || entries.contains(&m) {
-                    continue;
-                }
-                if reach.contains(&m) == reachable && cx.target_matches(&c.target, m, &[]) {
-                    out.push(violation(m, None, vec![]));
-                }
-            }
-        } else {
-            for_each_edge(&mut cx, &c, |i, cycle| {
-                let e = &g.edges[i];
-                out.push(violation(e.from, Some(e.to), cycle));
-            });
         }
     }
 
@@ -492,6 +535,7 @@ pub fn evaluate(g: &Graph, cfg: &Config) -> Result<Vec<Violation>> {
                     rule: NOT_IN_ALLOWED.into(),
                     severity: cfg.allowed_severity,
                     comment: Some("This dependency isn't covered by any `allowed` rule.".into()),
+                    scope: Scope::Module,
                     from: e.from,
                     to: Some(e.to),
                     cycle: if e.circular { g.cycle_path(i) } else { vec![] },
@@ -515,6 +559,7 @@ pub fn evaluate(g: &Graph, cfg: &Config) -> Result<Vec<Violation>> {
                     rule: rule.name.clone(),
                     severity: rule.severity,
                     comment: rule.comment.clone(),
+                    scope: Scope::Module,
                     from: m,
                     to: None,
                     cycle: vec![],
@@ -527,8 +572,8 @@ pub fn evaluate(g: &Graph, cfg: &Config) -> Result<Vec<Violation>> {
         b.severity
             .cmp(&a.severity)
             .then_with(|| a.rule.cmp(&b.rule))
-            .then_with(|| g.modules[a.from].id.cmp(&g.modules[b.from].id))
-            .then_with(|| a.to.map(|t| &g.modules[t].id).cmp(&b.to.map(|t| &g.modules[t].id)))
+            .then_with(|| a.source_id(g).cmp(b.source_id(g)))
+            .then_with(|| a.target_id(g).cmp(&b.target_id(g)))
     });
     Ok(out)
 }
@@ -546,8 +591,8 @@ pub struct BaselineEntry {
 fn baseline_key(g: &Graph, v: &Violation) -> BaselineEntry {
     BaselineEntry {
         rule: v.rule.clone(),
-        from: g.modules[v.from].id.clone(),
-        to: v.to.map(|t| g.modules[t].id.clone()),
+        from: v.source_id(g).to_string(),
+        to: v.target_id(g).map(String::from),
     }
 }
 
@@ -612,6 +657,109 @@ mod tests {
         got.sort();
         let want = [("a.ts", "b.ts"), ("b.ts", "s.ts"), ("s.ts", "a.ts")];
         assert_eq!(got, want.map(|(a, b)| (a.to_string(), b.to_string())));
+    }
+
+    #[test]
+    fn folder_scope() {
+        use crate::scan::{ImportFlags, Import, ScannedFile, Target as T, Work};
+        use std::path::PathBuf;
+        // No module cycle, but folders a/ and b/ depend on each other.
+        let root = PathBuf::from("/r");
+        let file = |name: &str, deps: &[&str]| {
+            ScannedFile::for_test(
+                root.join(name),
+                deps.iter()
+                    .map(|d| Import { specifier: d.to_string(), flags: ImportFlags::default(), target: T::Local(root.join(d)) })
+                    .collect(),
+            )
+        };
+        let files = vec![
+            file("a/x.ts", &["b/y.ts"]),
+            file("a/w.ts", &[]),
+            file("b/y.ts", &[]),
+            file("b/z.ts", &["a/w.ts", "c/q.ts"]),
+            file("c/q.ts", &[]),
+            file("index.ts", &["a/x.ts", "b/z.ts"]),
+        ];
+        let g = Graph::build(&root, &files, Work::default(), &crate::config::Options::default());
+        let cfg: Config = toml::from_str(
+            r#"
+            [[forbidden]]
+            name = "module-cycles"
+            to = { circular = true }
+
+            [[forbidden]]
+            name = "folder-cycles"
+            scope = "folder"
+            to = { circular = true }
+
+            [[forbidden]]
+            name = "lonely-folders"
+            scope = "folder"
+            module = { path = '^[a-z]$', number_of_dependents_less_than = 2 }
+            "#,
+        )
+        .unwrap();
+        validate(&cfg).unwrap();
+        let mut got: Vec<String> = evaluate(&g, &cfg)
+            .unwrap()
+            .iter()
+            .map(|v| format!("{} {} -> {} | {}", v.rule, v.source_id(&g), v.target_id(&g).unwrap_or("-"), v.cycle_ids(&g).join(" > ")))
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            [
+                "folder-cycles a -> b | a > b > a",
+                "folder-cycles b -> a | b > a > b",
+                // Each has a single dependent folder (root-level files aren't in one).
+                "lonely-folders a -> - | ",
+                "lonely-folders b -> - | ",
+                "lonely-folders c -> - | ",
+            ]
+        );
+        let bad: Config = toml::from_str("[[forbidden]]\nname = \"x\"\nscope = \"folder\"\nfrom = { orphan = true }").unwrap();
+        assert!(validate(&bad).is_err());
+    }
+
+    #[test]
+    fn folders_include_subfolders() {
+        use crate::scan::{ImportFlags, Import, ScannedFile, Target as T, Work};
+        use std::path::PathBuf;
+        let root = PathBuf::from("/r");
+        let file = |name: &str, deps: &[&str]| {
+            ScannedFile::for_test(
+                root.join(name),
+                deps.iter()
+                    .map(|d| Import { specifier: d.to_string(), flags: ImportFlags::default(), target: T::Local(root.join(d)) })
+                    .collect(),
+            )
+        };
+        // features/cart/ui/button.ts reaches into features/user/api/.
+        let files = vec![
+            file("src/features/cart/ui/button.ts", &["src/features/user/api/client.ts", "src/features/cart/model.ts"]),
+            file("src/features/cart/model.ts", &[]),
+            file("src/features/user/api/client.ts", &[]),
+        ];
+        let g = Graph::build(&root, &files, Work::default(), &crate::config::Options::default());
+        let cfg: Config = toml::from_str(
+            r#"
+            [[forbidden]]
+            name = "no-cross-feature"
+            scope = "folder"
+            from = { path = '^src/features/([^/]+)$' }
+            to = { path = '^src/features/', path_not = '^src/features/$1(/|$)' }
+            "#,
+        )
+        .unwrap();
+        let got: Vec<String> =
+            evaluate(&g, &cfg).unwrap().iter().map(|v| format!("{} -> {}", v.source_id(&g), v.target_id(&g).unwrap())).collect();
+        // The whole cart feature (not just files directly in it) depends on user/api.
+        assert_eq!(got, ["src/features/cart -> src/features/user/api"]);
+        let f = g.folders();
+        let cart = f.find(ModuleKind::Local, "src/features/cart").unwrap();
+        // One module edge leaves the cart subtree, none enter it.
+        assert_eq!(f.instability(cart), 1.0);
     }
 
     #[test]

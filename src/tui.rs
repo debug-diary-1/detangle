@@ -9,7 +9,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::*;
 
 use crate::Analysis;
-use crate::config::Severity;
+use crate::config::{Scope, Severity};
 use crate::graph::{Edge, Graph, ModuleKind};
 use crate::watch::{Changes, Watcher};
 
@@ -235,8 +235,29 @@ impl<'a> App<'a> {
         let n = g.modules.len();
         let mut viol_of = vec![vec![]; n];
         let mut worst: Vec<Option<Severity>> = vec![None; n];
+        // Folder violations are attributed to every module in the folder's subtree.
+        let mut by_folder: rustc_hash::FxHashMap<String, Vec<usize>> = Default::default();
+        if a.violations.iter().any(|v| v.scope == Scope::Folder) {
+            for m in 0..n {
+                let Some(mut f) = g.folder_of(m) else { continue };
+                loop {
+                    by_folder.entry(f.clone()).or_default().push(m);
+                    match f.rfind('/') {
+                        Some(i) => f.truncate(i),
+                        None => break,
+                    }
+                }
+            }
+        }
         for (i, v) in a.violations.iter().enumerate() {
-            for m in std::iter::once(v.from).chain(v.to) {
+            let touched: Vec<usize> = match v.scope {
+                Scope::Module => std::iter::once(v.from).chain(v.to).collect(),
+                Scope::Folder => std::iter::once(v.source_id(g))
+                    .chain(v.target_id(g))
+                    .flat_map(|f| by_folder.get(f).cloned().unwrap_or_default())
+                    .collect(),
+            };
+            for m in touched {
                 viol_of[m].push(i);
                 worst[m] = worst[m].max(Some(v.severity));
             }
@@ -573,14 +594,22 @@ impl<'a> App<'a> {
             return;
         }
         let Some(v) = self.vlist.selected().and_then(|i| vs.get(i)) else { return };
-        match code {
-            KeyCode::Enter => self.goto(v.from),
-            KeyCode::Char('t') => {
-                if let Some(t) = v.to {
-                    self.goto(t)
-                }
+        let target = match code {
+            KeyCode::Enter => Some(v.from),
+            KeyCode::Char('t') => v.to,
+            _ => None,
+        };
+        let Some(m) = target else { return };
+        match v.scope {
+            Scope::Module => self.goto(m),
+            Scope::Folder => {
+                // Show the folder's modules.
+                let folder = &v.graph(self.g).modules[m].id;
+                self.filter = if folder == "." { String::new() } else { format!("{folder}/") };
+                self.tab = Tab::Modules;
+                self.pane = Pane::List;
+                self.rebuild();
             }
-            _ => {}
         }
     }
 
@@ -764,10 +793,10 @@ impl<'a> App<'a> {
                     Span::styled(format!("{:<5} ", v.severity.as_str()), sev_style(v.severity)),
                     Span::styled(v.rule.clone(), Style::new().bold()),
                     Span::raw("  "),
-                    Span::styled(g.modules[v.from].id.clone(), Style::new().dim()),
+                    Span::styled(v.source_id(g).to_string(), Style::new().dim()),
                 ];
-                if let Some(t) = v.to {
-                    l.push(Span::styled(format!(" → {}", g.modules[t].id), Style::new().dim()));
+                if let Some(t) = v.target_id(g) {
+                    l.push(Span::styled(format!(" → {t}"), Style::new().dim()));
                 }
                 lines.push(Line::from(l));
             }
@@ -800,10 +829,11 @@ impl<'a> App<'a> {
                     Span::styled(format!("{:<5} ", v.severity.as_str()), sev_style(v.severity)),
                     Span::styled(format!("{:<rule_w$}  ", v.rule), Style::new().bold()),
                 ];
-                spans.extend(path_spans(&g.modules[v.from].id, g.modules[v.from].kind));
+                let vg = v.graph(g);
+                spans.extend(path_spans(&vg.modules[v.from].id, vg.modules[v.from].kind));
                 if let Some(t) = v.to {
                     spans.push(Span::styled(" → ", Style::new().dim()));
-                    spans.extend(path_spans(&g.modules[t].id, g.modules[t].kind));
+                    spans.extend(path_spans(&vg.modules[t].id, vg.modules[t].kind));
                 }
                 ListItem::new(Line::from(spans))
             })
@@ -821,19 +851,25 @@ impl<'a> App<'a> {
             if let Some(c) = &v.comment {
                 lines.push(Line::styled(c.clone(), Style::new().italic().fg(Color::Gray)));
             }
-            lines.push(Line::from(vec![Span::styled("from  ", Style::new().dim()), Span::raw(g.modules[v.from].id.clone())]));
+            let vg = v.graph(g);
+            let scope = if v.scope == Scope::Folder { "  (folder scope — ⏎ lists the folder's modules)" } else { "" };
+            lines.push(Line::from(vec![
+                Span::styled("from  ", Style::new().dim()),
+                Span::raw(v.source_id(g).to_string()),
+                Span::styled(scope, Style::new().dim()),
+            ]));
             if let Some(t) = v.to {
-                let edge = g.out[v.from].iter().map(|&e| &g.edges[e]).find(|e| e.to == t);
+                let edge = vg.out[v.from].iter().map(|&e| &vg.edges[e]).find(|e| e.to == t);
                 let mut l = vec![Span::styled("to    ", Style::new().dim())];
-                l.extend(path_spans(&g.modules[t].id, g.modules[t].kind));
-                if let Some(e) = edge {
+                l.extend(path_spans(&vg.modules[t].id, vg.modules[t].kind));
+                if let Some(e) = edge.filter(|_| v.scope == Scope::Module) {
                     l.push(Span::styled(format!("   via {:?}", e.specifier), Style::new().dim()));
                     l.extend(edge_tags(e));
                 }
                 lines.push(Line::from(l));
             }
             if v.cycle.len() > 1 {
-                let chain = v.cycle.iter().map(|&m| g.modules[m].id.as_str()).collect::<Vec<_>>().join(" → ");
+                let chain = v.cycle_ids(g).join(" → ");
                 lines.push(Line::from(vec![
                     Span::styled("cycle ", Style::new().dim()),
                     Span::styled(chain, Style::new().fg(Color::Red)),

@@ -120,6 +120,17 @@ enum Cmd {
         #[arg(long)]
         filter: Option<String>,
     },
+    /// Write a self-contained HTML report (violations, modules, cycles, folder graph)
+    Report {
+        #[command(flatten)]
+        target: Target,
+        /// Output file
+        #[arg(short, long, default_value = "tangle-report.html")]
+        output: PathBuf,
+        /// Open it in the browser afterwards
+        #[arg(long)]
+        open: bool,
+    },
     /// Summary statistics and hotspots
     Stats {
         #[command(flatten)]
@@ -401,6 +412,23 @@ fn run() -> Result<ExitCode> {
                 println!("{id}");
             }
             eprintln!("{}", p.dim(&format!("{} changed → {} affected", starts.len(), hit.len())));
+        }
+        Cmd::Report { target, output, open } => {
+            let a = analyze(&target.path, target.config.as_deref())?;
+            let html = report::html(&a.graph, &a.violations, a.config_path.as_deref());
+            std::fs::write(&output, &html).with_context(|| format!("writing {}", output.display()))?;
+            let (e, w, i) = report::counts(&a.violations);
+            println!(
+                "{} {} ({:.1} MB) · {} modules · {e} errors, {w} warnings, {i} info",
+                p.green("wrote"),
+                output.display(),
+                html.len() as f64 / 1e6,
+                a.graph.local_count()
+            );
+            if open {
+                let opener = if cfg!(target_os = "macos") { "open" } else if cfg!(windows) { "explorer" } else { "xdg-open" };
+                std::process::Command::new(opener).arg(&output).spawn().context("opening the report")?;
+            }
         }
         Cmd::Stats { target, top } => {
             let a = analyze(&target.path, target.config.as_deref())?;

@@ -295,7 +295,7 @@ pub fn convert(v: &Value) -> Imported {
     let label = |r: &Value, i: usize| r.get("name").and_then(Value::as_str).map_or(format!("#{}", i + 1), String::from);
 
     for (i, r) in rules("forbidden").iter().enumerate() {
-        match convert_rule(r, &["name", "severity", "comment", "from", "to", "module"])
+        match convert_rule(r, &["name", "severity", "comment", "scope", "from", "to", "module"])
             .and_then(|j| serde_json::from_value(j).map_err(|e| e.to_string()))
         {
             Ok(rule) => config.forbidden.push(rule),
@@ -358,7 +358,8 @@ mod tests {
                   "from": { "path": ["^src", "^lib"] },
                   "to": { "dependencyTypes": ["npm-dev"], "dependencyTypesNot": ["type-only"], "pathNot": ["node_modules/@types/"] } },
                 { "name": "no-deprecated", "severity": "ignore", "to": { "dependencyTypes": ["deprecated"] } },
-                { "name": "fancy", "severity": "error", "scope": "folder", "to": { "path": "x" } },
+                { "name": "fancy", "severity": "error", "from": {}, "to": { "path": "x", "exoticallyRequired": true } },
+                { "name": "folders", "severity": "warn", "scope": "folder", "from": {}, "to": { "circular": true } },
                 { "name": "bundled", "to": { "dependencyTypes": ["npm-bundled"] } },
                 { "name": "utils-shared", "module": { "path": "^src/utils", "numberOfDependentsLessThan": 2 } },
             ],
@@ -377,7 +378,8 @@ mod tests {
         });
         let imp = convert(&v);
         let names: Vec<_> = imp.config.forbidden.iter().map(|r| r.name.as_str()).collect();
-        assert_eq!(names, ["no-circular", "not-to-dev-dep", "no-deprecated", "utils-shared"]);
+        assert_eq!(names, ["no-circular", "not-to-dev-dep", "no-deprecated", "folders", "utils-shared"]);
+        assert_eq!(imp.config.forbidden[3].scope, crate::config::Scope::Folder);
         assert_eq!(imp.config.forbidden[0].to.via_only.as_ref().unwrap().path_not.as_ref().unwrap().0, "^src/types");
         assert_eq!(imp.config.forbidden[1].from.path.as_ref().unwrap().0, "(?:^src)|(?:^lib)");
         assert_eq!(imp.config.forbidden[2].severity, crate::config::Severity::Off);
@@ -389,14 +391,14 @@ mod tests {
         assert_eq!(o.tsconfig.as_deref(), Some("tsconfig.json"));
         assert!(!o.ignore_type_only && !o.cycles_ignore_type_only);
         let w = imp.warnings.join("\n");
-        assert!(w.contains("'fancy' skipped: `scope`"), "{w}");
+        assert!(w.contains("'fancy' skipped: to.exoticallyRequired"), "{w}");
         assert!(w.contains("'bundled' skipped: dependency type \"npm-bundled\""), "{w}");
         assert!(w.contains("options.webpackConfig"), "{w}");
         assert!(!w.contains("reporterOptions") && !w.contains("doNotFollow"), "{w}");
         // Round-trips through TOML.
         let text = to_toml(&imp, Path::new("rules.config.js")).unwrap();
         let back: Config = toml::from_str(&text).unwrap();
-        assert_eq!(back.forbidden.len(), 4);
+        assert_eq!(back.forbidden.len(), 5);
         crate::rules::validate(&back).unwrap();
     }
 }

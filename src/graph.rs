@@ -75,6 +75,11 @@ pub struct Graph {
     pub timings: Timings,
     /// Module ids per kind (indexed by `ModuleKind as usize`).
     index: [HashMap<String, usize>; 4],
+    cycles_ignore_type_only: bool,
+    /// The folder-level graph, built on first use.
+    folders: std::sync::OnceLock<Box<Graph>>,
+    /// Folder graphs only: (afferent, efferent) module-level coupling per node.
+    couplings: Vec<(u32, u32)>,
 }
 
 impl Graph {
@@ -90,6 +95,9 @@ impl Graph {
             cycle_of: vec![],
             timings: Timings { walk_ms: work.walk_ms, parse_ms: work.parse_ms, graph_ms: 0.0 },
             index: Default::default(),
+            cycles_ignore_type_only: opts.cycles_ignore_type_only,
+            folders: Default::default(),
+            couplings: vec![],
         };
         for f in files {
             let id = g.rel(&f.path);
@@ -160,15 +168,125 @@ impl Graph {
             e.types = edge_types(base, e.flags);
         }
 
-        g.out = vec![vec![]; g.modules.len()];
-        g.inc = vec![vec![]; g.modules.len()];
-        for (i, e) in g.edges.iter().enumerate() {
-            g.out[e.from].push(i);
-            g.inc[e.to].push(i);
-        }
-        g.find_cycles(opts.cycles_ignore_type_only);
+        g.link();
         g.timings.graph_ms = t.elapsed().as_secs_f64() * 1000.0;
         g
+    }
+
+    /// Builds adjacency lists and finds cycles once modules and edges are set.
+    fn link(&mut self) {
+        self.out = vec![vec![]; self.modules.len()];
+        self.inc = vec![vec![]; self.modules.len()];
+        for (i, e) in self.edges.iter().enumerate() {
+            self.out[e.from].push(i);
+            self.inc[e.to].push(i);
+        }
+        self.find_cycles(self.cycles_ignore_type_only);
+    }
+
+    /// The folder a module belongs to: `src/features/cart` for
+    /// `src/features/cart/cart.ts`, `.` for root-level files.
+    pub fn folder_of(&self, m: usize) -> Option<String> {
+        let module = &self.modules[m];
+        (module.kind == ModuleKind::Local).then(|| match dir_of(&module.id) {
+            "" => ".".to_string(),
+            d => d.to_string(),
+        })
+    }
+
+    /// The folder-level graph. Every directory is a node standing for its
+    /// whole subtree, so `src/features/cart` includes its subfolders:
+    ///
+    /// * a module edge `a → b` makes every folder containing `a` but not `b`
+    ///   depend on `b`'s own folder (npm packages are `node_modules/<name>`);
+    /// * instability uses module-level coupling across the folder boundary
+    ///   (Ce = edges leaving the subtree, Ca = edges entering it).
+    ///
+    /// Cycles are found exactly (strongly connected components), as for modules.
+    pub fn folders(&self) -> &Graph {
+        self.folders.get_or_init(|| {
+            let mut f = Graph {
+                root: self.root.clone(),
+                modules: vec![],
+                edges: vec![],
+                out: vec![],
+                inc: vec![],
+                cycles: vec![],
+                cycle_of: vec![],
+                timings: self.timings,
+                index: Default::default(),
+                cycles_ignore_type_only: self.cycles_ignore_type_only,
+                folders: Default::default(),
+                couplings: vec![],
+            };
+            for (m, module) in self.modules.iter().enumerate() {
+                if module.kind != ModuleKind::Local {
+                    continue;
+                }
+                for x in ancestors(dir_of(&module.id)) {
+                    let i = f.intern_ref(ModuleKind::Local, x);
+                    f.modules[i].scanned |= self.modules[m].scanned;
+                }
+            }
+            let mut ce: HashMap<usize, u32> = HashMap::default();
+            let mut ca: HashMap<usize, u32> = HashMap::default();
+            let mut seen: HashMap<(usize, usize), usize> = HashMap::default();
+            for e in &self.edges {
+                let a = &self.modules[e.from];
+                let b = &self.modules[e.to];
+                if a.kind != ModuleKind::Local {
+                    continue;
+                }
+                let (kind, target) = match b.kind {
+                    ModuleKind::Local => (ModuleKind::Local, match dir_of(&b.id) { "" => ".".to_string(), d => d.to_string() }),
+                    ModuleKind::Npm => (ModuleKind::Npm, format!("node_modules/{}", b.id)),
+                    k => (k, b.id.clone()),
+                };
+                let t = f.intern(kind, target);
+                for x in ancestors(dir_of(&a.id)) {
+                    if b.kind == ModuleKind::Local && inside(&b.id, x) {
+                        continue;
+                    }
+                    let xi = f.index[ModuleKind::Local as usize][x];
+                    *ce.entry(xi).or_default() += 1;
+                    match seen.get(&(xi, t)) {
+                        Some(&i) => {
+                            let fe = &mut f.edges[i];
+                            fe.flags = fe.flags.merge(e.flags);
+                            fe.multi_type |= e.multi_type;
+                            for ty in &e.types {
+                                if !fe.types.contains(ty) {
+                                    fe.types.push(ty);
+                                }
+                            }
+                        }
+                        None => {
+                            seen.insert((xi, t), f.edges.len());
+                            f.edges.push(Edge { from: xi, to: t, circular: false, ..e.clone() });
+                        }
+                    }
+                }
+                if b.kind == ModuleKind::Local {
+                    for y in ancestors(dir_of(&b.id)) {
+                        if !inside(&a.id, y) {
+                            *ca.entry(f.index[ModuleKind::Local as usize][y]).or_default() += 1;
+                        }
+                    }
+                } else {
+                    *ca.entry(t).or_default() += 1;
+                }
+            }
+            // `type-only` etc. describe the merged edge, not any one import.
+            for fe in &mut f.edges {
+                fe.types.retain(|t| !matches!(*t, "type-only" | "dynamic" | "require" | "reexport" | "resource"));
+                fe.types = edge_types(std::mem::take(&mut fe.types), fe.flags);
+            }
+            f.couplings = (0..f.modules.len())
+                .map(|i| (ca.get(&i).copied().unwrap_or(0), ce.get(&i).copied().unwrap_or(0)))
+                .collect();
+            f.link();
+            Box::new(f)
+        })
     }
 
     fn rel(&self, p: &Path) -> String {
@@ -341,7 +459,10 @@ impl Graph {
 
     /// Martin's instability: Ce / (Ca + Ce). 0 = stable, 1 = unstable.
     pub fn instability(&self, m: usize) -> f64 {
-        let (i, o) = (self.fan_in(m), self.fan_out(m));
+        let (i, o) = match self.couplings.get(m) {
+            Some(&(ca, ce)) => (ca as usize, ce as usize),
+            None => (self.fan_in(m), self.fan_out(m)),
+        };
         if i + o == 0 { 0.0 } else { o as f64 / (i + o) as f64 }
     }
 
@@ -504,4 +625,22 @@ impl PathFilter {
         let hit = |r: &fancy_regex::Regex| names.iter().any(|n| r.is_match(n).unwrap_or(false));
         self.include.as_ref().is_none_or(hit) && !self.exclude.as_ref().is_some_and(hit)
     }
+}
+
+/// `src/a/b.ts` → `src/a`; root-level → "".
+fn dir_of(id: &str) -> &str {
+    id.rfind('/').map_or("", |i| &id[..i])
+}
+
+/// `src/a/b` → [`src/a/b`, `src/a`, `src`].
+fn ancestors(dir: &str) -> impl Iterator<Item = &str> {
+    std::iter::successors((!dir.is_empty()).then_some(dir), |d| {
+        let p = dir_of(d);
+        (!p.is_empty()).then_some(p)
+    })
+}
+
+/// Is `id` somewhere below `folder`?
+fn inside(id: &str, folder: &str) -> bool {
+    id.len() > folder.len() && id.starts_with(folder) && id.as_bytes()[folder.len()] == b'/'
 }
