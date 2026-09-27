@@ -268,6 +268,7 @@ impl Project {
             bail!("{} is not a directory", path.display());
         }
         let root = config::find_root(&dir);
+        let t = std::time::Instant::now();
         let loaded = config::load(&root, config)?;
         let mut cfg: Config = loaded.config;
         if let Some(m) = mode {
@@ -287,8 +288,13 @@ impl Project {
             Some(p) => format!("in {}", p.display()),
             None => "in the built-in rules".into(),
         })?;
+        timing("config", t);
+        let t = std::time::Instant::now();
         let session = scan::Session::new(&root, &dir, &cfg.options)?;
+        timing("scan", t);
+        let t = std::time::Instant::now();
         let groups = groups::resolve(&root, &cfg)?;
+        timing("groups", t);
         Ok(Project {
             groups,
             dir,
@@ -312,9 +318,13 @@ impl Project {
     }
 
     fn analyze_with(&self, use_baseline: bool) -> Result<Analysis> {
+        let t = std::time::Instant::now();
         let mut graph = Graph::build(&self.root, self.session.files(), self.session.work, &self.cfg.options);
         graph.assign_groups(&self.groups, self.cfg.options.group_match == config::GroupMatch::Deepest);
+        timing("graph", t);
+        let t = std::time::Instant::now();
         let mut violations = rules::evaluate(&graph, &self.cfg)?;
+        timing("rules", t);
         let used = match self.baseline_path().filter(|p| use_baseline && p.is_file()) {
             Some(p) => rules::apply_baseline(&graph, &mut violations, &p)?,
             None => Default::default(),
@@ -362,7 +372,22 @@ impl Project {
     }
 }
 
+/// With `TANGLE_TIMINGS` set, prints how long a phase took to stderr.
+pub fn timing(phase: &str, t: std::time::Instant) {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var_os("TANGLE_TIMINGS").is_some());
+    if *ON {
+        eprintln!("{phase:>8} {:7.1}ms", t.elapsed().as_secs_f64() * 1000.0);
+    }
+}
+
 fn main() -> ExitCode {
+    let t = std::time::Instant::now();
+    let code = main_inner();
+    timing("total", t);
+    code
+}
+
+fn main_inner() -> ExitCode {
     match run() {
         Ok(code) => code,
         Err(e) => {

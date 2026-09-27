@@ -964,7 +964,7 @@ impl<'a> App<'a> {
         ]
         .concat();
         let l3 = Line::styled(
-            format!("walk {:.1}ms · parse+resolve {:.1}ms · graph {:.1}ms", t.walk_ms, t.parse_ms, t.graph_ms),
+            format!("scan {:.1}ms · graph {:.1}ms", t.scan_ms, t.graph_ms),
             Style::new().dim(),
         );
         f.render_widget(Paragraph::new(vec![Line::from(l1), Line::from(l2), l3]).block(block(" Overview ", false)), summary);

@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::time::SystemTime;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use anyhow::Result;
@@ -140,14 +141,28 @@ pub struct Import {
 type Stamp = Option<(SystemTime, u64)>;
 
 fn stamp(p: &Path) -> Stamp {
-    let m = std::fs::metadata(p).ok()?;
+    stamp_of(&std::fs::metadata(p).ok()?)
+}
+
+fn stamp_of(m: &std::fs::Metadata) -> Stamp {
     Some((m.modified().ok()?, m.len()))
+}
+
+/// A file's contents and stamp, from a single open.
+fn read_source(path: &Path) -> std::io::Result<(String, Stamp)> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let meta = file.metadata()?;
+    let mut source = String::with_capacity(meta.len() as usize + 1);
+    file.read_to_string(&mut source)?;
+    Ok((source, stamp_of(&meta)))
 }
 
 /// On-disk parse cache: each file's imports, reused while the file is
 /// unchanged. Files are compared by modification time and size; with the
 /// `content` strategy a file whose metadata changed (e.g. a fresh checkout)
-/// is still reused when its contents hash the same.
+/// is still reused when its contents hash the same. The comparison happens
+/// in `parse_file`, so each file is stat'ed once.
 mod cache {
     use super::*;
     use crate::config::CacheStrategy;
@@ -175,13 +190,19 @@ mod cache {
         files: HashMap<String, Entry>,
     }
 
-    /// A loaded cache: reusable files, plus what's needed to save it again.
+    /// A loaded cache: each file's previous scan, plus what's needed to save
+    /// the cache again.
     #[derive(Default)]
     pub struct Loaded {
-        pub files: HashMap<PathBuf, ScannedFile>,
+        pub files: HashMap<PathBuf, Hit>,
         entries: HashMap<String, Entry>,
-        /// Some entry needs rewriting (its metadata changed).
-        pub dirty: bool,
+    }
+
+    pub struct Hit {
+        /// The file as last scanned, with the stamp it had then.
+        pub file: ScannedFile,
+        /// Its content hash (`content` strategy only).
+        pub hash: Option<String>,
     }
 
     fn fingerprint(opts: &Options) -> String {
@@ -189,17 +210,24 @@ mod cache {
         format!("{}|{:?}|{}|{}|{:?}", env!("CARGO_PKG_VERSION"), opts.cache_strategy, d.jsdoc, d.builtin_calls, d.exotic)
     }
 
-    fn meta(path: &Path) -> Option<String> {
-        let (t, len) = stamp(path)?;
+    fn meta(stamp: Stamp) -> Option<String> {
+        let (t, len) = stamp?;
         let t = t.duration_since(std::time::UNIX_EPOCH).ok()?;
         Some(format!("{}.{:09}:{len}", t.as_secs(), t.subsec_nanos()))
     }
 
-    fn hash(path: &Path) -> Option<String> {
-        let bytes = std::fs::read(path).ok()?;
+    /// Inverse of `meta`.
+    fn parse_meta(m: &str) -> Stamp {
+        let (t, len) = m.split_once(':')?;
+        let (secs, nanos) = t.split_once('.')?;
+        let t = std::time::UNIX_EPOCH + std::time::Duration::new(secs.parse().ok()?, nanos.parse().ok()?);
+        Some((t, len.parse().ok()?))
+    }
+
+    pub fn hash(bytes: &[u8]) -> String {
         let mut h = rustc_hash::FxHasher::default();
         bytes.hash(&mut h);
-        Some(format!("{:016x}:{}", h.finish(), bytes.len()))
+        format!("{:016x}:{}", h.finish(), bytes.len())
     }
 
     pub fn load(dir: &Path, root: &Path, opts: &Options) -> Loaded {
@@ -210,32 +238,18 @@ mod cache {
             return Loaded::default();
         }
         let content = opts.cache_strategy == CacheStrategy::Content;
-        let hits: Vec<(String, Entry, bool)> = stored
+        let files = stored
             .files
-            .into_par_iter()
-            .filter_map(|(rel, mut e)| {
-                let path = root.join(&rel);
-                let now = meta(&path)?;
-                if now == e.meta {
-                    return Some((rel, e, false));
-                }
-                if content && !e.hash.is_empty() && hash(&path)? == e.hash {
-                    e.meta = now;
-                    return Some((rel, e, true));
-                }
-                None
+            .iter()
+            .map(|(rel, e)| {
+                let path = root.join(rel);
+                let raw = e.imports.iter().map(|(s, b)| (s.clone(), ImportFlags::from_bits(*b))).collect();
+                let file = ScannedFile { path: path.clone(), imports: vec![], parse_errors: e.errors, raw, stamp: parse_meta(&e.meta) };
+                let hash = (content && !e.hash.is_empty()).then(|| e.hash.clone());
+                (path, Hit { file, hash })
             })
             .collect();
-        let mut out = Loaded::default();
-        for (rel, e, moved) in hits {
-            out.dirty |= moved;
-            let path = root.join(&rel);
-            let raw = e.imports.iter().map(|(s, b)| (s.clone(), ImportFlags::from_bits(*b))).collect();
-            let st = stamp(&path);
-            out.files.insert(path.clone(), ScannedFile { path, imports: vec![], parse_errors: e.errors, raw, stamp: st });
-            out.entries.insert(rel, e);
-        }
-        out
+        Loaded { files, entries: stored.files }
     }
 
     /// Saves the cache, reusing loaded entries (and their hashes) where current.
@@ -245,12 +259,12 @@ mod cache {
             .par_iter()
             .filter_map(|f| {
                 let rel = f.path.strip_prefix(root).ok()?.to_string_lossy().into_owned();
-                let m = meta(&f.path)?;
+                let m = meta(f.stamp)?;
                 if let Some(e) = loaded.get(&rel).filter(|e| e.meta == m) {
                     return Some((rel, e.clone()));
                 }
                 let imports = f.raw.iter().map(|(s, fl)| (s.clone(), fl.to_bits())).collect();
-                let hash = if content { hash(&f.path)? } else { String::new() };
+                let hash = if content { hash(&std::fs::read(&f.path).ok()?) } else { String::new() };
                 Some((rel, Entry { meta: m, hash, errors: f.parse_errors, imports }))
             })
             .collect();
@@ -268,7 +282,7 @@ mod cache {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ScannedFile {
     pub path: PathBuf,
     pub imports: Vec<Import>,
@@ -284,8 +298,7 @@ pub struct Work {
     pub walked: bool,
     pub reparsed: usize,
     pub reresolved: usize,
-    pub walk_ms: f64,
-    pub parse_ms: f64,
+    pub scan_ms: f64,
 }
 
 /// A long-lived scan of a project that can be updated incrementally.
@@ -303,18 +316,26 @@ impl Session {
     /// Full scan: walk, parse and resolve everything.
     pub fn new(root: &Path, dir: &Path, opts: &Options) -> Result<Self> {
         let t = Instant::now();
-        let paths = discover(root, dir, opts)?;
-        let walk_ms = ms(t);
-        let t = Instant::now();
         let resolver = make_resolver(root, opts)?;
         let detect = Detect::new(opts);
         let cache_dir = opts.cache.dir(root);
-        let mut cached = cache_dir.as_deref().map(|d| cache::load(d, root, opts)).unwrap_or_default();
-        let with_prev: Vec<(PathBuf, Option<ScannedFile>)> = paths.into_iter().map(|p| { let prev = cached.files.remove(&p); (p, prev) }).collect();
-        let parsed: Vec<(ScannedFile, bool)> = with_prev.into_par_iter().map(|(p, prev)| parse_file(p, prev, &detect)).collect();
-        // Rewrite the cache only when a file was parsed, went away or moved.
-        let changed = cached.dirty || parsed.iter().any(|(_, fresh)| *fresh) || !cached.files.is_empty();
-        let files: Vec<ScannedFile> = parsed.into_iter().map(|(f, _)| f).collect();
+        let cached = cache_dir.as_deref().map(|d| cache::load(d, root, opts)).unwrap_or_default();
+        // Walk, parse and resolve in one pass: each file is handled by the
+        // walker thread that finds it, so parsing starts with the first file.
+        let (fresh, seen) = (AtomicBool::new(false), AtomicUsize::new(0));
+        let mut files = walk_sources(root, dir, opts, |p| {
+            let hit = cached.files.get(&p);
+            seen.fetch_add(usize::from(hit.is_some()), Ordering::Relaxed);
+            let (mut f, how) = parse_file(p, hit.map(|h| &h.file), hit.and_then(|h| h.hash.as_deref()), &detect);
+            if how != Scanned::Reused {
+                fresh.store(true, Ordering::Relaxed);
+            }
+            f.resolve(&resolver);
+            f
+        })?;
+        files.sort_unstable_by(|a, b| path_cmp(&a.path, &b.path));
+        // Rewrite the cache only when a file changed or went away.
+        let changed = fresh.into_inner() || seen.into_inner() != cached.files.len();
         if let Some(d) = &cache_dir
             && changed
         {
@@ -330,10 +351,9 @@ impl Session {
             index: HashMap::new(),
             work: Work::default(),
         };
-        s.resolve_all();
         s.reindex();
         let n = s.files.len();
-        s.work = Work { walked: true, reparsed: n, reresolved: n, walk_ms, parse_ms: ms(t) };
+        s.work = Work { walked: true, reparsed: n, reresolved: n, scan_ms: ms(t) };
         Ok(s)
     }
 
@@ -367,25 +387,23 @@ impl Session {
         let dirty: Vec<usize> = if structural {
             let paths = discover(&self.root, &self.dir, &self.opts)?;
             work.walked = true;
-            work.walk_ms = ms(t);
             let same_set = paths.len() == self.files.len() && paths.iter().zip(&self.files).all(|(p, f)| *p == f.path);
             if !same_set {
                 // The set of files changed, so any import may now resolve
                 // differently (`./foo` → the new `foo.ts`): re-resolve all
                 // with fresh resolver caches, but only re-parse what changed.
-                let t = Instant::now();
                 let mut old: HashMap<PathBuf, ScannedFile> = self.files.drain(..).map(|f| (f.path.clone(), f)).collect();
                 let reused: Vec<(PathBuf, Option<ScannedFile>)> =
                     paths.into_iter().map(|p| { let o = old.remove(&p); (p, o) }).collect();
-                let parsed: Vec<(ScannedFile, bool)> =
-                    reused.into_par_iter().map(|(p, prev)| parse_file(p, prev, &detect)).collect();
-                work.reparsed = parsed.iter().filter(|(_, fresh)| *fresh).count();
+                let parsed: Vec<(ScannedFile, Scanned)> =
+                    reused.into_par_iter().map(|(p, prev)| parse_file(p, prev.as_ref(), None, &detect)).collect();
+                work.reparsed = parsed.iter().filter(|(_, how)| *how != Scanned::Reused).count();
                 self.files = parsed.into_iter().map(|(f, _)| f).collect();
                 self.resolver = make_resolver(&self.root, &self.opts)?;
                 self.resolve_all();
                 self.reindex();
                 work.reresolved = self.files.len();
-                work.parse_ms = ms(t);
+                work.scan_ms = ms(t);
                 self.work = work;
                 return Ok(());
             }
@@ -405,12 +423,11 @@ impl Session {
         dirty.dedup();
 
         // Same file set: only re-parse and re-resolve the files that changed.
-        let t = Instant::now();
         let r = &self.resolver;
         let updated: Vec<(usize, ScannedFile)> = dirty
             .par_iter()
             .map(|&i| {
-                let (mut f, _) = parse_file(self.files[i].path.clone(), None, &detect);
+                let (mut f, _) = parse_file(self.files[i].path.clone(), None, None, &detect);
                 f.resolve(r);
                 (i, f)
             })
@@ -420,7 +437,7 @@ impl Session {
         for (i, f) in updated {
             self.files[i] = f;
         }
-        work.parse_ms = ms(t);
+        work.scan_ms = ms(t);
         self.work = work;
         Ok(())
     }
@@ -444,10 +461,27 @@ fn globset(patterns: &[String]) -> Result<Option<GlobSet>> {
 /// Walks `dir` (respecting .gitignore) and returns source files, filtered by
 /// the include/exclude globs, which are matched against root-relative paths.
 pub fn discover(root: &Path, dir: &Path, opts: &Options) -> Result<Vec<PathBuf>> {
+    let mut files = walk_sources(root, dir, opts, |p| p)?;
+    files.sort_unstable_by(|a, b| path_cmp(a, b));
+    Ok(files)
+}
+
+/// The same order as `Path::cmp` (component by component) for the
+/// normalised paths the walker produces, but much faster: bytewise, with
+/// separators sorting before everything else.
+fn path_cmp(a: &Path, b: &Path) -> std::cmp::Ordering {
+    let key = |c: &u8| if std::path::is_separator(char::from(*c)) { 0 } else { *c };
+    a.as_os_str().as_encoded_bytes().iter().map(key).cmp(b.as_os_str().as_encoded_bytes().iter().map(key))
+}
+
+/// Like `discover`, but maps each source file with `f` on the walker thread
+/// that found it. The results are unordered.
+fn walk_sources<T: Send>(root: &Path, dir: &Path, opts: &Options, f: impl Fn(PathBuf) -> T + Sync) -> Result<Vec<T>> {
     let include = globset(&opts.include)?;
     let exclude = globset(&opts.exclude)?;
     let filter = crate::graph::PathFilter::new(opts);
     let found = Mutex::new(Vec::new());
+    let f = &f;
     WalkBuilder::new(dir)
         .require_git(false)
         .filter_entry(|e| e.file_name() != "node_modules")
@@ -467,15 +501,14 @@ pub fn discover(root: &Path, dir: &Path, opts: &Options) -> Result<Vec<PathBuf>>
                     let excluded = exclude.as_ref().is_some_and(|g| g.is_match(rel));
                     let kept = !filter.active() || filter.keep(&[&rel.to_string_lossy().replace('\\', "/")]);
                     if included && !excluded && kept {
-                        found.lock().unwrap().push(path.to_path_buf());
+                        let item = f(path.to_path_buf());
+                        found.lock().unwrap().push(item);
                     }
                 }
                 WalkState::Continue
             })
         });
-    let mut files = found.into_inner().unwrap();
-    files.sort();
-    Ok(files)
+    Ok(found.into_inner().unwrap())
 }
 
 fn with_extra(mut base: Vec<String>, extra: &[String]) -> Vec<String> {
@@ -492,6 +525,8 @@ fn with_extra(mut base: Vec<String>, extra: &[String]) -> Vec<String> {
 /// main resolver fail for *every* import in its scope, so failures are
 /// retried without it.
 struct Resolvers {
+    /// Tells resolvers apart in the thread-local `DirMemo`s.
+    id: u64,
     main: Resolver,
     plain: Resolver,
     aliases: Aliases,
@@ -556,32 +591,51 @@ fn make_resolver(root: &Path, opts: &Options) -> Result<Resolvers> {
         ..ResolveOptions::default()
     });
     let plain = main.clone_with_options(ResolveOptions { tsconfig: None, ..main.options().clone() });
-    Ok(Resolvers { main, plain, aliases, builtins: r.builtins.clone(), builtins_add: r.builtins_add.clone() })
+    static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    Ok(Resolvers { id, main, plain, aliases, builtins: r.builtins.clone(), builtins_add: r.builtins_add.clone() })
 }
 
 thread_local! {
     static ALLOC: RefCell<Allocator> = RefCell::new(Allocator::default());
 }
 
-/// Parses `path`, reusing `prev`'s imports when the file is unchanged
-/// (returns whether it actually parsed). The result still needs `resolve`.
-fn parse_file(path: PathBuf, prev: Option<ScannedFile>, detect: &Detect) -> (ScannedFile, bool) {
-    let st = stamp(&path);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Scanned {
+    /// Unchanged since `prev`: its imports were reused.
+    Reused,
+    /// Its metadata changed but its contents hash the same: imports reused.
+    Rehashed,
+    Parsed,
+}
+
+/// Parses `path`, reusing `prev`'s imports when the file is unchanged: when
+/// its stamp is the same, or its contents hash to `prev_hash`. The result
+/// still needs `resolve`.
+fn parse_file(path: PathBuf, prev: Option<&ScannedFile>, prev_hash: Option<&str>, detect: &Detect) -> (ScannedFile, Scanned) {
+    let reuse = |prev: &ScannedFile, stamp: Stamp| ScannedFile { imports: vec![], stamp, ..prev.clone() };
     if let Some(prev) = prev
         && prev.stamp.is_some()
-        && prev.stamp == st
+        && prev.stamp == stamp(&path)
     {
-        return (ScannedFile { imports: vec![], ..prev }, false);
+        return (reuse(prev, prev.stamp), Scanned::Reused);
     }
-    let Ok(source) = std::fs::read_to_string(&path) else {
-        return (ScannedFile { path, imports: vec![], parse_errors: 1, raw: vec![], stamp: st }, true);
+    // One open for both the stamp and the contents.
+    let (source, st) = match read_source(&path) {
+        Ok(r) => r,
+        Err(_) => return (ScannedFile { stamp: stamp(&path), path, imports: vec![], parse_errors: 1, raw: vec![] }, Scanned::Parsed),
     };
+    if let (Some(prev), Some(h)) = (prev, prev_hash)
+        && cache::hash(source.as_bytes()) == h
+    {
+        return (reuse(prev, st), Scanned::Rehashed);
+    }
     let (raw, parse_errors) = ALLOC.with(|a| {
         let mut alloc = a.borrow_mut();
         alloc.reset();
         extract(&alloc, &path, &source, detect)
     });
-    (ScannedFile { path, imports: vec![], parse_errors, raw, stamp: st }, true)
+    (ScannedFile { path, imports: vec![], parse_errors, raw, stamp: st }, Scanned::Parsed)
 }
 
 impl ScannedFile {
@@ -591,14 +645,64 @@ impl ScannedFile {
     }
 
     fn resolve(&mut self, resolver: &Resolvers) {
-        self.imports = self
-            .raw
-            .iter()
-            .filter_map(|(specifier, flags)| {
-                let target = resolve(resolver, &self.path, specifier)?;
-                Some(Import { specifier: specifier.clone(), flags: *flags, target })
-            })
-            .collect();
+        DIR_MEMO.with(|m| {
+            let mut m = m.borrow_mut();
+            m.enter(resolver, &self.path);
+            self.imports = self
+                .raw
+                .iter()
+                .filter_map(|(specifier, flags)| {
+                    let target = m.resolve(resolver, &self.path, specifier)?;
+                    Some(Import { specifier: specifier.clone(), flags: *flags, target })
+                })
+                .collect();
+        });
+    }
+}
+
+/// Resolutions for the directory a thread is working in. A resolution
+/// depends only on the importing file's directory, the tsconfig that governs
+/// the file and the specifier, and files of one directory are mostly
+/// resolved together on one thread (the walker hands a thread a whole
+/// directory), so imports repeated across a directory's files resolve once.
+#[derive(Default)]
+struct DirMemo {
+    resolver: u64,
+    dir: PathBuf,
+    /// The governing tsconfig, by identity (the resolver caches it).
+    tsconfig: Option<std::sync::Arc<oxc_resolver::TsConfig>>,
+    targets: rustc_hash::FxHashMap<String, Option<Target>>,
+}
+
+thread_local! {
+    static DIR_MEMO: RefCell<DirMemo> = RefCell::new(DirMemo::default());
+}
+
+impl DirMemo {
+    fn enter(&mut self, resolver: &Resolvers, file: &Path) {
+        let dir = file.parent().unwrap_or(file);
+        // A tsconfig that fails to load governs nothing; resolution then
+        // falls back to the plain resolver, which ignores tsconfigs.
+        let tsconfig = resolver.main.find_tsconfig(file).ok().flatten();
+        let same_tsconfig = match (&self.tsconfig, &tsconfig) {
+            (Some(a), Some(b)) => std::sync::Arc::ptr_eq(a, b),
+            (a, b) => a.is_none() && b.is_none(),
+        };
+        if self.resolver != resolver.id || self.dir != dir || !same_tsconfig {
+            self.resolver = resolver.id;
+            self.dir = dir.to_path_buf();
+            self.tsconfig = tsconfig;
+            self.targets.clear();
+        }
+    }
+
+    fn resolve(&mut self, resolver: &Resolvers, from: &Path, spec: &str) -> Option<Target> {
+        if let Some(t) = self.targets.get(spec) {
+            return t.clone();
+        }
+        let t = resolve(resolver, from, spec);
+        self.targets.insert(spec.to_string(), t.clone());
+        t
     }
 }
 
@@ -796,12 +900,15 @@ impl Collector<'_> {
     }
 }
 
-/// `a`, `a.b`, `a.b.c` as written, for matching callee names.
-fn callee_name(e: &Expression) -> Option<String> {
+/// Whether `e` is the callee `name` as written (`a`, `a.b`, `a.b.c`).
+fn callee_is(e: &Expression, name: &str) -> bool {
     match e {
-        Expression::Identifier(id) => Some(id.name.to_string()),
-        Expression::StaticMemberExpression(m) => Some(format!("{}.{}", callee_name(&m.object)?, m.property.name)),
-        _ => None,
+        Expression::Identifier(id) => id.name == name,
+        Expression::StaticMemberExpression(m) => name
+            .strip_suffix(m.property.name.as_str())
+            .and_then(|n| n.strip_suffix('.'))
+            .is_some_and(|n| callee_is(&m.object, n)),
+        _ => false,
     }
 }
 
@@ -855,21 +962,18 @@ impl<'a> Visit<'a> for Collector<'_> {
 
     fn visit_call_expression(&mut self, it: &CallExpression<'a>) {
         let single = (it.arguments.len() == 1).then(|| it.arguments[0].as_expression().and_then(static_string)).flatten();
-        let callee = callee_name(&it.callee);
-        let exotic = callee.as_deref().and_then(|c| self.detect.exotic.iter().position(|x| x == c));
-        let plain = |f: fn(&mut ImportFlags)| {
-            let mut flags = ImportFlags::default();
-            f(&mut flags);
-            flags
-        };
-        match (callee.as_deref(), single) {
-            (Some("require"), Some(s)) => self.push(s, plain(|f| f.require = true)),
-            (Some("require" | "define"), _) => self.amd(&it.arguments),
-            (Some("process.getBuiltinModule"), Some(s)) if self.detect.builtin_calls => self.push(s, plain(|f| f.builtin_call = true)),
-            (Some(_), Some(s)) if exotic.is_some() => {
-                self.push(s, ImportFlags { exotic: exotic.map_or(0, |i| (i + 1).min(255) as u8), ..Default::default() })
+        let callee = &it.callee;
+        let require = matches!(callee, Expression::Identifier(id) if id.name == "require");
+        if require && let Some(s) = single {
+            self.push(s, ImportFlags { require: true, ..Default::default() });
+        } else if require || matches!(callee, Expression::Identifier(id) if id.name == "define") {
+            self.amd(&it.arguments);
+        } else if let Some(s) = single {
+            if self.detect.builtin_calls && callee_is(callee, "process.getBuiltinModule") {
+                self.push(s, ImportFlags { builtin_call: true, ..Default::default() });
+            } else if let Some(i) = self.detect.exotic.iter().position(|x| callee_is(callee, x)) {
+                self.push(s, ImportFlags { exotic: (i + 1).min(255) as u8, ..Default::default() });
             }
-            _ => {}
         }
         walk::walk_call_expression(self, it);
     }
@@ -924,6 +1028,16 @@ mod tests {
     fn specs(src: &str) -> Vec<(String, ImportFlags)> {
         let alloc = Allocator::default();
         extract(&alloc, Path::new("x.ts"), src, &Detect::default()).0
+    }
+
+    #[test]
+    fn path_cmp_orders_like_path_cmp() {
+        let names = ["/a/b", "/a.b", "/a/b/c", "/a-b/c", "/a/b.ts", "/a/bc", "/a/b-c/d", "/a", "/ab", "/a/B", "/a/_b"];
+        let mut fast: Vec<&Path> = names.iter().map(Path::new).collect();
+        let mut std = fast.clone();
+        fast.sort_by(|a, b| path_cmp(a, b));
+        std.sort();
+        assert_eq!(fast, std);
     }
 
     #[test]

@@ -75,8 +75,8 @@ impl Edge {
 
 #[derive(Debug, Default, Clone, Copy, Serialize)]
 pub struct Timings {
-    pub walk_ms: f64,
-    pub parse_ms: f64,
+    /// Walk, parse and resolve (they run as one parallel pass).
+    pub scan_ms: f64,
     pub graph_ms: f64,
 }
 
@@ -118,7 +118,7 @@ impl Graph {
             inc: vec![],
             cycles: vec![],
             cycle_of: vec![],
-            timings: Timings { walk_ms: work.walk_ms, parse_ms: work.parse_ms, graph_ms: 0.0 },
+            timings: Timings { scan_ms: work.scan_ms, graph_ms: 0.0 },
             index: Default::default(),
             cycles_ignore_type_only: opts.cycles_ignore_type_only,
             folders: Default::default(),
@@ -661,7 +661,7 @@ impl Graph {
     }
 
     pub fn total_ms(&self) -> f64 {
-        self.timings.walk_ms + self.timings.parse_ms + self.timings.graph_ms
+        self.timings.scan_ms + self.timings.graph_ms
     }
 
     pub fn local_count(&self) -> usize {

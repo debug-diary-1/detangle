@@ -67,7 +67,7 @@ export interface Analysis {
     errors: number;
     warnings: number;
     info: number;
-    timings: { walk_ms: number; parse_ms: number; graph_ms: number };
+    timings: { scan_ms: number; graph_ms: number };
   };
   modules: Module[];
   cycles: string[][];

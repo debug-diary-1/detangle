@@ -739,7 +739,7 @@ pub fn stats(g: &Graph, vs: &[Violation], top: usize) -> String {
         let _ = writeln!(out, "  parse errors   {}", p.yellow(&parse_errors.to_string()));
     }
     let t = g.timings;
-    let _ = writeln!(out, "  time           {:.0}ms {}", g.total_ms(), p.dim(&format!("(walk {:.0}ms · parse+resolve {:.0}ms · graph {:.0}ms)", t.walk_ms, t.parse_ms, t.graph_ms)));
+    let _ = writeln!(out, "  time           {:.0}ms {}", g.total_ms(), p.dim(&format!("(scan {:.0}ms · graph {:.0}ms)", t.scan_ms, t.graph_ms)));
 
     let mut section = |title: &str, rows: Vec<(usize, usize)>| {
         let _ = writeln!(out, "\n{}", p.bold(title));
