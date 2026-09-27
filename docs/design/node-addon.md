@@ -1,6 +1,6 @@
 # Feature: ESLint rules backed by a native Node.js add-on
 
-Status: **draft, revision 4** (after Cold Reads 1–3; their findings are at the end). No code until the next Cold Read and sign-off. Owner and sign-off: the maintainer.
+Status: **draft, revision 5** (after Cold Reads 1–4; their findings are at the end). No code until the next Cold Read and sign-off. Owner and sign-off: the maintainer; the independent gate is the cold reads plus human review.
 
 ## Problem
 
@@ -24,16 +24,17 @@ This is a maintainer-driven bet, not a response to user requests. That's why it 
 | violation | One rule match. Its `scope` is `module`, `folder` (the graph of directories) or `group`. It has a `from` node, an optional `to` node (none for rules about a node alone), a `cycle` (for circular rules) and, at group scope only, `imports`: the module-level imports behind it. `detangle check -f json` prints each import as `{ from, specifier, to }`, where `from`/`to` are module ids and `specifier` is the import string. |
 | circular violation | Reported **per import edge**: every edge that lies on a cycle and matches the rule yields its own violation, with `from` = that edge's importing file. |
 | `dir` and root | `detangle check <dir>` scans `dir`. The **root** is `find_root(dir)`: the nearest ancestor of `dir` (itself included) with `detangle.toml`, else the nearest with `package.json`, else `dir`. Module ids are relative to the root, and the watcher watches the root. |
-| `Session` (`src/scan.rs`) | The scanned files: each file's extracted import strings (`raw`), their resolved targets, the parse-error count, and a `stamp` (mtime + size). `Session::update(paths)` re-reads changed files. When a path was added, removed or renamed (a **structural** change), it re-walks `dir`. If the set of files differs, it re-resolves every file; if the set is the same, only files whose stamp moved. Its `work.graph_changed` flag says whether any file's imports changed. |
+| `Session` (`src/scan.rs`) | The scanned files: each file's extracted import strings (`raw`), their resolved targets, the parse-error count, and a `stamp` (mtime + size). `Session::update(paths)` re-reads changed files. It decides what changed **by checking the filesystem, not the event kind** (watchers report plain saves as creates): a path counts as added only if it's a source file that isn't a member yet, and as removed only if a member no longer exists. So an editor's atomic save (write a temp file, rename it over the original) is a plain modification. When a path really was added, removed or renamed (a **structural** change), it re-walks `dir`. If the set of files differs, it re-resolves every file; if not, only files whose stamp moved. Its `work.graph_changed` flag says whether any file's imports changed. |
+| member directory | A directory under the root that contains a Session member, or is an ancestor of one. Gitignored output such as `.next/` or `dist/` has no members, so it isn't one. |
 | `Project` (`src/main.rs`) | A loaded config plus a `Session`. `Project::analyze()` builds the `Graph` and evaluates the rules into an `Analysis` (graph + violations). |
 | `extract` (`src/scan.rs`) | Parses one file's source (with oxc) and returns its import strings. They're the **cooked** string values, the same as ESTree's `Literal.value`, including any `?query` suffix. Vue/Svelte/Astro files go through `src/sfc.rs` first. |
-| parse cache | The optional on-disk cache of each file's extracted imports, enabled by `cache` in the config or `--cache` on the CLI. |
+| parse cache | The optional on-disk cache of each file's extracted imports, enabled by `cache` in the config or `--cache` on the CLI. It's written to a temp file, then renamed into place. |
 | exotic require | `options.exotic_require` in the config: extra callee names treated like `require`, possibly dotted (for example `module.require`). |
 | watcher (`src/watch.rs`) | The `notify`-based recursive file watcher used by `detangle watch` and the explorer (the interactive terminal UI). It **ignores events** under `node_modules`, `.git` and `target`, but the OS still watches those directories (on Linux, one inotify watch per directory). It waits for 150 ms of quiet before releasing a batch. It flags a change as a **config change** when the file name is `detangle.toml`, `package.json`, `tsconfig*.json`, `webpack.config.*`, `vite.config.*`, `babel.config.*`, `.babelrc*`, `.env*` or `project.json`. |
 | `--mode` | The existing CLI flag passed to Vite/webpack config evaluation, so aliases defined per mode resolve correctly. |
 | `one_shot` (`src/main.rs`) | Deliberately leaks a one-shot command's `Project` and `Analysis`, because the OS reclaims them faster at exit than freeing them does (~20 ms for VS Code's graph, measured when it was introduced). |
 | platform packages | The 8 npm packages `detangle-{darwin-arm64, darwin-x64, linux-x64-gnu, linux-arm64-gnu, linux-x64-musl, linux-arm64-musl, windows-x64, windows-arm64}`, each holding the binary for one target (today 3.5–3.8 MB compressed, 8–9.6 MB unpacked). They're listed in `npm/platforms.json`; `npm/binary.js`'s `platform()` picks the one for this machine. |
-| `--concurrency N` | ESLint's option (ESLint 9.34+) to lint in N worker threads. |
+| `--concurrency N` | ESLint's option (ESLint 9.34+) to lint in N worker threads, all in one process. |
 | baseline `22899e5` | The commit of release 0.1.3, the last release before this work. |
 | fixtures | `tests/fixtures/*`: small projects used by the Rust and npm tests. `conditions` exercises ~20 rule conditions (it produces 12 plain and 7 circular module-scope violations). |
 | verify against the real tool | The project's standing rule: correctness is checked by comparing with the real CLI's output, not only with unit tests. |
@@ -52,7 +53,7 @@ Other measurements:
 - VS Code phase times (`DETANGLE_TIMINGS=1`, `graph -f json`): scan 170 ms, graph 15 ms, rules 5 ms, total 219 ms.
 - VS Code peak memory for `detangle check`: 172 MB RSS.
 - `detangle watch` on VS Code, rebuild after an edit, 8 runs each:
-  - one that changes imports: 57–61 ms;
+  - one that changes imports: 57–61 ms (not broken down further);
   - one that doesn't: 2–5 ms.
 - A one-file project holding VS Code's largest file (1.4 MB), or a median one (5.9 KB): scan ~3 ms either way. That's resolver setup, so **the per-file parse of a median file isn't measured yet**; the benchmark measures it.
 - Walking `src/` (`rg --files`): ~30 ms.
@@ -61,11 +62,12 @@ Other measurements:
   | Platform | Tree | Directories | Setup |
   | -------- | ---- | ----------- | ----- |
   | macOS (FSEvents) | VS Code `src/` | 2,713 | ~1.4 ms |
-  | Linux 6.12 (inotify, Docker VM on the same Mac) | VS Code `src/` | 2,713 | ~46 ms |
-  | Linux | the same `src/` plus a typical `node_modules` (react, next, vite, vitest, typescript, eslint, jest, storybook, webpack, babel, prettier) | 6,370 | ~96 ms |
-  | Linux | one non-recursive watch per directory, skipping `node_modules`/`.git`, even with `notify`'s batch API | 2,694 | ~125 ms |
+  | Linux 6.12 (inotify, **Docker VM** on the same Mac) | VS Code `src/` | 2,713 | ~46 ms |
+  | Linux (VM) | the same `src/` plus a typical `node_modules` (react, next, vite, vitest, typescript, eslint, jest, storybook, webpack, babel, prettier) | 6,370 | ~96 ms |
+  | Linux (VM) | one non-recursive watch per directory, skipping `node_modules`/`.git`, even with `notify`'s batch API | 2,694 | ~125 ms |
 
-  Linux costs ~15–17 µs per directory, and `node_modules` can't be excluded from a recursive watch. Filtering is slower than watching everything.
+  - Linux costs ~15–17 µs per directory, and `node_modules` can't be excluded from a recursive watch. Filtering is slower than watching everything.
+  - Native Linux and Windows aren't measured yet; CI logs them (Risks).
 
 What these numbers mean:
 - **Starting a process costs ~4 ms.** The only other overhead in the Node API is JSON, and only `analyze()` on huge repos pays it.
@@ -79,43 +81,52 @@ What these numbers mean:
 ## Scope
 
 - **In:**
-  - A napi-rs (v3) add-on, `detangle.node`, targeting Node-API 8 (Node ≥ 18, the package's `engines`). It exposes `rootOf`, `open` and a synchronous `Project` (contract in D3).
-  - Two ESLint rules, `detangle/errors` and `detangle/warnings`, in the existing `detangle` npm package at `detangle/eslint`, plus `configs.recommended`. They support ESLint 9 and 10 flat config.
+  - A napi-rs (v3) add-on, `detangle.node`, targeting Node-API 8. It exposes `open` and a synchronous `Project` (contract in D3).
+  - Two ESLint rules, `detangle/errors` and `detangle/warnings`, in the existing `detangle` npm package at `detangle/eslint`, plus `configs.recommended`.
+    - They support ESLint 9 and 10 flat config.
+    - The Node versions ESLint supports apply to the rules: ESLint 10 needs ^20.19, ^22.13 or ≥ 24. The package's `engines` (Node ≥ 18) stays for the CLI and the existing API.
+  - **One Project per `(dir, config, mode)` per ESLint thread**, where `dir` is the `dir` option or ESLint's `cwd` (D8). No automatic per-file project discovery.
   - Freshness:
     - an overlay of the linted file's buffer (D6);
-    - a watcher started at open, on a background thread (D7);
-    - root discovery that notices new marker files above the root (D8).
+    - a watcher started at open on a background thread;
+    - polling of the root config files on every lint (D7).
   - Shipping `detangle.node` inside the 8 existing platform packages.
   - `scripts/cmp-output.sh` and `scripts/bench-eslint.mjs`, committed so the checks can be reproduced.
+  - Two CLI fixes that come with the watcher and Session work:
+    - `detangle watch` and the explorer stop ignoring `notify`'s lost-event signal;
+    - the parse cache's temp file gets a per-thread name.
   - Release **0.2.0**, with the ESLint integration marked **experimental**.
 - **Out:**
-  - Changing the existing `analyze`/`check`/`report`/`graph`/`migrate` Node API, or any CLI output.
-  - Unsaved changes in files other than the one being linted.
+  - Changing the existing `analyze`/`check`/`report`/`graph`/`migrate` Node API, or any CLI output format.
+  - Discovering a project per linted file (walking up from each file to its own `detangle.toml`/`package.json`). That was tried in revisions 3–4 and produced most of Cold Read 4's lifecycle holes.
+  - Unsaved changes in files other than the one being linted. That includes other buffers whose overlay a structural update has replaced with disk content (D6).
   - Files that don't exist on disk yet: no reports.
   - Re-linting other open files when the graph changes. They update the next time the editor lints them.
   - Folder- and group-scope violations **without an import** (dependents count, orphan or reachable at group scope). They have no file to show in; `detangle check` lists them.
   - Tracking files that a JavaScript rules config imports.
   - Excluding `node_modules` from the OS-level watch on Linux (measured: filtering costs more than it saves).
   - A fallback when the add-on can't load (D11).
-  - Autofixes and suggestions. Rules defined in the ESLint config.
-  - Legacy `.eslintrc`, and ESLint < 9. typescript-eslint < 8.
+  - Autofixes and suggestions.
+  - Writing detangle rules inside the ESLint config instead of `detangle.toml` or a rules config file.
+  - Legacy `.eslintrc`, ESLint < 9, and typescript-eslint < 8.
   - Any new npm package.
   - Bundler plugins, an LSP, and a `detangle serve` daemon.
   - Sharing one Session across ESLint worker threads.
 
 ## Success criteria
 
-"Lint" means **one ESLint pass over one file with both rules enabled**, which is one add-on call (D5). Targets are for VS Code `src/` on the maintainer's Mac, measured by `scripts/bench-eslint.mjs <corpus>`. The benchmark drives ESLint's `Linter` API with and without the rules and reports the difference; for "added" rows, it measures one ESLint thread.
+"Lint" means **one ESLint pass over one file with both rules enabled**, which is one add-on call (D5). Targets are for VS Code `src/` on the maintainer's Mac, measured by `scripts/bench-eslint.mjs <corpus>`. The benchmark drives ESLint's `Linter` API with and without the rules on one thread and reports the difference.
 
 | Case | Target | Basis |
 | ---- | ------ | ----- |
-| Lint, file unchanged, median-size file | ≤ 0.5 ms added | estimate: parse of ~6 KB plus lookup and node matching; to be measured |
+| Lint, file unchanged, median-size file | ≤ 0.5 ms added | estimate: parse of ~6 KB, a few config stats, the lookup and node matching. To be measured |
 | Lint, file unchanged, 1.4 MB file | ≤ 5 ms added | parse ≤ 3 ms, one parse per lint |
-| Lint after an import edit | ≤ 65 ms added | `watch` measures 57–61 ms. D8's off-thread free should lower it, but that saving is unmeasured and not counted |
+| Lint after an **unsaved** import edit in the linted file | ≤ 30 ms added | one parse, re-resolving one file, graph 15 ms, rules 5 ms |
+| Lint after a **saved** import change in another file (arrives via the watcher) | ≤ 65 ms added | `watch` measures 57–61 ms. D8's off-thread free should lower it, but that saving is unmeasured and not counted |
 | First lint in a process (cold scan) | ≤ 250 ms | CLI total 219 ms. The watcher is set up in parallel and isn't on this path |
 | Lint after a config change (TOML config) | ≤ 250 ms | a full re-open. JS configs and Vite/webpack evaluation add their `node` spawn, reported by `DETANGLE_TIMINGS` as the `config` phase |
-| Watcher setup, Linux (background) | ≤ 100 ms for VS Code `src/` | measured ~46 ms (Docker VM) |
-| Memory per Project | ≤ 1.2 × the CLI's peak RSS on the same project | CLI: 172 MB on VS Code; a Session plus one Analysis should be about the same |
+| Watcher setup, Linux (background) | ≤ 100 ms for VS Code `src/` | ~46 ms in a VM; re-measured on native Linux in CI (Risks) |
+| Memory per Project, steady state | ≤ 1.2 × the CLI's peak RSS on the same project | CLI: 172 MB on VS Code. During a re-open the old Session stays alive until the new one is ready, so up to ~2.4× briefly |
 
 A missed target **blocks the 0.2.0 release**, unless the maintainer accepts that specific miss in the release commit message with the measured number. The measured numbers go in the implementation commit message either way.
 
@@ -130,28 +141,36 @@ Correctness criterion: the drift test (Risks) passes, comparing **locations**, n
 - `src/lib.rs` (**new**): declares the modules `main.rs` declares today and re-exports `Project`, `Analysis` and `CacheArgs`. The crate docs say "internal API, no semver guarantees".
 - `src/project.rs` (**new**):
   - `Project` and `Analysis`, moved from `main.rs`.
-  - One logic change: `Project::open` today reads the CLI's `--cache`/`--cache-strategy` from a global (`CACHE_ARGS`). It takes them as an explicit `CacheArgs` parameter instead; the CLI passes its flags, and the add-on passes none, so only the config's `cache` setting applies.
-  - `Project::violations_for(path) -> FileReport`: the D3 result's `violations`, implementing D9. It relies on a per-`Analysis` index from module to violations, built lazily.
-  - `Project::config_stamps()`: stamps of the files `open` reads directly: the `config` file, `detangle.toml`, the root `package.json` and `tsconfig*.json`, and any Vite/webpack config.
+  - One logic change: `Project::open` today reads the CLI's `--cache`/`--cache-strategy` from a global (`CACHE_ARGS`, read nowhere else). It takes them as an explicit `CacheArgs` parameter instead; the CLI passes its flags, and the add-on passes none, so only the config's `cache` setting applies.
+  - `Project::violations_for(path) -> FileReport`, where `FileReport = { violations: Vec<FileViolation> }` and `FileViolation = { rule, severity, message, specifiers }` (D3). It implements D9 through a per-`Analysis` index built lazily on first use:
+    - module-scope violations by `from` module;
+    - group-scope violations by each `imports` entry's `from` module;
+    - folder-scope violations by folder id. The lookup walks the linted file's directory and its ancestors.
+  - `Project::config_stamps()`: stamps of the files `open` reads directly: the `config` file (wherever it lives), `detangle.toml`, the root `package.json` and `tsconfig*.json`, and any Vite/webpack config.
 - `src/main.rs`: uses the lib, and passes `CacheArgs` from its flags. `one_shot` stays here.
 - `src/scan.rs`:
   - `Session::overlay(path, source) -> bool` (D6).
   - `Session::contains(path)`.
-  - `Session::rescan()`: a forced structural update (D7).
+  - `Session::admit(path) -> bool`: a structural update for one path that may have been missed (D6).
+  - `Session::rescan()`: a forced structural update.
+  - `Session::is_member_dir(path)`.
+  - The parse cache's temp file is named `{FILE}.{pid}.{thread id}` instead of `{FILE}.{pid}`, so `--concurrency` workers in one process can't collide.
 - `src/watch.rs`:
-  - `Changes` gains `rescan: bool`, set when `notify` reports lost events (`need_rescan()`: macOS "must scan subdirs", inotify queue overflow).
-  - The callback checks `need_rescan()` **before** its event-kind filter. Today that filter discards these events (their kind is `Other`), so `detangle watch` silently ignores lost events.
-  - `detangle watch` and the explorer gain the fix too: `rescan` triggers a full rebuild (`Changes::full`). That changes behavior, not output format.
+  - `Changes` gains `rescan: bool`, set when `notify` reports lost events (`need_rescan()`: macOS "must scan subdirs", inotify queue overflow). The callback checks `need_rescan()` **before** its event-kind filter. Today that filter discards these events (their kind is `Other`), so `detangle watch` silently ignores lost events.
+  - `detangle watch` and the explorer gain the fix too: `rescan` triggers a full rebuild (`Changes::full`). That changes behavior, not output format, and a `watch.rs` unit test covers it.
   - `Watcher::drain() -> Result<Changes, Disconnected>` returns every pending change with no quiet period. `Disconnected` (a unit error) means the watcher's thread died.
 - `napi/Cargo.toml`, `napi/src/lib.rs` (**new**): the `detangle-napi` crate (`publish = false`, `crate-type = ["cdylib"]`, `napi` 3 / `napi-derive` 3). It contains:
   - The exports from D3, each wrapped in `std::panic::catch_unwind` (D8). `#[napi(catch_unwind)]` is a backstop.
-  - The state machine, background watcher setup, ancestor-marker watch, dropper thread and env cleanup hook (D7, D8).
+  - The state machine, background watcher setup, config polling, dropper thread and env cleanup hook (D7, D8).
   - A `test-hooks` cargo feature adding a hidden `__panicForTest()` export.
 - `npm/native.js` (**new**):
   - Loads `detangle.node` from the platform package via `binary.js`'s `platform()`.
-  - Resolves each Project's key (D8), and shares one result per `(sourceCode, key)` (D5).
+  - Keeps the Project `Map` (D8), and shares one result per `(sourceCode, key)` (D5).
   - Emits process warnings (D12).
-- `npm/eslint.js`, `npm/eslint.mjs`, `npm/eslint.d.ts` (**new**): the plugin `{ meta, rules: { errors, warnings }, configs: { recommended } }`. The rules match specifiers to AST nodes (D9).
+- `npm/eslint.js`, `npm/eslint.mjs`, `npm/eslint.d.ts` (**new**):
+  - The plugin `{ meta, rules: { errors, warnings }, configs: { recommended } }`.
+  - The rules match specifiers to AST nodes (D9).
+  - `configs.recommended` is `{ name: "detangle/recommended", plugins: { detangle }, rules: { "detangle/errors": "error", "detangle/warnings": "warn" } }`, with no `files`. It applies to whatever files the user's config already lints; TypeScript, Vue and Svelte need their usual `files`/parser entries.
 - `npm/package.json`:
   - `exports["./eslint"]` and the new files in `files`.
   - `peerDependencies.eslint: ">=9"`, optional via `peerDependenciesMeta`.
@@ -162,12 +181,15 @@ Correctness criterion: the drift test (Risks) passes, comparing **locations**, n
   - The drift test (Risks).
   - The shared-`SourceCode` assumption, on ESLint 9 and 10.
   - The worker teardown test.
-  - The panic test (`test-hooks`): one re-open per watcher batch, never one per call.
-  - The ancestor-marker test (a `detangle.toml` added above the root switches Projects and closes the old one).
-  - A lost-events test: a synthetic `rescan` in `Changes` triggers `Session::rescan()`.
+  - The panic test (`test-hooks`).
+  - A no-watcher test: with the watcher disabled by a `test-hooks` switch, a config edit is still picked up through polling, and a `Broken` Project recovers.
+  - A build-output test: writing `.next/package.json` causes no re-open.
+  - A new-file test: a file created and linted before its watcher event arrives is admitted.
+  - A lost-events test.
   - A Windows-only case test (a path differing only in case).
+  - It logs watcher setup time per OS (read by Risks).
 - `tests/fixtures/eslint/` (**new**): module, circular, folder, group, orphan and `required` rules, an exotic require (dotted), and duplicate specifiers.
-- `tests/fixtures/eslint-monorepo/` (**new**): workspace packages with their own `package.json`, a cross-package cycle, and the root `detangle.toml` added by the test at run time.
+- `tests/fixtures/eslint-monorepo/` (**new**): workspace packages with their own `package.json`, a root `detangle.toml`, and a cross-package cycle.
 - `scripts/cmp-output.sh` (**new**): `cmp-output.sh <base-bin> <new-bin> <project>…`.
   - It runs `check`, `check -f json`, `graph -f json` and `graph -f dot` with both binaries.
   - It strips the only nondeterministic output: JSON `timings`/`*_ms` fields, and `· <n>ms` in text output. It then asserts byte-identical output.
@@ -175,13 +197,18 @@ Correctness criterion: the drift test (Risks) passes, comparing **locations**, n
 - `scripts/bench-eslint.mjs` (**new**): the Success-criteria benchmark. It takes a corpus path and isn't run in CI.
 - `scripts/npm-packages.mjs`: copies `detangle.node` into each platform package.
 - `.github/workflows/release.yml`:
-  - Builds `detangle-napi` per target.
+  - Builds `detangle-napi` per target, on the same native runner as the target's binary.
   - On musl, `RUSTFLAGS=-C target-feature=-crt-static` is set **only on the add-on build step**, so the CLI binary stays static. The step checks this with `file bin/detangle`, which must say "statically linked".
-  - Each runner smoke-tests the add-on with `node -e "require('./detangle.node')"` before upload.
+  - Smoke test before upload: `node -e "require('./detangle.node')"`. On musl targets it runs inside a `node:22-alpine` container, because a glibc `node` can't load a musl add-on. x86_64 macOS isn't smoke-tested, the same as its binary today (it builds on an arm64 runner).
 - `.github/workflows/ci.yml`:
-  - Builds the add-on and runs `npm/eslint.test.mjs` on Linux, macOS and Windows against ESLint 10, and on Linux also against `eslint9`.
+  - Builds the add-on and runs `npm/eslint.test.mjs` on Linux, macOS and Windows with Node 22, against ESLint 10, and on Linux also against `eslint9`.
   - Runs `cargo package` plus a standalone build.
-- `docs/reference.md`, `README.md`, `site/index.html`: an ESLint section with the experimental label, the editor-first positioning, the `--cache` caveat, and the `dir` option for monorepos without a root `detangle.toml`.
+- `docs/reference.md`, `README.md`, `site/index.html`: an ESLint section with:
+  - the experimental label;
+  - the editor-first positioning;
+  - the `--cache` caveat;
+  - a flat-config example;
+  - the `dir` option for projects that don't sit at ESLint's working directory.
 
 ## Decisions
 
@@ -205,16 +232,14 @@ Correctness criterion: the drift test (Risks) passes, comparing **locations**, n
 ### D3: A narrow contract. Rust decides placement; JavaScript only matches nodes
 
 - **Chosen:**
-  - `rootOf(dir: string) → string`: `find_root(dir)`. It always returns a path; with no marker file it's `dir` itself.
   - `open(dir: string, options: { config?: string; mode?: string }) → Project`. This is `detangle check <dir> [--config …] [--mode …]` kept alive. Other CLI flags have no equivalent; everything else comes from the config file, the parse cache (`cache`) included. Paths are absolute, resolved by `native.js` (D8).
-  - `Project.violationsFor(file: string, text: string) → { violations, problems, exoticRequire, generation }`:
+  - `Project.violationsFor(file: string, text: string) → { violations, problems, exoticRequire }`:
     - `violations: { rule, severity: "error" | "warn" | "info", message, specifiers: string[] }[]`.
       - `specifiers` are the import strings **in this file** where the violation should be shown. An empty list means line 1.
       - `message` is defined below.
     - `problems: string[]`: persistent state problems (D12).
     - `exoticRequire: string[]`: the config's exotic-require names, for node matching (D9).
-    - `generation: number`: incremented on every re-open (D8). `native.js` uses it to drop its caches.
-  - `Project.close()`: stops the watcher and frees the Session. Used by tests and by root switching (D8).
+  - `Project.close()`: stops the watcher and frees the Session. The Project then stays `Closed`: every later call returns only the problem `detangle project closed`. Only tests call `close()`; in normal use the env cleanup hook tears Projects down (D8).
   - **Message format**, built in Rust from the violation's JSON fields, as `detangle check -f json` prints them:
     - `` `${rule}: ${from}` `` then `` ` → ${to}` `` if there's a `to`;
     - then `` ` (cycle: ${cycle.join(" → ")})` `` if the cycle has more than one entry;
@@ -224,6 +249,7 @@ Correctness criterion: the drift test (Risks) passes, comparing **locations**, n
 - **Rejected:**
   - Returning `to`, `cycle` and `imports` and placing in JavaScript: it spreads the placement rules over two languages.
   - Returning the whole `Analysis`: a different feature.
+  - A `rootOf` export and a `generation` counter (revision 4): they only served per-file project discovery, which is now Out.
 - **Cost we're accepting:** the add-on isn't a general Node API.
 
 ### D4: Ship as `detangle/eslint`, with the `.node` file inside the existing platform packages
@@ -232,7 +258,7 @@ Correctness criterion: the drift test (Risks) passes, comparing **locations**, n
 - **Rejected:**
   - `eslint-plugin-detangle`, or separate per-platform add-on packages: each new npm package needs its own trusted-publisher setup on npmjs.com, which takes a security-key confirmation per save.
   - One package bundling all 8 add-ons: every install would download all 8.
-- **Cost we're accepting:** each platform package roughly doubles, from 3.5–3.8 MB compressed to an expected ~7 MB (the add-on contains most of the binary's code). If a compressed platform package goes over 10 MB, D4 is reopened (see Risks).
+- **Cost we're accepting:** each platform package roughly doubles, from 3.5–3.8 MB compressed (measured) to an **estimated** ~7 MB, since the add-on contains most of the binary's code. If a compressed platform package goes over 10 MB, D4 is reopened (see Risks).
 
 ### D5: One add-on call per lint, shared by both rules
 
@@ -251,103 +277,112 @@ Correctness criterion: the drift test (Risks) passes, comparing **locations**, n
 - **Chosen:** `violationsFor(file, text)` does these steps in order.
   - `file` is ESLint's `context.filename`.
   - `text` is `context.sourceCode.text`, from which ESLint has removed any BOM. `extract` ignores a BOM too, so specifiers match either way.
-  1. **Drain** the watcher (D7), if it's running, and apply the changes:
-     - `Session::update` for source changes;
-     - `Session::rescan()` if `rescan` is set;
-     - one re-open if any change in the batch is a config change (D8).
-  2. **Membership:** if `file` isn't a Session member (`Session::contains`), return no violations. **The Session decides membership, never the overlay.** Excluded, generated, out-of-`dir` and not-yet-saved files land here. A newly saved file joins through the watcher's structural update.
+  1. **Freshen** (D7): poll the config stamps; drain the watcher, if it's running; apply what they found.
+  2. **Membership:** if `file` isn't a Session member (`Session::contains`):
+     - If the file exists on disk, has a source extension, and hasn't been rejected since the last structural change, call `Session::admit(file)`. That's a structural update for that one path (a re-walk, ~30 ms on VS Code), so a new file saved and linted before its watcher event arrives is picked up immediately.
+     - If it's still not a member (excluded, generated, outside `dir`), remember the rejection until the next structural change and return no violations. Files that don't exist on disk return no violations without any work.
+     - **The Session decides membership, never the overlay.**
   3. **Overlay:** `Session::overlay(file, text)`.
      - Runs `extract` on `text` and compares the result with the file's stored `raw` and parse-error count.
      - If they're equal, returns `false`, with no change.
-     - Otherwise it replaces `raw`, re-resolves **only this file**, sets `stamp = None` so the next disk update re-reads it, and sets `graph_changed`.
+     - Otherwise it replaces `raw`, re-resolves **only this file**, sets `stamp = None` so the next disk read of it re-parses, and sets `graph_changed`.
      - Other files don't need re-resolving. Resolution depends on the **set** of files and on config files (`package.json` `exports`, tsconfig `paths`). An overlay changes neither, and config files are handled by re-opening.
-  4. **Analyse** again only if step 1 or 3 set `graph_changed`.
+  4. **Analyse** again only if step 1, 2 or 3 set `graph_changed`.
 - **Overlay lifetime:**
-  - An overlay lasts until a disk event for that path, the next lint of that file, or a re-open.
-  - A disk event for a file whose buffer still has unsaved edits (a `git checkout` or a formatter) replaces the overlay with the disk content. The next lint of the buffer puts it back.
-  - A buffer discarded without saving leaves its overlay in place **indefinitely**, until one of those happens or ESLint restarts.
+  - An overlay lasts until the file is next re-read from disk (on a disk event for it, or during **any** structural update), the next lint of that file, or a re-open.
+  - Because every structural update re-reads overlaid files, unsaved imports in **other** open buffers revert to disk content at the next file add or remove, until those buffers are linted again. The linted file itself is never affected, since step 3 runs after step 1.
+  - A buffer discarded without saving leaves its overlay in place until one of those events or an ESLint restart.
   - Overlays are never written to the parse cache.
 - **Rejected:**
   - Disk only: new unsaved imports would only show after saving.
   - An mtime check of every file on every call: ~25 ms on VS Code.
   - Overlaying files that aren't on disk: the resolver reads the real filesystem.
-- **Cost we're accepting:** the discarded-buffer case, and a brief disk-content window after an external write. Unsaved edits in files that aren't being linted are invisible.
+  - Keeping overlays across structural updates: it would need the overlay texts stored and re-applied, for a case that's already Out (unsaved edits in other files).
+- **Cost we're accepting:**
+  - the discarded-buffer case;
+  - other buffers reverting to disk at structural updates;
+  - a brief disk-content window after an external write;
+  - one ~30 ms re-walk the first time an excluded file is linted after each structural change.
 
-### D7: The watcher starts at open, on a background thread
+### D7: Freshness: config polling on every lint, plus a watcher started at open on a background thread
 
 - **Chosen:**
-  - `open` starts a thread that creates the recursive watcher on the root **before** the scan begins. The scan runs on the calling thread at the same time; watcher setup (Linux ~46–96 ms, macOS ~1.4 ms) overlaps the ~170 ms scan.
-  - The watcher belongs to the Project **wrapper**, not the Session, so it survives re-opens and panics (D8). It's started once per Project, whatever state `open` ends in.
-  - Each call drains it with **no quiet period**:
-    - The quiet period exists to coalesce editors' multi-write saves before a TUI redraw. Here, the worst case is a half-written file parsed once. Its next write event re-marks it dirty, and the next lint corrects it.
-    - A burst such as a branch switch may span several drains. Each drain applies at most one structural update, re-resolving every file only if the set of files changed, and at most one re-open. So a burst costs a few updates, each bounded by a full scan (≤ 250 ms on VS Code), not one per event.
-  - **Lost events:** when `notify` reports that events were dropped (`need_rescan()`), the next drain runs `Session::rescan()` and compares `config_stamps()`, re-opening if they changed.
+  - **Config polling (always on).** At the start of each call, the Project stats `config_stamps()`: a handful of files, microseconds. If any stamp changed, it re-opens (D8).
+    - This alone keeps the config fresh and lets `Broken`/`Failed` recover, whether or not a watcher is running.
+    - It also covers a `config` file outside the root, which the watcher can't see.
+  - **The watcher.** `open` starts a thread that creates the recursive watcher on the root **before** the scan begins. The scan runs on the calling thread at the same time; watcher setup (Linux ~46–96 ms in a VM, macOS ~1.4 ms) overlaps the ~170 ms scan.
+    - The watcher belongs to the Project **wrapper**, not the Session, so it survives re-opens and panics (D8).
+    - Each call drains it with **no quiet period**:
+      - The quiet period exists to coalesce editors' multi-write saves before a TUI redraw. Here, the worst case is a half-written file parsed once. Its next write event re-marks it dirty, and the next lint corrects it.
+      - Atomic saves are ordinary modifications (Glossary: `Session`).
+      - A burst such as a branch switch may span several drains. Each drain applies at most one `Session::update` and at most one re-open, so a burst costs a few updates, each bounded by a full scan (≤ 250 ms on VS Code), not one per event.
+  - **Which watcher events count as a config change:** a config-named event (Glossary: watcher) counts only if the file is in `config_stamps()`, is the `config` file, or sits in a **member directory**, so nested workspace `package.json`/`tsconfig.json` files count. Config-named files in gitignored output such as `.next/package.json` or `dist/` don't. The event filter keeps skipping `node_modules`, `.git` and `target`.
+  - **Lost events** (`need_rescan()`): the next drain re-opens the Project. That's one ≤ 250 ms rebuild, and it catches nested config changes too. Lost events are rare, and a partial rescan could miss those nested config changes.
+  - **Without a watcher** (setup failed, inotify exhausted, or the thread died): one warning (D12); config polling and the overlay keep working. Saved changes to other source files and new files are picked up only when those files are linted themselves: step 2 admits new files, and the overlay covers the file's own imports. They aren't seen from other files' lints.
 - **Rejected:**
-  - A lazy watcher, started on the first re-lint (revisions 2–3). It needed lint tracking, a 1 s heuristic and a catch-up. It left holes: new files, `Broken` projects that could never start a watcher, and config edits missed before the watcher started. Three cold reads kept finding its corners.
+  - A lazy watcher, started on the first re-lint (revisions 2–3). It needed lint tracking, a 1 s heuristic and a catch-up, and three cold reads kept finding its corners.
+  - Relying on the watcher alone for config and recovery (revision 4): a failed watcher made `Broken`/`Failed` permanent.
   - Filtering the watch on Linux to skip `node_modules`: measured slower (~125 ms vs ~46 ms for the same tree).
   - Starting the watcher on ESLint's thread: adds 46–96 ms to the first lint on Linux.
+  - Retrying watcher creation: the usual cause (exhausted inotify watches) doesn't go away within a process.
 - **Cost we're accepting:**
   - Every Project watches, including `eslint .` and each `--concurrency` worker:
     - on Linux, ~15–17 µs of background CPU per directory under the root, `node_modules` included (a very large `node_modules` of ~50k directories takes ~0.8 s and 50k inotify watches per Project);
     - on macOS, one FSEvents stream;
-    - on Windows, one recursive directory handle (not measured).
-  - When inotify watches run out, the watcher fails. That's one warning (D12); results are still correct for a one-shot run.
+    - on Windows, one recursive directory handle (cost logged by CI, not yet known).
   - **Startup race:** an edit made during the first ~100 ms after open, to a file the scan has already read in a directory not yet watched, is missed until that file's next event or lint.
 
-### D8: Lifecycle. Project keys and roots, a state machine, panic recovery and cleanup
+### D8: Lifecycle. One Project per `(dir, config, mode)`, a state machine, panic recovery and cleanup
 
-- **Which directory to scan (`native.js`):** the Project's `dir` is, in order:
-  1. the rule option `dir`, resolved against ESLint's `context.cwd`. It's exactly `detangle check <dir>`.
-  2. otherwise, if `config` is given, `context.cwd`, like running `detangle check . --config <config>` from where ESLint runs;
-  3. otherwise, `rootOf(dirname(file))`.
-  - The root is always `find_root(dir)`, as in the CLI, so with option 1 or 2 the root can lie above `dir`. The watcher watches the root.
-  - With a `detangle.toml` at the repo root and ESLint run from the repo root, all three give the same root as `detangle check .` run there. A monorepo without a root `detangle.toml` should set `dir`, and the docs say so.
+- **Which directory to scan (`native.js`):**
+  - `dir` is the rule option `dir`, resolved against ESLint's `context.cwd`, or else `context.cwd` itself. That is exactly `detangle check <dir>`, or `detangle check .` run from where ESLint runs.
+  - The root is `find_root(dir)`, as in the CLI, and the watcher watches the root.
+  - Editors set ESLint's `cwd` per workspace folder, so each folder of a multi-root workspace gets its own Project. A project nested below the `cwd` that has its own `detangle.toml` needs `dir` (or a separate ESLint config with `dir`); the docs say so.
+  - **Refusal:** if the root would be the filesystem root or the user's home directory, `open` doesn't scan. The Project is `Broken` with the problem `refusing to scan <path>; set the "dir" option`.
 - **Cache:**
-  - Projects are cached in a module-level `Map` keyed by `(canonical dir, canonical config path or "", mode or "")`. `dunce::canonicalize` runs through the add-on's `rootOf`. A path that can't be canonicalized, such as a missing config, is used as given; `open` then fails with that error and the Project is `Broken`.
-  - The `rootOf` results are cached per directory.
-  - Both caches are dropped when any Project's `generation` changes.
-- **Root switching:**
-  - Case 3's roots can change when a marker file (`detangle.toml` or `package.json`) appears or disappears **above** a root. To notice that, each Project whose `dir` came from case 3 also watches the root's ancestor directories **non-recursively**: one watch per ancestor, typically under 10.
-  - Such an event clears the `rootOf` cache and closes (`Project.close()`) every case-3 Project of that env, so the next lint opens the right one. Superseded Projects are never kept.
-  - This is the only eviction. Otherwise one process sees a handful of keys, and each ESLint worker thread has its own module instance.
-- **States** (the Rust wrapper; the watcher lives in the wrapper and survives every transition):
+  - Projects live in a module-level `Map` keyed by `(canonical dir, canonical config path or "", mode or "")`, canonicalized with Node's `fs.realpathSync.native`.
+  - A path that can't be canonicalized (a missing config) is used as given; `open` then fails with that error, and the Project is `Broken`.
+  - Keys are fixed for the life of the process. Nothing is evicted, and nothing needs to be: one ESLint thread sees one key per distinct option set in its config, usually one. Each worker thread has its own module instance.
+- **States** (the Rust wrapper; the watcher lives in the wrapper and survives every transition except `Closed`):
 
   | State | Holds | Each call returns |
   | ----- | ----- | ----------------- |
   | `Ready` | Session and Analysis | violations |
   | `Stale` | the last good Session and Analysis, plus a config error | violations. Overlays and drains keep applying to the last good Session. The error is in `problems` |
-  | `Broken` | a config error, no Session | no violations; the error in `problems` |
+  | `Broken` | a config error (or a refusal), no Session | no violations; the error in `problems` |
   | `Failed` | a panic message, no Session | no violations; the panic in `problems` |
+  | `Closed` | nothing | the problem `detangle project closed` |
 
   | From | Event | To |
   | ---- | ----- | -- |
-  | (none) | `open`: succeeds / config error / panics | `Ready` / `Broken` / `Failed` |
-  | `Ready`, `Stale` | a config change in a drained batch → re-open: succeeds / fails / panics | `Ready` / `Stale` (keeps the last good Session) / `Failed` |
-  | `Broken` | a config change → re-open: succeeds / fails / panics | `Ready` / `Broken` / `Failed` |
+  | (none) | `open`: succeeds / config error or refusal / panics | `Ready` / `Broken` / `Failed` |
+  | `Ready`, `Stale` | config change (polled stamp, or a qualifying watcher event, or lost events) → re-open: succeeds / fails / panics | `Ready` / `Stale` (keeps the last good Session) / `Failed` |
+  | `Broken` | config change → re-open: succeeds / fails / panics | `Ready` / `Broken` / `Failed` |
   | `Ready`, `Stale` | a panic in any call | `Failed` (the Session is dropped) |
-  | `Failed` | the next drained watcher batch of any kind → re-open: succeeds / fails / panics | `Ready` / `Broken` / `Failed` |
+  | `Failed` | a config change, or a drained batch that touches a Session member path → re-open: succeeds / fails / panics | `Ready` / `Broken` / `Failed` |
+  | any | `close()` | `Closed` |
 
-  - A "config change" is an event the watcher flags as one, or an event for the `config` file itself (it may have any name).
-  - A re-open happens at most once per drained batch, so a panic that recurs every time costs one re-open per batch of file changes, never one per lint.
-  - Every re-open increments `generation`.
+  - A re-open happens at most once per call. From `Failed` it needs a config change or a change to a source file the old Session held, not churn in unrelated files. So a panic that recurs every time costs one re-open per relevant change, never one per lint.
+  - During a re-open from `Ready`/`Stale`, the old Session stays alive until the new one is ready (Success criteria: memory).
 - **Panics:**
   - Every export wraps its body in `std::panic::catch_unwind`. A panic moves to `Failed`, and the call returns normally with the panic in `problems`. Throwing is avoided (D12).
   - All profiles keep `panic = "unwind"`, and `napi/Cargo.toml` says why.
 - **Background threads:**
-  - The watcher threads (recursive and ancestor): if one dies, `drain()` returns `Disconnected`. The Project drops that watcher, emits a warning (D12), and continues with overlay-only freshness.
-  - The **dropper thread** is one per Project. It receives replaced Analyses, and the old Session on a re-open, and frees them off ESLint's thread. If sending to it fails, the value is freed inline.
-- **Cleanup:** an env cleanup hook (`napi_add_env_cleanup_hook`) runs when a worker thread or the process ends. It stops the watchers and joins their threads.
-  - In a **worker** env, it also closes the dropper channel, joins that thread, and frees the Projects.
-  - In the **main** env (process exit), it leaks the Projects and the dropper's queue, like the CLI's `one_shot`. Freeing them would only delay exit (~20 ms per VS Code-sized graph).
+  - The watcher's thread: if it dies, `drain()` returns `Disconnected`. The Project drops the watcher, emits a warning (D12), and continues without it (D7).
+  - The **dropper thread** is one per Project. It receives replaced Analyses, and the old Session after a re-open, and frees them off ESLint's thread. If sending to it fails, the value is freed inline.
+- **Cleanup:** an env cleanup hook (`napi_add_env_cleanup_hook`) runs when a worker thread or the main environment is torn down. Whether Node runs it under `process.exit()` isn't verified yet (the teardown test checks). Either way the main-env path only signals and leaks, so skipping it loses nothing. Nothing runs when the process is killed.
+  - In a **worker** env, it stops the watcher and joins its thread (waiting for an unfinished setup, ≤ its setup time), closes the dropper channel, joins that thread, and frees the Projects.
+  - In the **main** env (process exit), it signals the threads to stop but **doesn't join** them, and leaks the Projects and the dropper's queue, like the CLI's `one_shot`. The OS reclaims everything at exit, so a short `eslint .` run never waits on watcher setup or freeing.
 - **Rejected:**
+  - Per-file project discovery (`rootOf` of each linted file, an ancestor watch, root switching; revisions 3–4). It made one Project per directory in unmarked trees, scanned `$HOME` via a stray `package.json`, and leaked or duplicated Projects when marker files changed inside a root.
+  - The config file's directory as `dir` (revision 3): wrong when the config lives in a subdirectory.
   - Re-opening on every call after a panic: a cold scan per keystroke.
   - A time-based backoff: it can retry into the same panic over and over.
   - Never re-opening in-process: one bad save disables the rules for the editor session.
-  - The config file's directory as `dir` (revision 3): wrong when the config lives in a subdirectory.
-  - Guessing the outermost `package.json`: it would disagree with `detangle check`.
   - A process-global Session shared across worker threads.
 - **Cost we're accepting:**
-  - Monorepos without a root `detangle.toml` must set `dir`.
+  - Nested projects not at ESLint's `cwd` must set `dir`.
+  - A monorepo without a root `detangle.toml`, linted from the repo root, is one Project rooted at the root `package.json`. That's the same as `detangle check .` there, so no violations are lost relative to the CLI.
   - With `--concurrency N`, the scan runs N times (N × ~170 ms of CPU and N × ~172 MB on VS Code), and each worker holds its own watcher.
 
 ### D9: Two rules split by severity, and a placement table
@@ -401,59 +436,68 @@ Correctness criterion: the drift test (Risks) passes, comparing **locations**, n
 - **Rejected:** a one-time `spawnSync` of the binary. Its triggers barely exist:
   - The add-on and binary ship in, and fail with, the same platform package.
   - Node-API is ABI-stable across Node versions.
-  - Placing reports would need `graph -f json --externals` (31 MB on VS Code) and a second, JavaScript implementation of D9.
+  - It would mean a second **production** implementation of D9 in JavaScript, plus 31 MB of JSON per start on VS Code. The drift test's oracle is also a JavaScript version of D9, but it's test code, checked against the Rust one on every CI run. A production copy would be a second path users depend on.
 - **Cost we're accepting:** runtimes without Node-API get only the message.
 
 ### D12: Problems and warnings
 
 - **Chosen:**
-  - **`problems`** are persistent state problems: add-on unavailable (D11), a config error (`Stale`, `Broken`), or a panic (`Failed`). They're returned on every call while the state lasts, and shown at line 1 of every linted file.
-    - Within one pass, only the **first rule to run** for that `(sourceCode, key)` reports them. The shared result (D5) records that they've been reported.
-    - Which rule runs first is set by the order of the user's ESLint config.
-  - **Warnings** are one-time notices that don't block results: the watcher failed to start, or a watcher thread died. `native.js` emits them with `process.emitWarning`, once per Project; editors show them in the ESLint output channel.
+  - **`problems`** are persistent state problems: add-on unavailable (D11), a config error or refusal (`Stale`, `Broken`), a panic (`Failed`), or `Closed`. They're returned on every call while the state lasts, and shown at line 1 of every linted file.
+    - Within one pass, only the **first rule to run** for that `(sourceCode, key)` reports them, at that rule's severity. The shared result (D5) records that they've been reported.
+    - Which rule runs first follows the order in the user's ESLint config. `configs.recommended` lists `detangle/errors` first, so under it problems are errors.
+    - An add-on that can't load in CI therefore fails the lint. That's intended: a CI config that enables the rules but can't run them is misconfigured, and the message says to run `detangle check`.
+  - **Warnings** are one-time notices that don't block results: the watcher failed to start, or its thread died. `native.js` emits them with `process.emitWarning`, once per Project; editors show them in the ESLint output channel. They aren't `problems`, because in CI they'd flood every file while results are still correct.
 - **Rejected:**
   - Throwing: ESLint turns it into a crash message for the whole file.
-  - Showing watcher failures as lint messages: they would appear in every file, although results still work.
   - Reporting problems from both rules: duplicates.
-- **Cost we're accepting:** a broken config shows at line 1 of every file linted until it's fixed. That's intended.
+- **Cost we're accepting:**
+  - A broken config shows at line 1 of every file linted until it's fixed. That's intended.
+  - With a config that lists `detangle/warnings` first, problems show as warnings.
 
 ## Edge cases & failure modes
 
 | Scenario | Behavior | Why |
 | -------- | -------- | --- |
-| `eslint .` / `eslint --fix .` | One scan and one watcher per thread; one overlay parse per pass | D5, D7 |
-| `eslint --concurrency N` | N scans, N watchers | D7, D8 cost |
-| inotify watches exhausted (Linux, big `node_modules` or many workers) | Watcher fails: one warning; results correct at that moment, then only the linted file stays fresh | D7, D12 |
+| `eslint .` / `eslint --fix .` | One scan and one watcher per thread; one overlay parse per pass; exit never waits on the watcher | D5, D7, D8 cleanup |
+| `eslint --concurrency N` | N scans, N watchers, N × memory | D7, D8 cost |
+| inotify watches exhausted (Linux, big `node_modules` or many workers) | Watcher fails: one warning. Config polling and the overlay keep working; other files' saved changes are seen when those files are linted | D7, D12 |
 | `eslint --cache` | May miss cross-file violations | D10 |
-| Monorepo, `detangle.toml` at the repo root | One Project for the repo, the same root as `detangle check` from the repo root | D8 |
-| Monorepo without a root `detangle.toml`, no `dir` option | One Project per package; violations across packages are missing | D8 cost; the docs say to set `dir` |
-| `detangle.toml` added above the current root while the editor runs | The ancestor watch notices; the case-3 Projects close; the next lint opens the repo-level Project (one cold scan) | D8 root switching |
-| Config change | Re-open at the next lint (≤ 250 ms for TOML). Success: `Ready`. Failure: `Stale`, with the last good results plus the error | D8 |
-| Nested `package.json`/`tsconfig.json` edit | Treated as a config change, one re-open, as `detangle watch` does | Correctness: nested files affect resolution |
-| Config invalid on first open | `Broken`: a line-1 problem on every file; recovers on the next config change | D8, D12 |
-| `open` panics | `Failed`; re-opens on the next watcher batch | D8 |
+| Monorepo, linted from the repo root | One Project for the repo, the same as `detangle check .` there | D8 |
+| Nested project with its own `detangle.toml`, not at ESLint's `cwd` | Scanned as part of the `cwd`'s root unless `dir` points at it | D8 cost |
+| Multi-root editor workspace | One Project per workspace folder (the editor sets ESLint's `cwd` per folder) | D8 |
+| ESLint run from `$HOME` or `/` with no marker below | `Broken`: "refusing to scan …; set the "dir" option" | D8 refusal |
+| Config change (root files, or the `config` file anywhere) | Detected by polling at the next lint, with or without a watcher. Re-open ≤ 250 ms (TOML). Success: `Ready`. Failure: `Stale`, with the last good results plus the error | D7, D8 |
+| Nested workspace `package.json`/`tsconfig.json` edit | A config change via the watcher (it's in a member directory), so one re-open | D7 |
+| `.next/package.json`, `dist/package.json` written by a dev server | Ignored: not a member directory | D7 |
+| Config invalid on first open | `Broken`: a line-1 problem on every file; recovers at the first lint after the config is fixed | D7 polling, D8 |
+| `open` panics | `Failed`; re-opens after a config change or a change to a source file | D8 |
 | JavaScript rules config, or Vite/webpack evaluation | The add-on spawns `node` synchronously, the first `node` on the ESLint process's `PATH`. Editors launched from a GUI may have a different `PATH`; if `node` isn't found, the Project is `Broken` with that error | Unchanged code path; costs time only at open |
 | Edit to a file a JavaScript rules config imports | Not detected | Out |
-| Linted file not in the Session (excluded, generated, outside `dir`, not saved yet) | No reports | D6 step 2 |
-| New file saved | Joins through the watcher's structural update; reported from its next lint | D6, D7 |
+| Linted file not in the Session (excluded, generated, outside `dir`) | One `admit` check (~30 ms) the first time after each structural change, then no reports | D6 step 2 |
+| New file saved and linted before its watcher event | Admitted by step 2 and reported at once | D6 |
+| Untitled or unsaved new file | No reports | D6 step 2 |
+| Atomic save (temp file + rename) | An ordinary modification, not structural (2–5 ms in `watch`) | Glossary: `Session` |
 | Edit during the first ~100 ms after open | Possibly missed until that file's next event or lint | D7 startup race |
 | Unsaved import edit | Checked live | D6 |
+| Unsaved imports in another open buffer, then any file is added or removed | That buffer reverts to disk content until it's linted again | D6 cost |
 | External write to a file with unsaved edits | Disk content until the next lint of the buffer | D6 |
-| Buffer discarded without saving | Overlay stays indefinitely: until a disk event for the path, the next lint of that file, a re-open, or an ESLint restart | D6 cost |
-| `notify` reports lost events | `Session::rescan()` plus a config-stamp check at the next lint | D7 |
-| Branch switch | A few structural updates across the next lints, each ≤ 250 ms on VS Code; re-opens if config files changed | D7 |
-| Processor virtual filenames (`README.md/0.js`) | Not Session members, so no reports | D6 step 2 |
+| Buffer discarded without saving | Overlay stays until the file is re-read from disk, linted again, re-opened, or ESLint restarts | D6 cost |
+| `notify` reports lost events | Re-open at the next lint | D7 |
+| Branch switch | A few updates across the next lints, each ≤ 250 ms on VS Code; a re-open if config files changed | D7 |
+| Processor virtual filenames (`README.md/0.js`) | Don't exist on disk, so no reports and no `admit` | D6 step 2 |
 | Buffer with syntax errors | ESLint fails to parse and never runs the rules | ESLint behavior |
 | Vue/Svelte through their ESLint parsers | `text` is the full SFC source, which `extract` handles via `sfc.rs` | Same input the CLI reads |
 | Specifier with no matching AST node | Line 1, with `[import "…"]` in the message | D9 |
 | Same specifier imported twice | Both nodes are reported | D9 |
 | `require(variable)` | Never matched | D9 |
 | Folder/group violation without an import | Not shown | Out |
-| Add-on missing or fails to load | A `problems` line on every file | D11 |
-| Rust panic | `Failed`; a `problems` line; one re-open on the next watcher batch | D8 |
+| Add-on missing or fails to load | A `problems` line on every file (an error under `recommended`) | D11, D12 |
+| Rust panic | `Failed`; a `problems` line; one re-open per relevant change | D8 |
 | Stack overflow or abort in Rust | The ESLint process dies | Can't be caught; D1 |
-| ESLint worker thread exits | The cleanup hook stops the watchers and frees the Projects | D8 |
-| Process exit | The cleanup hook stops the watchers; Projects are leaked, like `one_shot` | D8 |
+| ESLint worker thread exits | The cleanup hook stops and joins the threads and frees the Projects | D8 |
+| Process exit (`eslint .` finishing, or `process.exit()`) | The cleanup hook, if Node runs it, signals the threads and leaks the rest, like `one_shot`; otherwise the OS reclaims everything | D8 |
+| Process killed | Nothing runs; the OS reclaims everything | — |
+| Two `--concurrency` workers write the parse cache | Separate temp files per thread; the last rename wins; each file is complete | Files: `scan.rs` |
 | Symlinked paths from ESLint | `dunce::canonicalize` before lookup | The Session stores canonical paths |
 | Case-mismatched paths | macOS: canonicalize returns the on-disk case (checked with native `realpath` on APFS). Windows: covered by the CI case test | Same |
 
@@ -474,15 +518,22 @@ Correctness criterion: the drift test (Risks) passes, comparing **locations**, n
     - overlay adds an import;
     - overlay, then a disk save with the same text;
     - overlay, then the disk reverted;
-    - overlay, then a drain, then `rescan()`, then another overlay.
+    - overlay, then a structural update (the overlay is dropped), then another overlay;
+    - `admit` of a new file.
 - **Rust panics become ESLint crashes.** Caught by `catch_unwind`, the panic test, and a local run of the rules over the VS Code and excalidraw clones before each release. The clones aren't in CI. Not caught: aborts, OOM, stack overflow.
-- **Watcher cost on Linux CI.** Every `eslint .` run pays watcher setup in the background. Caught by: the benchmark's Linux watcher row. Not caught: repos with very large `node_modules`, where it's ~0.8 s of background CPU and may exhaust inotify watches. That degrades to a warning, not wrong results.
-- **musl or Windows ARM add-on builds fail.** The release matrix builds them; CI only covers x64 Linux/Windows and arm64 macOS. Mitigation: the smoke `require` on each release runner, and the check that the musl CLI binary is still static, both before anything is uploaded.
-- **Thread teardown bugs** (a watcher outliving its env). Caught by: a test that opens a Project in a `worker_threads` Worker, terminates the Worker, and asserts the process exits cleanly.
+- **Watcher cost differs on native Linux and Windows.** The Linux numbers come from a Docker VM, and Windows isn't measured.
+  - Caught by: `eslint.test.mjs` logs watcher setup time for its fixture on each CI OS, and the benchmark's Linux row is re-run on a native Linux machine before release.
+  - Not caught: repos with very large `node_modules`, where setup is ~0.8 s of background CPU and may exhaust inotify watches. That degrades freshness (D7), not correctness at open.
+- **musl or Windows ARM add-on builds fail.** The release matrix builds them on native runners; CI only covers x64 Linux/Windows and arm64 macOS.
+  - Mitigation: the smoke `require` on each release runner (musl in an Alpine container), and the check that the musl CLI binary is still static, both before anything is uploaded.
+  - Not smoke-tested: x86_64 macOS, the same as its binary today.
+- **Thread teardown bugs** (a watcher outliving its env). Caught by: a test that opens a Project in a `worker_threads` Worker, terminates the Worker, and asserts the process exits cleanly. Plus the `eslint .` exit-time check in the benchmark.
 - **Stale results in editors.** Lost events are handled (D7). Events `notify` drops *without* signalling it aren't caught; they self-heal on the next save of the affected file, a re-open, or an ESLint restart.
-- **Package size.** If a compressed platform package goes over 10 MB (expected ~7 MB), D4 is reopened. The alternative is one extra `-node` package per platform, with its trusted-publisher setups.
-- **The lib split changes the binary's output.** Caught by `scripts/cmp-output.sh` against the `22899e5` binary on VS Code and excalidraw. The `CacheArgs` change is the only logic change, and it's covered by the existing `--cache` tests.
-- **ESLint API changes.** CI tests ESLint 10 (current: 10.11) on all three OSes and ESLint 9 on Linux. The shared-`SourceCode` assumption (D5) has its own test.
+- **Package size.** If a compressed platform package goes over 10 MB (estimated ~7 MB), D4 is reopened. The alternative is one extra `-node` package per platform, with its trusted-publisher setups.
+- **The lib split changes the binary's output.** Caught by `scripts/cmp-output.sh` against the `22899e5` binary on VS Code and excalidraw.
+  - The `CacheArgs` change is the only logic change in the move, and it's covered by the existing `--cache` tests.
+  - The two CLI fixes (lost events in `watch`, cache temp names) change no output.
+- **ESLint API changes.** CI tests ESLint 10 (current: 10.11) on all three OSes and ESLint 9 on Linux, all on Node 22. The shared-`SourceCode` assumption (D5) has its own test.
 - **Latency or memory misses its targets.** `scripts/bench-eslint.mjs` before release. A miss blocks the release unless it's explicitly accepted.
 
 ## Sign-off
@@ -490,7 +541,8 @@ Correctness criterion: the drift test (Risks) passes, comparing **locations**, n
 - [x] Cold Read 1 — revision 1 → addressed in revision 2
 - [x] Cold Read 2 — revision 2 → addressed in revision 3
 - [x] Cold Read 3 — revision 3 → addressed in revision 4
-- [ ] Cold Read 4 — on revision 4
+- [x] Cold Read 4 — revision 4 → addressed in revision 5
+- [ ] Cold Read 5 — on revision 5
 - [ ] Human review
 
 ## Cold Read Findings — 2026-09-27
@@ -665,3 +717,70 @@ Same setup: three parallel subagents, one read of revision 3 each.
   - `Stale` applies overlays and drains; `open` panicking goes to `Failed`.
   - The cleanup hook leaks at process exit, like `one_shot`.
 - **Context:** the glossary adds groups, the baseline, fixtures, and "verify against the real tool". The drift test compares a multiset including columns.
+
+## Cold Read 4 Findings — 2026-09-28
+
+Same setup: three parallel subagents, one read of revision 4 each.
+
+### Risks (blocking)
+
+1. **Cache and Project lifecycle.**
+   - "Both caches are dropped when `generation` changes" reads as dropping the Project `Map`, which would orphan every Project with its watcher still running.
+   - A marker file (`package.json`/`detangle.toml`) created or deleted **inside** a case-3 root re-opens the old Project instead of closing it, and a second Project opens for the same tree.
+   - `rootOf` with no marker gives one Project per directory. A stray `~/package.json` makes `$HOME` the root.
+   - The ancestor-event filter is unspecified, and there's no `Closed` state.
+2. **With no watcher, recovery is impossible.** If the watcher failed to start or died, `Broken`/`Failed` are permanent and config edits are ignored. The "only the linted file stays fresh" row is wrong: new files, other files and config edits are lost too. A `config` file outside the root is never watched.
+3. **Config-named files in build output** (for example `.next/package.json`) aren't in the watcher's ignore list, so dev servers would force cold re-opens on nearly every lint.
+
+### Confirmed in code during aggregation
+
+- A structural update re-reads overlaid files from disk (`stamp = None` fails the reuse check), so other buffers' overlays are dropped before any disk event for them. The linted file is unaffected, because step 3 re-applies its overlay.
+- The parse cache's temp file is named by process id (`{FILE}.{pid}`), so `--concurrency` workers in one process can collide writing it.
+- Refuted: "atomic saves cost a structural re-walk". `Session::update` classifies changes by checking the filesystem, not by event kind. A rename onto an existing member isn't structural. The doc should say so.
+
+### Gaps
+
+- **Race and teardown:** a new file linted before its create event arrives. Exit blocking on watcher setup.
+- **Environment:** case 2's dependence on ESLint's `cwd`. Silent cross-package loss without a root `detangle.toml`.
+- **Problems:** problem severity depends on config order. An unavailable add-on makes every CI file red.
+- **Lost events:** they compare only root config stamps.
+- **Undefined:** `configs.recommended`, `FileReport`/index shapes, "rules defined in the ESLint config", and which edit the import-edit target covers.
+- **Memory:** two Sessions during a `Stale` re-open, and the index, aren't counted.
+- **Measurement and CI:**
+  - The Linux numbers come from a Docker VM, and Windows watcher cost is unmeasured.
+  - Node versions in CI (ESLint 10 needs Node ^20.19 / ^22.13 / ≥24).
+  - Smoke tests on cross targets: a glibc `node` can't load a musl `.node`, and x86_64 macOS runs on an arm64 runner.
+  - The `detangle watch` fix has no CLI test.
+- **Claims:** D11's "second JS implementation" argument is weakened by the oracle. The ~7 MB package size is an estimate.
+
+### Verdict
+
+- Explain-back: NEEDS REVISION. Lifecycle holes only.
+- Implementation: NEEDS REVISION. 12 questions; the core was judged sound.
+- Critique: RISKS FOUND. Nested markers, recovery without a watcher, and atomic saves (refuted).
+- Trend: the core (D3, overlay, placement, watcher at open) held. The holes cluster in automatic root discovery (added in revisions 3–4) and in recovery that depends only on the watcher.
+
+### Resolution (revision 5)
+
+- **Risk 1:** per-file project discovery is dropped (maintainer's decision). `dir` is the `dir` option or ESLint's `cwd`, and there's one Project per `(dir, config, mode)` per thread, fixed for the process. That removes `rootOf`, the ancestor watch, root switching, `generation`, one-Project-per-directory and the leaks. A `$HOME`/`/` root is refused, and a `Closed` state is added.
+- **Risk 2:** every lint polls `config_stamps()` (including a `config` file outside the root). Recovery from `Broken`/`Failed` and config freshness no longer depend on the watcher. Without a watcher, saved changes in other files are seen when those files are linted; the edge-case row is corrected. `Failed` re-opens only on a config change or a change to a member path.
+- **Risk 3:** config-named watcher events count only in member directories, so `.next/package.json` is ignored.
+- **Confirmed code issues:**
+  - Structural updates dropping other buffers' overlays is documented in D6 and Out.
+  - The cache temp file gets a per-thread name.
+  - Atomic saves: the glossary states that changes are classified by checking the filesystem.
+- **Gaps:**
+  - New-file race: `Session::admit` in D6 step 2.
+  - Exit: the main env doesn't join threads.
+  - `cwd` per workspace folder is stated.
+  - Problem severity follows rule order; `recommended` lists `errors` first.
+  - CI failure when the add-on is unavailable is intended.
+  - Lost events re-open.
+  - Defined: `configs.recommended`, `FileReport` and the index, the Out wording, and the two import-edit targets (unsaved ≤ 30 ms, saved elsewhere ≤ 65 ms).
+  - Memory during a re-open (~2.4× briefly).
+  - CI logs watcher setup per OS, and Linux is re-measured natively.
+  - Node 22 in CI (ESLint 10 needs ^20.19/^22.13/≥24).
+  - Musl smoke test in Alpine; x86_64 macOS not smoke-tested.
+  - A `watch.rs` unit test for the lost-events fix.
+  - D11's argument rewritten (production copy vs test oracle).
+  - Package size labeled as an estimate.
