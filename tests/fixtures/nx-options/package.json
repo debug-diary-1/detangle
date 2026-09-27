@@ -1,0 +1,1 @@
+{ "name": "@org/source", "private": true, "workspaces": ["libs/pkg", "libs/plain"], "dependencies": { "lodash": "4", "chalk": "4" } }

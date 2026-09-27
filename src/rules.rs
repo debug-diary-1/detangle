@@ -25,6 +25,8 @@ pub struct Violation {
     pub to: Option<usize>,
     /// For circular violations: the cycle, as module indices.
     pub cycle: Vec<usize>,
+    /// Group scope: the module-graph imports behind the dependency.
+    pub imports: Vec<usize>,
 }
 
 impl Violation {
@@ -192,6 +194,13 @@ fn types(list: &Option<Vec<String>>, rule: &str) -> Result<Option<Vec<&'static s
         .transpose()
 }
 
+/// A matching dependency: its cycle witness (circular rules) and, at group
+/// scope, the module imports that satisfy the rule.
+struct Match {
+    cycle: Vec<usize>,
+    imports: Vec<usize>,
+}
+
 /// A compiled `from` + `to` pair.
 struct Compiled<'r> {
     from: &'r FromSpec,
@@ -205,6 +214,12 @@ struct Compiled<'r> {
     types_not: Option<Vec<&'static str>>,
     license: Option<Regex>,
     license_not: Option<Regex>,
+    specifier: Option<Regex>,
+    specifier_not: Option<Regex>,
+    /// `reaches_tags`: modules that are, or depend on, a tagged module.
+    reaching: std::cell::OnceCell<HashSet<usize>>,
+    /// `lazy_loaded`: modules reachable from each source through dynamic imports.
+    lazy: std::cell::RefCell<HashMap<usize, HashSet<usize>>>,
 }
 
 fn compile<'r>(name: &str, from: &'r FromSpec, to: &'r ToSpec) -> Result<Compiled<'r>> {
@@ -227,6 +242,10 @@ fn compile<'r>(name: &str, from: &'r FromSpec, to: &'r ToSpec) -> Result<Compile
         types_not: types(&to.dependency_types_not, name)?,
         license: to.license.as_ref().map(|p| regex(p, name)).transpose()?,
         license_not: to.license_not.as_ref().map(|p| regex(p, name)).transpose()?,
+        specifier: to.specifier.as_ref().map(|p| regex(p, name)).transpose()?,
+        specifier_not: to.specifier_not.as_ref().map(|p| regex(p, name)).transpose()?,
+        reaching: Default::default(),
+        lazy: Default::default(),
     })
 }
 
@@ -272,6 +291,8 @@ struct PkgMeta {
 
 struct Ctx<'g> {
     g: &'g Graph,
+    /// Group scope: the module graph, for conditions on individual imports.
+    parent: Option<Box<Ctx<'g>>>,
     /// npm packages also answer to `node_modules/<pkg>/`, so path rules
     /// written against installed files keep working.
     alt: Vec<Option<String>>,
@@ -286,7 +307,12 @@ impl<'g> Ctx<'g> {
             .iter()
             .map(|m| (m.kind == ModuleKind::Npm).then(|| format!("node_modules/{}/", m.id)))
             .collect();
-        Ctx { g, alt, cache: HashMap::default(), meta: HashMap::default() }
+        Ctx { g, parent: None, alt, cache: HashMap::default(), meta: HashMap::default() }
+    }
+
+    /// A context for the group graph of `g`.
+    fn groups(g: &'g Graph) -> Self {
+        Ctx { parent: Some(Box::new(Ctx::new(g))), ..Ctx::new(g.groups()) }
     }
 
     /// The names module `m` can be matched by.
@@ -366,8 +392,36 @@ impl Compiled<'_> {
         self.source.matches(&cx.names(m))
     }
 
+    /// Conditions on a single import: its specifier and dependency types.
+    fn import_ok(&self, cx: &mut Ctx, e: &Edge) -> bool {
+        self.types.as_ref().is_none_or(|l| l.iter().any(|x| cx.edge_has_type(e, x)))
+            && !self.types_not.as_ref().is_some_and(|l| l.iter().any(|x| cx.edge_has_type(e, x)))
+            && self.specifier.as_ref().is_none_or(|r| matches(r, &e.specifier))
+            && !self.specifier_not.as_ref().is_some_and(|r| matches(r, &e.specifier))
+    }
+
+    /// Modules reachable from `from` through dynamic imports only.
+    fn lazily_reached(&self, cx: &Ctx, from: usize) -> HashSet<usize> {
+        let g = cx.g;
+        let dynamic = |i: usize| match &cx.parent {
+            // A group dependency is lazy if any import behind it is.
+            Some(p) => g.members[i].iter().any(|&m| p.g.edges[m].flags.dynamic),
+            None => g.edges[i].flags.dynamic,
+        };
+        let mut seen = HashSet::new();
+        let mut q = std::collections::VecDeque::from([from]);
+        while let Some(m) = q.pop_front() {
+            for &i in &g.out[m] {
+                if dynamic(i) && seen.insert(g.edges[i].to) {
+                    q.push_back(g.edges[i].to);
+                }
+            }
+        }
+        seen
+    }
+
     /// Whether edge `i` matches; returns the cycle witness for circular edges.
-    fn edge_matches(&self, cx: &mut Ctx, i: usize, caps: &[String]) -> Option<Vec<usize>> {
+    fn edge_matches(&self, cx: &mut Ctx, i: usize, caps: &[String]) -> Option<Match> {
         let g = cx.g;
         let e = &g.edges[i];
         let to = &g.modules[e.to];
@@ -382,26 +436,50 @@ impl Compiled<'_> {
         if !ok {
             return None;
         }
-        if let Some(list) = &self.types
-            && !list.iter().any(|x| cx.edge_has_type(e, x))
-        {
+        // At group scope, import conditions apply to the imports behind the
+        // dependency: at least one must satisfy them.
+        let imports = if let Some(p) = cx.parent.as_deref_mut() {
+            let ok: Vec<usize> = g.members[i].iter().copied().filter(|&m| self.import_ok(p, &p.g.edges[m])).collect();
+            if ok.is_empty() {
+                return None;
+            }
+            ok
+        } else if self.import_ok(cx, e) {
+            vec![]
+        } else {
             return None;
-        }
-        if let Some(list) = &self.types_not
-            && list.iter().any(|x| cx.edge_has_type(e, x))
-        {
-            return None;
-        }
+        };
         if !tags_ok(&to.tags, &t.tags, &t.tags_not, None) {
             return None;
         }
+        if let Some(tags) = &t.reaches_tags {
+            let reaching = self.reaching.get_or_init(|| {
+                let tagged: Vec<usize> =
+                    (0..g.modules.len()).filter(|&m| crate::groups::has_any(tags, &g.modules[m].tags)).collect();
+                g.closure(&tagged, false)
+            });
+            if !reaching.contains(&e.to) {
+                return None;
+            }
+        }
+        if let Some(want) = t.lazy_loaded {
+            if !self.lazy.borrow().contains_key(&e.from) {
+                let reached = self.lazily_reached(cx, e.from);
+                self.lazy.borrow_mut().insert(e.from, reached);
+            }
+            if self.lazy.borrow()[&e.from].contains(&e.to) != want {
+                return None;
+            }
+        }
         if let Some(want) = t.cross_group {
             let cross = match (g.group_of.get(e.from).copied().flatten(), g.group_of.get(e.to).copied().flatten()) {
-                (Some(a), Some(b)) => a != b,
+                (Some(a), Some(b)) => Some(a != b),
                 // On the group graph every edge joins two different groups.
-                _ => g.group_of.is_empty(),
+                _ if g.group_of.is_empty() => Some(true),
+                // A module outside any group is neither.
+                _ => None,
             };
-            if cross != want {
+            if cross != Some(want) {
                 return None;
             }
         }
@@ -419,8 +497,9 @@ impl Compiled<'_> {
                 return None;
             }
         }
+        let found = |cycle| Some(Match { cycle, imports: imports.clone() });
         if !e.circular {
-            return Some(vec![]);
+            return found(vec![]);
         }
         // Circular: find a witness cycle, honouring `via` / `via_only`. Unlike
         // checking one arbitrary cycle, these consider *every* cycle through
@@ -432,7 +511,7 @@ impl Compiled<'_> {
                 return None;
             }
             let back = g.path_where(e.to, e.from, |x| x.circular, |m| ok.contains(&m))?;
-            return Some(std::iter::once(e.from).chain(back).collect());
+            return found(std::iter::once(e.from).chain(back).collect());
         }
         if let Some(spec) = &self.via {
             // A *simple* cycle from → to ⇝ hit ⇝ from through a matching
@@ -452,7 +531,7 @@ impl Compiled<'_> {
                 };
                 let used: HashSet<usize> = a.iter().copied().filter(|&m| m != hit).collect();
                 let Some(b) = g.path_where(hit, e.from, |x| x.circular, |m| !used.contains(&m)) else { continue };
-                return Some(std::iter::once(e.from).chain(a).chain(b.into_iter().skip(1)).collect());
+                return found(std::iter::once(e.from).chain(a).chain(b.into_iter().skip(1)).collect());
             }
             return None;
         }
@@ -461,13 +540,13 @@ impl Compiled<'_> {
         if t.max_cycle_length.is_some_and(|max| cycle.len() - 1 > max) {
             return None;
         }
-        Some(cycle)
+        found(cycle)
     }
 }
 
 /// Calls `f(edge, cycle)` for every edge matching `c`. `from` is matched once
 /// per module, then its outgoing edges are tested.
-fn for_each_edge(cx: &mut Ctx, c: &Compiled, mut f: impl FnMut(usize, Vec<usize>)) {
+fn for_each_edge(cx: &mut Ctx, c: &Compiled, mut f: impl FnMut(usize, Match)) {
     let g = cx.g;
     for m in 0..g.modules.len() {
         if g.out[m].is_empty() {
@@ -475,8 +554,8 @@ fn for_each_edge(cx: &mut Ctx, c: &Compiled, mut f: impl FnMut(usize, Vec<usize>
         }
         let Some(caps) = c.source_ok(cx, m) else { continue };
         for &i in &g.out[m] {
-            if let Some(cycle) = c.edge_matches(cx, i, &caps) {
-                f(i, cycle);
+            if let Some(found) = c.edge_matches(cx, i, &caps) {
+                f(i, found);
             }
         }
     }
@@ -486,7 +565,7 @@ fn for_each_edge(cx: &mut Ctx, c: &Compiled, mut f: impl FnMut(usize, Vec<usize>
 fn eval_forbidden(cx: &mut Ctx, rule: &Rule, out: &mut Vec<Violation>) -> Result<()> {
     let g = cx.g;
     let n = g.modules.len();
-    let violation = |from, to, cycle| Violation {
+    let violation = |from, to, cycle, imports| Violation {
         rule: rule.name.clone(),
         severity: rule.severity,
         comment: rule.comment.clone(),
@@ -494,6 +573,7 @@ fn eval_forbidden(cx: &mut Ctx, rule: &Rule, out: &mut Vec<Violation>) -> Result
         from,
         to,
         cycle,
+        imports,
     };
     if let Some(spec) = &rule.module {
         let c = compile_module(&rule.name, spec)?;
@@ -510,7 +590,7 @@ fn eval_forbidden(cx: &mut Ctx, rule: &Rule, out: &mut Vec<Violation>) -> Result
                 continue;
             }
             if c.source.matches(&cx.names(m)).is_some() {
-                out.push(violation(m, None, vec![]));
+                out.push(violation(m, None, vec![], vec![]));
             }
         }
         return Ok(());
@@ -519,7 +599,7 @@ fn eval_forbidden(cx: &mut Ctx, rule: &Rule, out: &mut Vec<Violation>) -> Result
     if c.from_orphan == Some(true) {
         for m in 0..n {
             if g.is_orphan(m) && c.source_ok(cx, m).is_some() {
-                out.push(violation(m, None, vec![]));
+                out.push(violation(m, None, vec![], vec![]));
             }
         }
     } else if let Some(reachable) = rule.to.reachable {
@@ -537,13 +617,13 @@ fn eval_forbidden(cx: &mut Ctx, rule: &Rule, out: &mut Vec<Violation>) -> Result
                 continue;
             }
             if reach.contains(&m) == reachable && cx.target_matches(&c.target, m, &[]) {
-                out.push(violation(m, None, vec![]));
+                out.push(violation(m, None, vec![], vec![]));
             }
         }
     } else {
-        for_each_edge(cx, &c, |i, cycle| {
+        for_each_edge(cx, &c, |i, m| {
             let e = &g.edges[i];
-            out.push(violation(e.from, Some(e.to), cycle));
+            out.push(violation(e.from, Some(e.to), m.cycle, m.imports));
         });
     }
     Ok(())
@@ -563,7 +643,7 @@ pub fn evaluate(g: &Graph, cfg: &Config) -> Result<Vec<Violation>> {
                 eval_forbidden(fcx, rule, &mut out)?;
             }
             Scope::Group => {
-                let gcx = group_cx.get_or_insert_with(|| Ctx::new(g.groups()));
+                let gcx = group_cx.get_or_insert_with(|| Ctx::groups(g));
                 eval_forbidden(gcx, rule, &mut out)?;
             }
         }
@@ -587,6 +667,7 @@ pub fn evaluate(g: &Graph, cfg: &Config) -> Result<Vec<Violation>> {
                     from: e.from,
                     to: Some(e.to),
                     cycle: if e.circular { g.cycle_path(i) } else { vec![] },
+                    imports: vec![],
                 });
             }
         }
@@ -611,6 +692,7 @@ pub fn evaluate(g: &Graph, cfg: &Config) -> Result<Vec<Violation>> {
                     from: m,
                     to: None,
                     cycle: vec![],
+                    imports: vec![],
                 });
             }
         }

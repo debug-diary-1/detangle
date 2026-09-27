@@ -190,7 +190,24 @@ from = { tags = ["feature"] }
 to = { tags_not = ["feature", "ui"] }
 ```
 
-With `options.nx_projects = true`, every Nx project (`project.json`, or a `package.json` with an `nx` section) is a group, rediscovered on each run with its `tags`. Each project also gets the tag `projectType:<type>`, and nested projects take precedence over their parents. Tag conditions (`tags`, `tags_not`, and `tags_all` on `from`) accept Nx patterns: exact tags, `*` globs and `/regex/`. On the module scope, `to.cross_group = true` matches dependencies between different groups, and the `relative` dependency type matches imports written as a relative or absolute path.
+With `options.nx_projects = true`, every Nx project is a group, rediscovered on each run with its `tags`. Projects are found the way Nx finds them without plugins: every `project.json`, and every `package.json` in the package manager's workspaces (`workspaces`, `pnpm-workspace.yaml`, `lerna.json`). Those also get Nx's `npm:public`/`npm:private` and keyword tags. Each project also gets `projectType:application` or `projectType:library` (inferred as Nx does when unset) and `target:<name>` for each of its targets. Nested projects take precedence over their parents. Tag conditions (`tags`, `tags_not`, `reaches_tags`, and `tags_all` on `from`) accept Nx patterns: exact tags, `*` globs and `/regex/`. On the module scope, `to.cross_group = true` / `false` matches dependencies between different groups / within one group. The `relative` dependency type matches imports written as a relative or absolute path.
+
+A group dependency stands for the imports behind it. At group scope, `specifier`, `specifier_not`, `dependency_types` and `dependency_types_not` are checked against those imports: the rule matches when at least one import satisfies them. Violations list those imports, so `tangle check` shows the files to fix, and GitHub annotations land on them.
+
+```toml
+# no feature may pull in the server layer, even indirectly
+[[forbidden]]
+name = "features-stay-client-side"
+scope = "group"
+from = { tags = ["type:feature"] }
+to = { reaches_tags = ["type:server"] }
+
+# a lib loaded with import() somewhere must not also be imported statically
+[[forbidden]]
+name = "keep-lazy-libs-lazy"
+scope = "group"
+to = { lazy_loaded = true, dependency_types_not = ["dynamic", "type-only"] }
+```
 
 ### Folder scope
 
@@ -223,7 +240,7 @@ At folder scope, a module edge `a → b` makes every folder containing `a` but n
 | | conditions |
 |---|---|
 | `from` | `path`, `path_not`, `orphan`, `tags`, `tags_not`, `tags_all` |
-| `to` | `path`, `path_not`, `circular`, `via`, `via_only`, `max_cycle_length`, `tags`, `tags_not`, `cross_group`, `dependency_types`, `dependency_types_not`, `could_not_resolve`, `type_only`, `dynamic`, `reachable`, `more_unstable`, `more_than_one_dependency_type`, `license`, `license_not` |
+| `to` | `path`, `path_not`, `specifier`, `specifier_not`, `circular`, `via`, `via_only`, `max_cycle_length`, `tags`, `tags_not`, `reaches_tags`, `cross_group`, `lazy_loaded`, `dependency_types`, `dependency_types_not`, `could_not_resolve`, `type_only`, `dynamic`, `reachable`, `more_unstable`, `more_than_one_dependency_type`, `license`, `license_not` |
 | `module` | `path`, `path_not`, `number_of_dependents_less_than`, `number_of_dependents_more_than` (with `from` restricting which dependents count) |
 
 Dependency types: `local`, `npm`, `npm-dev`, `npm-peer`, `npm-optional`, `npm-undeclared`, `core`, `unresolvable`, `type-only`, `dynamic`, `require`, `reexport`, `resource`, `import`, `aliased` (a tsconfig-paths, `#imports` or workspace import of a local file), `deprecated` (the installed package is marked deprecated). A package declared in several `package.json` sections has all of the matching types, for example `npm` and `npm-dev`. npm packages can also be matched as `node_modules/<name>/`.
@@ -260,7 +277,7 @@ tangle check               # same checks as before, much faster
 |---|---|
 | **JavaScript rules configs** (`.js`, `.cjs`, `.mjs` or `.json` files declaring `forbidden`, `allowed` or `required` rules). These are recognised by content, not file name. | Every rule, `extends` presets, options, and the known-violations file they point at |
 | **ESLint** (`eslint.config.*`, `.eslintrc.{js,cjs,json,yaml,yml}`, `package.json` `eslintConfig`) | `import/no-cycle` (with `maxDepth`), `import/no-restricted-paths` (zones, `except`, `basePath`, messages) and `import/no-extraneous-dependencies` (dev/optional/peer globs), also under `import-x`. `files`, `ignores` and `overrides` scoping carry over (an `"off"` for test files becomes a `path_not`), and so do the `import/resolver` webpack and TypeScript settings. Legacy `extends` chains are followed: relative files, shareable `eslint-config-*` packages and `plugin:…` configs. As in ESLint, a later severity-only setting keeps the rule's earlier options. |
-| **Nx** (`@nx/enforce-module-boundaries` in an ESLint config) | Project discovery (`nx_projects`), every depConstraint (`sourceTag` or `allSourceTags`, `onlyDependOnLibsWithTags`, `notDependOnLibsWithTags`, `bannedExternalImports`, `allowedExternalImports`), and Nx's built-in checks: project cycles, importing applications, relative imports across projects, and "a project without tags matching a constraint can't depend on libraries" |
+| **Nx** (`@nx/enforce-module-boundaries` in an ESLint config) | Project discovery (`nx_projects`) and every depConstraint: `sourceTag` or `allSourceTags`, `onlyDependOnLibsWithTags` (including `[]`), `notDependOnLibsWithTags` (transitively, as Nx checks it), and `bannedExternalImports` / `allowedExternalImports` (matched against the import as Nx does). Options: `allow`, `enforceBuildableLibDependency` with `buildTargets`, `banTransitiveDependencies`, `allowCircularSelfDependency` and `checkDynamicDependenciesExceptions`. Nx's built-in checks: project cycles, imports of apps and e2e projects, relative imports across projects or outside every project, self-imports through the project's own alias, static imports of lazy-loaded libraries, and "a project without tags matching a constraint can't depend on libraries". Like Nx, `require()` calls aren't checked. |
 | **eslint-plugin-boundaries** (`boundaries/dependencies` or `boundaries/element-types`) | `boundaries/elements` become `[[groups]]` (folder, file and full modes, `basePattern`). Policies, in both the v6+ `{ to: { element: { type } } }` format and the legacy format, including `types.anyOf` and `!type`, are replayed with the plugin's last-match-wins semantics. Capture conditions are skipped with a warning. |
 | **madge** (`.madgerc`, `package.json` `madge`, or `madge --circular` in a script) | A circular-dependency rule, `excludeRegExp`, `tsConfig`, `webpackConfig`, `skipTypeImports` |
 | **Known-violation files** (JSON arrays of `{ from, to, rule: { name } }`) | `.tangle-baseline.json`, applied automatically through `options.baseline` |
@@ -276,6 +293,7 @@ You can also run a JavaScript rules config directly without converting it: `tang
 - **ESLint 9 + eslint-plugin-import 2.32**, on a project using all three rules with zones, `except`, file-scoped overrides and dev-dependency globs: tangle's migrated config reports **exactly the same 7 violations**, rule for rule, file for file, import for import.
 - **ESLint 9 legacy configs with `extends`**: a zone from a relative config, `no-cycle` with `maxDepth: 1` from a shareable config (kept when the root sets `"warn"`), and a directory the shared config turned off but the root re-enabled. Tangle reports **exactly the same 7 findings**. `maxDepth` 1, 2 and 3 on a project with cycles of 2, 3 and 4 modules match the plugin exactly.
 - **Nx 21** (`@nx/enforce-module-boundaries`), on a workspace with scope and type tags, an application, an untagged lib, a banned external, a relative cross-project import and project cycles: tangle flags **exactly the same 10 imports**. Adding a new tagged project afterwards is enforced without migrating again, because projects are rediscovered on every run.
+- **Nx 21 options**, on a second workspace with `allow`, buildable libraries (executor and command targets), `banTransitiveDependencies` (a package declared only by another project, one not installed), a transitive `notDependOnLibsWithTags`, an empty `onlyDependOnLibsWithTags`, a `workspaces` package without an `nx` section, a project typed only by its `tsconfig.app.json`, an e2e project, a self-import through the project's alias, a relative import outside every project, a lazy-loaded library also imported statically, and `require()` and `import()` calls: **exactly the same 13 imports**. (Nx 21's `checkNestedExternalImports` compares the imported project's name with the nested package's name, so it never reports anything; tangle converts it to nothing.)
 - **eslint-plugin-boundaries 7.2**, using both the legacy `rules` and v6+ `policies` formats, with a later `disallow` overriding an `allow` and a negated `!app` selector: **exactly the same 4 violations**.
 - **madge 8 on excalidraw** (873 modules): madge's own dependency graph puts 168 files on cycles. `madge --circular` lists 128 of them; tangle reports all 168, with no extras, in 0.03 s against madge's 2.5 s.
 - **A JavaScript rules config with known violations:** all 14 known violations were carried into the baseline. The only findings left were genuine cycle dependencies the original setup never reported, each shown with its cycle.

@@ -1,0 +1,1 @@
+{ "name": "bridge", "projectType": "library", "sourceRoot": "libs/bridge/src", "tags": ["scope:a", "type:util"] , "targets": { "build": { "executor": "@nx/js:tsc" } } }

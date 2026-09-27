@@ -1,0 +1,1 @@
+{ "name": "app-e2e", "projectType": "application", "sourceRoot": "apps/app-e2e/src", "tags": ["scope:a"]  }

@@ -532,9 +532,23 @@ pub struct ToSpec {
     pub tags: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tags_not: Option<Vec<String>>,
-    /// Module scope: source and target are in different group instances.
+    /// Module scope: source and target are both in groups, and in different
+    /// (`true`) or the same (`false`) group instance.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cross_group: Option<bool>,
+    /// Regex on the import specifier as written (`@org/lib`, `../x`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub specifier: Option<Pat>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub specifier_not: Option<Pat>,
+    /// The target, or anything it depends on directly or indirectly, has
+    /// one of these tags.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reaches_tags: Option<Vec<String>>,
+    /// The source also loads the target lazily: a chain of dynamic imports
+    /// leads from the source to it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lazy_loaded: Option<bool>,
 }
 
 impl ToSpec {

@@ -88,6 +88,8 @@ pub struct Graph {
     groups: Option<Box<Graph>>,
     /// Group graphs only: each node's root path.
     pub group_roots: Vec<String>,
+    /// Group graphs only: the module-graph edges behind each edge.
+    pub members: Vec<Vec<usize>>,
 }
 
 impl Graph {
@@ -109,6 +111,7 @@ impl Graph {
             group_of: vec![],
             groups: None,
             group_roots: vec![],
+            members: vec![],
         };
         for f in files {
             let id = g.rel(&f.path);
@@ -214,6 +217,7 @@ impl Graph {
             group_of: vec![],
             groups: None,
             group_roots: vec![],
+            members: vec![],
         };
         self.group_of = vec![None; self.modules.len()];
         if !defs.is_empty() {
@@ -238,13 +242,14 @@ impl Graph {
                 self.group_of[m] = Some(i);
             }
             let mut seen: HashMap<(usize, usize), usize> = HashMap::default();
-            for e in &self.edges {
+            for (mi, e) in self.edges.iter().enumerate() {
                 let (Some(a), Some(b)) = (self.group_of[e.from], self.group_of[e.to]) else { continue };
                 if a == b {
                     continue;
                 }
                 match seen.get(&(a, b)) {
                     Some(&i) => {
+                        g.members[i].push(mi);
                         let ge = &mut g.edges[i];
                         ge.flags = ge.flags.merge(e.flags);
                         for t in &e.types {
@@ -255,6 +260,7 @@ impl Graph {
                     }
                     None => {
                         seen.insert((a, b), g.edges.len());
+                        g.members.push(vec![mi]);
                         g.edges.push(Edge { from: a, to: b, circular: false, ..e.clone() });
                     }
                 }
@@ -289,6 +295,7 @@ impl Graph {
                 group_of: vec![],
                 groups: None,
                 group_roots: vec![],
+                members: vec![],
             }),
         }
     }
@@ -330,6 +337,7 @@ impl Graph {
                 group_of: vec![],
                 groups: None,
                 group_roots: vec![],
+                members: vec![],
             };
             for (m, module) in self.modules.iter().enumerate() {
                 if module.kind != ModuleKind::Local {

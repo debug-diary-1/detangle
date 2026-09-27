@@ -333,15 +333,58 @@ fn strings(v: &Value) -> Vec<String> {
     }
 }
 
+/// Nx `allow` / `checkDynamicDependenciesExceptions` entries, as a regex on
+/// the specifier (`matchImportWithWildcard`).
+fn nx_allow(a: &str) -> String {
+    let esc = |s: &str| fancy_regex::escape(s).into_owned();
+    if let Some(p) = a.strip_suffix("/**") {
+        format!("^{}/", esc(p))
+    } else if let Some(p) = a.strip_suffix("/*") {
+        format!("^{}/[^/]*$", esc(p))
+    } else if let Some((pre, suf)) = a.split_once("/**/") {
+        format!("^(?={})(?=.*{}$)", esc(pre), esc(suf))
+    } else {
+        // Anything else is used as an (unanchored) regular expression.
+        a.to_string()
+    }
+}
+
+/// Nx `bannedExternalImports` / `allowedExternalImports` entries, as a regex
+/// on the specifier (`mapGlobToRegExp`: `*` and `.*` are wildcards, the rest
+/// is used as a regex).
+fn nx_external(g: &str) -> String {
+    let wild = regex::Regex::new(r"\.\*|\*+").expect("valid");
+    format!("^(?:{})$", wild.split(g).collect::<Vec<_>>().join(".*"))
+}
+
 /// `@nx/enforce-module-boundaries`: projects come from Nx discovery
-/// (`options.nx_projects`); each dependency constraint becomes group rules.
+/// (`options.nx_projects`). Each check becomes group rules (between projects)
+/// or module rules (about single imports). Like Nx, only `import` / `export
+/// … from` / `import()` are checked, not `require()`, and `allow`ed
+/// specifiers are exempt from everything.
 fn convert_nx(full: &str, sev: Severity, o: &Value, warnings: &mut Vec<String>) -> Vec<Rule> {
+    let list = |key: &str| strings(o.get(key).unwrap_or(&Value::Null));
+    let allow = list("allow");
+    let allow_re = (!allow.is_empty()).then(|| Pat::any(&allow.iter().map(|a| nx_allow(a)).collect::<Vec<_>>()));
+    let in_project = || FromSpec { tags: Some(vec!["projectType:*".into()]), ..Default::default() };
+    let types = |l: &[&str]| Some(l.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+    let finish = |mut r: Rule| {
+        r.to.specifier_not = match (r.to.specifier_not.take(), &allow_re) {
+            (Some(a), Some(b)) => Some(or(Some(a), b.clone())),
+            (a, b) => a.or_else(|| b.clone()),
+        };
+        let not = r.to.dependency_types_not.get_or_insert_with(Vec::new);
+        if !not.iter().any(|t| t == "require") {
+            not.push("require".into());
+        }
+        r
+    };
     let mut out = vec![
         group_rule(full, sev, "Circular dependency between projects.", FromSpec::default(), ToSpec { circular: Some(true), ..Default::default() }),
         group_rule(
             full,
             sev,
-            "Imports of apps are forbidden.",
+            "Imports of apps and e2e projects are forbidden.",
             FromSpec::default(),
             ToSpec { tags: Some(vec!["projectType:application".into()]), ..Default::default() },
         ),
@@ -350,21 +393,77 @@ fn convert_nx(full: &str, sev: Severity, o: &Value, warnings: &mut Vec<String>) 
             sev,
             "Projects cannot be imported by a relative or absolute path, and must begin with an npm scope.",
             FromSpec::default(),
-            ToSpec { dependency_types: Some(vec!["relative".into()]), cross_group: Some(true), ..Default::default() },
+            ToSpec { dependency_types: types(&["relative"]), cross_group: Some(true), ..Default::default() },
+        ),
+        rule(
+            full,
+            sev,
+            "External resources cannot be imported using a relative or absolute path.",
+            in_project(),
+            ToSpec { dependency_types: types(&["relative"]), tags_not: Some(vec!["*".into()]), ..Default::default() },
         ),
     ];
-    for (key, default) in [
-        ("enforceBuildableLibDependency", json!(false)),
-        ("allowCircularSelfDependency", json!(false)),
-        ("banTransitiveDependencies", json!(false)),
-        ("checkNestedExternalImports", json!(false)),
-        ("allow", json!([])),
-        ("ignoredCircularDependencies", json!([])),
-    ] {
-        if let Some(v) = o.get(key).filter(|v| **v != default) {
-            warnings.push(format!("{full}: {key} = {v} isn't converted"));
-        }
+    if o.get("allowCircularSelfDependency") != Some(&json!(true)) {
+        out.push(rule(
+            full,
+            sev,
+            "Projects should use relative imports to import from other files within the same project.",
+            in_project(),
+            ToSpec { dependency_types_not: types(&["relative"]), cross_group: Some(false), ..Default::default() },
+        ));
     }
+    // Static imports of a project the source also loads with import().
+    let exceptions = list("checkDynamicDependenciesExceptions");
+    out.push(group_rule(
+        full,
+        sev,
+        "Static imports of lazy-loaded libraries are forbidden.",
+        FromSpec::default(),
+        ToSpec {
+            lazy_loaded: Some(true),
+            dependency_types_not: types(&["dynamic", "reexport", "type-only", "resource"]),
+            specifier_not: (!exceptions.is_empty()).then(|| Pat::any(&exceptions.iter().map(|a| nx_allow(a)).collect::<Vec<_>>())),
+            ..Default::default()
+        },
+    ));
+    if o.get("banTransitiveDependencies") == Some(&json!(true)) {
+        let msg = "Only packages defined in the \"package.json\" can be imported. Transitive or unresolvable dependencies are not allowed.";
+        out.push(rule(full, sev, msg, in_project(), ToSpec { dependency_types: types(&["npm-undeclared"]), ..Default::default() }));
+        out.push(rule(
+            full,
+            sev,
+            msg,
+            in_project(),
+            ToSpec { could_not_resolve: Some(true), dependency_types_not: types(&["relative"]), ..Default::default() },
+        ));
+        // A bare import of a local file outside every project.
+        out.push(rule(
+            full,
+            sev,
+            msg,
+            in_project(),
+            ToSpec { dependency_types: types(&["aliased"]), tags_not: Some(vec!["*".into()]), ..Default::default() },
+        ));
+    }
+    if o.get("enforceBuildableLibDependency") == Some(&json!(true)) {
+        let build = match o.get("buildTargets") {
+            Some(t) => strings(t),
+            None => vec!["build".into()],
+        };
+        let targets: Vec<String> = build.iter().map(|t| format!("target:{t}")).collect();
+        out.push(group_rule(
+            full,
+            sev,
+            "Buildable libraries cannot import or export from non-buildable libraries.",
+            FromSpec { tags_all: Some(vec!["projectType:library".into()]), tags: Some(targets.clone()), ..Default::default() },
+            ToSpec { tags: Some(vec!["projectType:library".into()]), tags_not: Some(targets), ..Default::default() },
+        ));
+    }
+    if o.get("ignoredCircularDependencies").is_some_and(|v| *v != json!([])) {
+        warnings.push(format!("{full}: ignoredCircularDependencies isn't converted"));
+    }
+    // checkNestedExternalImports compares the imported project's specifier
+    // with the nested package's name, so it never reports anything (Nx 21).
     let constraints = o.get("depConstraints").and_then(Value::as_array).cloned().unwrap_or_default();
     let mut source_tags: Vec<String> = vec![];
     let mut any_all_source = false;
@@ -379,28 +478,38 @@ fn convert_nx(full: &str, sev: Severity, o: &Value, warnings: &mut Vec<String>) 
             let from = if s == "*" { FromSpec::default() } else { FromSpec { tags: Some(vec![s.clone()]), ..Default::default() } };
             (from, if s == "*" { "any project".to_string() } else { format!("tagged \"{s}\"") })
         };
-        let only = strings(c.get("onlyDependOnLibsWithTags").unwrap_or(&Value::Null));
-        if !only.is_empty() && !only.iter().any(|t| t == "*") {
-            out.push(group_rule(
+        match c.get("onlyDependOnLibsWithTags").map(strings) {
+            Some(only) if only.is_empty() => out.push(group_rule(
+                full,
+                sev,
+                &format!("A project {label} cannot depend on any libs with tags."),
+                from.clone(),
+                // Any tag of its own (not tangle's projectType: / target: facts).
+                ToSpec { tags: Some(vec!["/^(?!projectType:|target:)/".into()]), ..Default::default() },
+            )),
+            Some(only) if !only.iter().any(|t| t == "*") => out.push(group_rule(
                 full,
                 sev,
                 &format!("A project {label} can only depend on libs tagged {}.", only.join(", ")),
                 from.clone(),
                 ToSpec { tags_not: Some(only), ..Default::default() },
-            ));
+            )),
+            _ => {}
         }
         let not = strings(c.get("notDependOnLibsWithTags").unwrap_or(&Value::Null));
         if !not.is_empty() {
+            // Transitively: nothing the target depends on may have them either.
             out.push(group_rule(
                 full,
                 sev,
-                &format!("A project {label} cannot depend on libs tagged {}.", not.join(", ")),
+                &format!("A project {label} cannot depend on libs tagged {}, directly or indirectly.", not.join(", ")),
                 from.clone(),
-                ToSpec { tags: Some(not), ..Default::default() },
+                ToSpec { reaches_tags: Some(not), ..Default::default() },
             ));
         }
-        // External imports: module rules on the project's files (they carry its tags).
-        let pkg_re = |globs: Vec<String>| Pat::any(&globs.iter().map(|g| to_regex(g, Plain::Exact, false, "")).collect::<Vec<_>>());
+        // External imports: module rules on the project's files (they carry
+        // its tags), matched against the specifier as Nx does.
+        let spec_re = |globs: Vec<String>| Pat::any(&globs.iter().map(|g| nx_external(g)).collect::<Vec<_>>());
         let banned = strings(c.get("bannedExternalImports").unwrap_or(&Value::Null));
         if !banned.is_empty() {
             out.push(rule(
@@ -408,11 +517,10 @@ fn convert_nx(full: &str, sev: Severity, o: &Value, warnings: &mut Vec<String>) 
                 sev,
                 &format!("A project {label} cannot import {}.", banned.join(", ")),
                 from.clone(),
-                ToSpec { dependency_types: Some(NPM_TYPES.iter().map(|s| s.to_string()).collect()), path: Some(pkg_re(banned)), ..Default::default() },
+                ToSpec { dependency_types: Some(NPM_TYPES.iter().map(|s| s.to_string()).collect()), specifier: Some(spec_re(banned)), ..Default::default() },
             ));
         }
-        let allowed = strings(c.get("allowedExternalImports").unwrap_or(&Value::Null));
-        if c.get("allowedExternalImports").is_some() {
+        if let Some(allowed) = c.get("allowedExternalImports").map(strings) {
             out.push(rule(
                 full,
                 sev,
@@ -420,13 +528,10 @@ fn convert_nx(full: &str, sev: Severity, o: &Value, warnings: &mut Vec<String>) 
                 from.clone(),
                 ToSpec {
                     dependency_types: Some(NPM_TYPES.iter().map(|s| s.to_string()).collect()),
-                    path_not: (!allowed.is_empty()).then(|| pkg_re(allowed)),
+                    specifier_not: (!allowed.is_empty()).then(|| spec_re(allowed)),
                     ..Default::default()
                 },
             ));
-        }
-        if c.get("onlyTagsDependOnTags").is_some() {
-            warnings.push(format!("{full}: onlyTagsDependOnTags isn't converted"));
         }
     }
     // Nx: a project whose tags match no constraint can't depend on other projects.
@@ -447,7 +552,7 @@ fn convert_nx(full: &str, sev: Severity, o: &Value, warnings: &mut Vec<String>) 
             ToSpec::default(),
         ));
     }
-    out
+    out.into_iter().map(finish).collect()
 }
 
 /// `boundaries/elements` → `[[groups]]` (one group type per element type).

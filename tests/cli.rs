@@ -490,50 +490,28 @@ fn migrated_flagged_imports(fixture: &str) -> std::collections::BTreeSet<(String
     let violations: serde_json::Value = serde_json::from_str(&run(&["check", "-f", "json"])).unwrap();
     let graph: serde_json::Value = serde_json::from_str(&run(&["graph", "-f", "json", "--externals"])).unwrap();
     std::fs::remove_dir_all(&dir).unwrap();
-    let modules = graph["modules"].as_array().unwrap();
-    // Group ids are Nx project names or element folders; map both to folders.
-    let root_of = |id: &str| -> String {
-        modules
-            .iter()
-            .filter_map(|m| m["id"].as_str())
-            .find(|m| m.starts_with(&format!("{id}/")))
-            .map(|_| id.to_string())
-            .unwrap_or_else(|| {
-                // Nx project name → its folder (project.json "name").
-                walk_project_json(&graph, id)
-            })
-    };
     let mut out = std::collections::BTreeSet::new();
     for v in violations.as_array().unwrap() {
+        if v["scope"] == "group" {
+            // Group violations list the imports behind them.
+            for i in v["imports"].as_array().unwrap() {
+                out.insert((i["from"].as_str().unwrap().to_string(), i["specifier"].as_str().unwrap().to_string()));
+            }
+            continue;
+        }
         let (from, to) = (v["from"].as_str().unwrap(), v["to"].as_str());
-        for m in modules {
-            let id = m["id"].as_str().unwrap();
+        for m in graph["modules"].as_array().unwrap() {
+            if m["id"] != from {
+                continue;
+            }
             for d in m["dependencies"].as_array().unwrap() {
-                let target = d["module"].as_str().unwrap();
-                let hit = if v["scope"] == "group" {
-                    id.starts_with(&format!("{}/", root_of(from))) && to.is_none_or(|t| target.starts_with(&format!("{}/", root_of(t))))
-                } else {
-                    id == from && to == Some(target)
-                };
-                if hit {
-                    out.insert((id.to_string(), d["specifier"].as_str().unwrap().to_string()));
+                if to == d["module"].as_str() {
+                    out.insert((from.to_string(), d["specifier"].as_str().unwrap().to_string()));
                 }
             }
         }
     }
     out
-}
-
-/// Nx fixture project names → roots (from the files in the fixture).
-fn walk_project_json(_graph: &serde_json::Value, name: &str) -> String {
-    let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/nx-workspace");
-    for dir in ["apps/shop", "libs/shop/feature", "libs/shop/ui", "libs/shared/util", "libs/shared/data", "libs/admin/feature", "libs/legacy"] {
-        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(base.join(dir).join("project.json")).unwrap()).unwrap();
-        if v["name"] == name {
-            return dir.to_string();
-        }
-    }
-    panic!("unknown project {name}")
 }
 
 #[test]
@@ -610,4 +588,31 @@ fn eslint_extends_match_eslint() {
         ("src/lib/l.js", "../app/a.js"),
     ]);
     assert_eq!(migrated_flagged_imports("eslint-extends"), expected);
+}
+
+#[test]
+fn nx_options_match_nx() {
+    // Exactly the imports real Nx 21 flags with allow, enforceBuildableLibDependency,
+    // banTransitiveDependencies and checkNestedExternalImports on, including the
+    // transitive notDependOnLibsWithTags, an empty onlyDependOnLibsWithTags, a
+    // workspaces package without an `nx` section, projectType inferred from
+    // tsconfig.app.json, a self-import through the project's alias, a relative
+    // import outside every project and a static import of a lazy-loaded lib.
+    // `allow` exempts @org/legacy; require() isn't checked.
+    let expected = pairs(&[
+        ("apps/app/src/static.js", "@org/ui"),
+        ("libs/bridge/src/index.js", "@org/server"),
+        ("libs/bridge/src/index.js", "chalk"),
+        ("libs/empty/src/index.js", "@org/feat"),
+        ("libs/feat/src/index.js", "@org/bridge"),
+        ("libs/feat/src/index.js", "@org/ui"),
+        ("libs/feat/src/index.js", "left-pad"),
+        ("libs/ui/src/index.js", "not-installed-pkg"),
+        ("libs/ui/src/more.js", "@org/app-e2e"),
+        ("libs/ui/src/more.js", "@org/notype"),
+        ("libs/ui/src/more.js", "@org/plain"),
+        ("libs/ui/src/self.js", "@org/ui"),
+        ("libs/util/src/index.js", "../../../tools/helper.js"),
+    ]);
+    assert_eq!(migrated_flagged_imports("nx-options"), expected);
 }

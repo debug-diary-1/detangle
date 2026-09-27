@@ -1,0 +1,1 @@
+{ "name": "feat", "projectType": "library", "sourceRoot": "libs/feat/src", "tags": ["scope:a", "type:feature"] , "targets": { "build": { "executor": "@nx/js:tsc", "options": {} } } }

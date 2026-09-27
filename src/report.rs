@@ -50,6 +50,14 @@ pub fn counts(vs: &[Violation]) -> (usize, usize, usize) {
     (n(Severity::Error), n(Severity::Warn), n(Severity::Info))
 }
 
+/// The module imports behind a group violation: (file, specifier, target).
+fn imports<'g>(g: &'g Graph, v: &Violation) -> impl Iterator<Item = (&'g str, &'g str, &'g str)> {
+    v.imports.iter().map(|&i| {
+        let e = &g.edges[i];
+        (g.modules[e.from].id.as_str(), e.specifier.as_str(), g.modules[e.to].id.as_str())
+    })
+}
+
 pub fn text(g: &Graph, vs: &[Violation], suppressed: usize) -> String {
     let p = Paint::stdout();
     let mut out = String::new();
@@ -70,7 +78,10 @@ pub fn text(g: &Graph, vs: &[Violation], suppressed: usize) -> String {
             p.bold(rule),
             p.dim(&format!("({})", list.len()))
         );
-        if let Some(c) = &first.comment {
+        // One rule name can cover several checks (e.g. converted Nx rules):
+        // then each violation carries its own explanation.
+        let shared = list.iter().all(|v| v.comment == first.comment);
+        if shared && let Some(c) = &first.comment {
             let _ = writeln!(out, "  {}", p.dim(c));
         }
         for v in list {
@@ -86,8 +97,18 @@ pub fn text(g: &Graph, vs: &[Violation], suppressed: usize) -> String {
                     let _ = writeln!(out, "  {from}");
                 }
             }
+            if !shared && let Some(c) = &v.comment {
+                let _ = writeln!(out, "    {}", p.dim(c));
+            }
             if v.cycle.len() > 1 {
                 let _ = writeln!(out, "    {} {}", p.dim("cycle:"), p.dim(&v.cycle_ids(g).join(" → ")));
+            }
+            const SHOWN: usize = 3;
+            for (file, specifier, _) in imports(g, v).take(SHOWN) {
+                let _ = writeln!(out, "    {} {file} {} {specifier}", p.dim("via"), p.dim("imports"));
+            }
+            if v.imports.len() > SHOWN {
+                let _ = writeln!(out, "    {}", p.dim(&format!("… and {} more imports", v.imports.len() - SHOWN)));
             }
         }
         out.push('\n');
@@ -134,6 +155,14 @@ pub fn github(g: &Graph, vs: &[Violation]) -> String {
         if let Some(c) = &v.comment {
             msg = if msg.is_empty() { c.clone() } else { format!("{msg}\n{c}") };
         }
+        // Group violations are annotated on the imports behind them.
+        if !v.imports.is_empty() {
+            for (file, specifier, _) in imports(g, v) {
+                let what = format!("imports {specifier} ({} → {})\n{msg}", v.source_id(g), v.target_id(g).unwrap_or(""));
+                let _ = writeln!(out, "::{level} file={file},title={}::{}", v.rule, esc(&what));
+            }
+            continue;
+        }
         let _ = writeln!(
             out,
             "::{level} file={},title={}::{}",
@@ -156,6 +185,7 @@ pub fn violations_json(g: &Graph, vs: &[Violation]) -> serde_json::Value {
                 "from": v.source_id(g),
                 "to": v.target_id(g),
                 "cycle": v.cycle_ids(g),
+                "imports": imports(g, v).map(|(from, specifier, to)| json!({ "from": from, "specifier": specifier, "to": to })).collect::<Vec<_>>(),
             })
         })
         .collect()
@@ -427,6 +457,9 @@ pub fn html(g: &Graph, vs: &[Violation], config: Option<&std::path::Path>) -> St
             "f": v.source_id(g),
             "t": v.target_id(g),
             "c": v.cycle_ids(g),
+            "i": imports(g, v).map(|(from, specifier, _)| [from, specifier]).collect::<Vec<_>>(),
+            // Its own explanation, when the rule's other violations differ.
+            "m": v.comment.as_ref().filter(|c| comments.get(&v.rule).and_then(|r| r.as_str()) != Some(c.as_str())),
         })).collect::<Vec<_>>(),
         "rc": comments,
     });

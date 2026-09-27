@@ -1,0 +1,20 @@
+{
+  "root": true,
+  "rules": {
+    "@nx/enforce-module-boundaries": [
+      "error",
+      {
+        "allow": ["@org/legacy"],
+        "enforceBuildableLibDependency": true,
+        "banTransitiveDependencies": true,
+        "checkNestedExternalImports": true,
+        "depConstraints": [
+          { "sourceTag": "type:feature", "notDependOnLibsWithTags": ["type:server"], "bannedExternalImports": ["chalk"] },
+          { "sourceTag": "type:empty", "onlyDependOnLibsWithTags": [] },
+          { "sourceTag": "type:util", "bannedExternalImports": ["chalk"] },
+          { "sourceTag": "scope:a", "onlyDependOnLibsWithTags": ["scope:a"] }
+        ]
+      }
+    ]
+  }
+}

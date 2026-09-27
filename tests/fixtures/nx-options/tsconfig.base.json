@@ -1,0 +1,44 @@
+{
+  "compilerOptions": {
+    "baseUrl": ".",
+    "allowJs": true,
+    "paths": {
+      "@org/app-e2e": [
+        "apps/app-e2e/src/index.js"
+      ],
+      "@org/notype": [
+        "libs/notype/src/index.js"
+      ],
+      "@org/plain": [
+        "libs/plain/src/index.js"
+      ],
+      "@org/app": [
+        "apps/app/src/index.js"
+      ],
+      "@org/feat": [
+        "libs/feat/src/index.js"
+      ],
+      "@org/ui": [
+        "libs/ui/src/index.js"
+      ],
+      "@org/util": [
+        "libs/util/src/index.js"
+      ],
+      "@org/server": [
+        "libs/server/src/index.js"
+      ],
+      "@org/bridge": [
+        "libs/bridge/src/index.js"
+      ],
+      "@org/empty": [
+        "libs/empty/src/index.js"
+      ],
+      "@org/legacy": [
+        "libs/legacy/src/index.js"
+      ],
+      "@org/pkg": [
+        "libs/pkg/src/index.js"
+      ]
+    }
+  }
+}
