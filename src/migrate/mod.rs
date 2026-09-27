@@ -167,7 +167,7 @@ pub fn migrate(root: &Path, sources: &[Source]) -> Result<Migration> {
         let label = s.label(root);
         let imported = match &s.kind {
             Kind::RulesConfig => import(&s.path),
-            Kind::Eslint => eslint::check_supported(&s.path).and_then(|_| eslint::import(&s.path, root)),
+            Kind::Eslint => eslint::import(&s.path, root),
             Kind::MadgeRc => madge::from_rc(&s.path).map(|o| o.expect("discovered with a madge key")),
             Kind::MadgeScript { command, .. } => Ok(madge::from_script(command).expect("discovered as a madge script")),
             Kind::KnownViolations => continue,

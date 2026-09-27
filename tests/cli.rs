@@ -420,6 +420,8 @@ fn migrate_dry_run_merges_every_source() {
     // ESLint: the test-file override turned into path_not; the zone kept its message.
     assert_eq!(cfg["forbidden"][2]["from"]["path_not"].as_str(), Some(r"^(?:.*/)?[^/]*\.test\.ts$"));
     assert_eq!(cfg["forbidden"][3]["comment"].as_str(), Some("lib must not depend on app"));
+    // maxDepth 3: cycles of up to 4 modules.
+    assert_eq!(cfg["forbidden"][2]["to"]["max_cycle_length"].as_integer(), Some(4));
     let options = &cfg["options"];
     assert_eq!(options["exclude_path"].as_str(), Some(r"\.stories\.ts$")); // madge
     assert!(options["exclude"].as_array().unwrap().iter().any(|g| g.as_str() == Some("generated/**"))); // ESLint ignorePatterns
@@ -427,7 +429,6 @@ fn migrate_dry_run_merges_every_source() {
 
     for expected in [
         "known.json  1 known violations",
-        "maxDepth 3 isn't supported",
         "\"deps\": \"some-dep-checker --config .deps-rules.json src\"",
         "\"cycles\": \"madge --circular --extensions ts src\"",
         "\"cycles\": \"tangle check\"",
@@ -569,4 +570,44 @@ fn element_boundaries_match_eslint_plugin_boundaries() {
     .map(|(a, b)| (a.to_string(), b.to_string()))
     .collect();
     assert_eq!(migrated_flagged_imports("boundaries"), expected);
+}
+
+/// (file, specifier) pairs from a list of `("file", "specifier")`.
+fn pairs(list: &[(&str, &str)]) -> std::collections::BTreeSet<(String, String)> {
+    list.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect()
+}
+
+#[test]
+fn no_cycle_max_depth_matches_eslint_plugin_import() {
+    // Exactly the imports eslint-plugin-import 2.32 no-cycle flags with maxDepth 2:
+    // cycles of up to 3 modules (a↔b, c→d→e, j↔k, j→l→m), not f→g→h→i.
+    let expected = pairs(&[
+        ("src/a.js", "./b.js"),
+        ("src/b.js", "./a.js"),
+        ("src/c.js", "./d.js"),
+        ("src/d.js", "./e.js"),
+        ("src/e.js", "./c.js"),
+        ("src/j.js", "./k.js"),
+        ("src/j.js", "./l.js"),
+        ("src/k.js", "./j.js"),
+        ("src/l.js", "./m.js"),
+        ("src/m.js", "./j.js"),
+    ]);
+    assert_eq!(migrated_flagged_imports("cycle-depth"), expected);
+}
+
+#[test]
+fn eslint_extends_match_eslint() {
+    // Exactly what ESLint 9 (legacy config mode) reports: no-restricted-paths
+    // from a relative extends, no-cycle's maxDepth 1 from a shareable config
+    // kept by the root's severity-only "warn", and src/core re-enabled by it.
+    let expected = pairs(&[
+        ("src/app/a.js", "./b.js"),
+        ("src/app/a.js", "../lib/l.js"),
+        ("src/app/b.js", "./a.js"),
+        ("src/core/x.js", "./y.js"),
+        ("src/core/y.js", "./x.js"),
+        ("src/lib/l.js", "../app/a.js"),
+    ]);
+    assert_eq!(migrated_flagged_imports("eslint-extends"), expected);
 }

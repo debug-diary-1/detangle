@@ -211,6 +211,9 @@ fn compile<'r>(name: &str, from: &'r FromSpec, to: &'r ToSpec) -> Result<Compile
     if to.reachable.is_some() && from.path.is_none() {
         bail!("rule '{name}': `to.reachable` needs `from.path` to name the entry points");
     }
+    if to.max_cycle_length.is_some() && (to.via.is_some() || to.via_only.is_some()) {
+        bail!("rule '{name}': `to.max_cycle_length` can't be combined with `via` / `via_only`");
+    }
     let via = |v: &Option<PathSpec>| v.as_ref().map(|v| Target::new(&v.path, &v.path_not, name)).transpose();
     Ok(Compiled {
         from,
@@ -453,7 +456,12 @@ impl Compiled<'_> {
             }
             return None;
         }
-        Some(g.cycle_path(i))
+        let cycle = g.cycle_path(i);
+        // The path repeats `from` at the end: n modules, n edges.
+        if t.max_cycle_length.is_some_and(|max| cycle.len() - 1 > max) {
+            return None;
+        }
+        Some(cycle)
     }
 }
 

@@ -1,12 +1,13 @@
 //! Converts eslint-plugin-import / eslint-plugin-import-x dependency rules:
 //! `no-cycle`, `no-restricted-paths` and `no-extraneous-dependencies`, from
-//! flat (`eslint.config.*`) or legacy (`.eslintrc*`, package.json
-//! `eslintConfig`) configs, honouring `files` / `ignores` / `overrides`
-//! scoping and the `import/resolver` settings.
+//! flat (`eslint.config.*`) or legacy (`.eslintrc*` in JSON, YAML or JS,
+//! package.json `eslintConfig`) configs, honouring `files` / `ignores` /
+//! `overrides` scoping, legacy `extends` chains and the `import/resolver`
+//! settings.
 
 use std::path::Path;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use serde_json::{Value, json};
 
 use super::glob::{Plain, has_magic, to_regex};
@@ -23,26 +24,93 @@ pub const FILES: &[&str] = &[
     ".eslintrc.js",
     ".eslintrc.cjs",
     ".eslintrc.json",
+    ".eslintrc.yaml",
+    ".eslintrc.yml",
     ".eslintrc",
 ];
 
 const LOADER: &str = r#"
-const fs = require('fs'), path = require('path'), { pathToFileURL } = require('url');
+const fs = require('fs'), path = require('path'), { pathToFileURL } = require('url'), { createRequire } = require('module');
 const strip = (t) => t.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '').replace(/,(\s*[}\]])/g, '$1');
+const strs = (x) => [].concat(x || []).flat(Infinity).filter((s) => typeof s === 'string');
+const pick = (rules) => Object.fromEntries(Object.entries(rules || {}).filter(([k]) =>
+  /^(import|import-x|i)\/(no-cycle|no-restricted-paths|no-extraneous-dependencies)$/.test(k) ||
+  /^@(nx|nrwl\/nx)\/enforce-module-boundaries$/.test(k) || /^boundaries\//.test(k)));
+const boundaries = (s) => (s && (s['boundaries/elements'] || s['boundaries/ignore'])) ? { elements: s['boundaries/elements'] || null, ignore: strs(s['boundaries/ignore']) } : null;
+const resolver = (s) => (s || {})['import/resolver'] || (s || {})['import-x/resolver'] || null;
+const warnings = [];
+
+// js-yaml comes with ESLint 8 and @eslint/eslintrc; look for it from the config.
+const yaml = (text, from) => {
+  const req = createRequire(from);
+  for (const get of [() => req('js-yaml'), () => createRequire(req.resolve('@eslint/eslintrc'))('js-yaml'), () => createRequire(req.resolve('eslint'))('js-yaml')]) {
+    let y;
+    try { y = get(); } catch { continue; }
+    return y.load(text);
+  }
+  throw new Error(`${path.basename(from)} is YAML, which needs js-yaml — install the project's ESLint dependencies first`);
+};
+
+// A legacy config file, read as ESLint reads it.
+const loadLegacy = (file) => {
+  const base = path.basename(file), text = fs.readFileSync(file, 'utf8');
+  if (base === 'package.json') return JSON.parse(text).eslintConfig || {};
+  if (/\.c?js$/.test(base)) return require(file);
+  if (/\.ya?ml$/.test(base)) return yaml(text, file);
+  try { return JSON.parse(text); } catch {}
+  try { return JSON.parse(strip(text)); } catch {}
+  return yaml(text, file);
+};
+
+// eslint-config-* / eslint-plugin-* package naming, as ESLint does it.
+const pkgName = (name, kind) => {
+  const pre = `eslint-${kind}`;
+  if (name.startsWith('@')) {
+    const [scope, rest] = name.split('/');
+    return !rest ? `${scope}/${pre}` : rest.startsWith(pre) ? name : `${scope}/${pre}-${rest}`;
+  }
+  return name.startsWith(`${pre}-`) ? name : `${pre}-${name}`;
+};
+
+const resolveExtends = (name, from) => {
+  if (name.startsWith('eslint:')) return null; // core rules only
+  const req = createRequire(from);
+  if (name.startsWith('plugin:')) {
+    const rest = name.slice(7), i = rest.lastIndexOf('/');
+    const file = req.resolve(pkgName(rest.slice(0, i), 'plugin'));
+    const config = (require(file).configs || {})[rest.slice(i + 1)];
+    if (!config) throw new Error('the plugin has no such config');
+    return { config, file };
+  }
+  const file = name.startsWith('.') || path.isAbsolute(name) ? path.resolve(path.dirname(from), name) : req.resolve(pkgName(name, 'config'));
+  return { config: loadLegacy(file), file };
+};
+
+// A legacy config as cascade items: its extended configs first, then its own
+// settings, then its overrides. Patterns stay relative to the root config.
+const expand = (c, file, crit, seen) => {
+  const items = [];
+  for (const e of strs(c.extends)) {
+    let r;
+    try { r = resolveExtends(e, file); } catch (err) {
+      warnings.push(`extends "${e}" couldn't be loaded (${String(err.message).split('\n')[0]}), so rules it enables aren't converted`);
+      continue;
+    }
+    if (r && !seen.has(r.file)) items.push(...expand(r.config || {}, r.file, crit, new Set([...seen, r.file])));
+  }
+  if (c.ignorePatterns && !crit) items.push({ files: null, ignores: strs(c.ignorePatterns), globalIgnores: true, rules: {}, resolver: null });
+  items.push({ files: crit ? crit.files : null, ignores: crit ? crit.ignores : [], globalIgnores: false, rules: pick(c.rules), resolver: resolver(c.settings), boundaries: boundaries(c.settings) });
+  for (const o of c.overrides || []) items.push(...expand(o, file, { files: strs(o.files), ignores: strs(o.excludedFiles) }, seen));
+  return items;
+};
+
 (async () => {
   const file = process.env.TANGLE_CONFIG_FILE, base = path.basename(file);
-  let c;
-  if (base === 'package.json') c = JSON.parse(fs.readFileSync(file, 'utf8')).eslintConfig || {};
-  else if (/\.(c|m)?[jt]s$/.test(base)) { const m = await import(pathToFileURL(file).href); c = await (m.default ?? m); }
-  else { const t = fs.readFileSync(file, 'utf8'); try { c = JSON.parse(t); } catch { try { c = JSON.parse(strip(t)); } catch { throw new Error('only JSON .eslintrc files are supported (not YAML)'); } } }
-  if (typeof c === 'function') c = await c();
   const flat = base.startsWith('eslint.config.');
-  const pick = (rules) => Object.fromEntries(Object.entries(rules || {}).filter(([k]) =>
-    /^(import|import-x|i)\/(no-cycle|no-restricted-paths|no-extraneous-dependencies)$/.test(k) ||
-    /^@(nx|nrwl\/nx)\/enforce-module-boundaries$/.test(k) || /^boundaries\//.test(k)));
-  const boundaries = (s) => (s && (s['boundaries/elements'] || s['boundaries/ignore'])) ? { elements: s['boundaries/elements'] || null, ignore: strs(s['boundaries/ignore']) } : null;
-  const strs = (x) => [].concat(x || []).flat(Infinity).filter((s) => typeof s === 'string');
-  const resolver = (s) => (s || {})['import/resolver'] || (s || {})['import-x/resolver'] || null;
+  let c;
+  if (/\.(c|m)?[jt]s$/.test(base)) { const m = await import(pathToFileURL(file).href); c = await (m.default ?? m); }
+  else c = loadLegacy(file);
+  if (typeof c === 'function') c = await c();
   let items;
   if (flat) {
     items = [].concat(c).flat(Infinity).filter(Boolean).map((it) => ({
@@ -52,11 +120,9 @@ const strip = (t) => t.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm,
       rules: pick(it.rules), resolver: resolver(it.settings), boundaries: boundaries(it.settings),
     }));
   } else {
-    items = [{ files: null, ignores: [], globalIgnores: false, rules: pick(c.rules), resolver: resolver(c.settings), boundaries: boundaries(c.settings) },
-      ...(c.overrides || []).map((o) => ({ files: strs(o.files), ignores: strs(o.excludedFiles), globalIgnores: false, rules: pick(o.rules), resolver: resolver(o.settings), boundaries: boundaries(o.settings) }))];
-    if (c.ignorePatterns) items.unshift({ files: null, ignores: strs(c.ignorePatterns), globalIgnores: true, rules: {}, resolver: null });
+    items = expand(c, file, null, new Set([file]));
   }
-  process.stdout.write(JSON.stringify({ flat, items, extends: flat ? [] : strs(c.extends) }));
+  process.stdout.write(JSON.stringify({ flat, items, warnings }));
 })().catch((e) => { console.error((e && e.message) || String(e)); process.exit(1); });
 "#;
 
@@ -106,6 +172,7 @@ pub fn import(file: &Path, root: &Path) -> Result<Imported> {
     let mut nx = false;
 
     let mut active: Vec<(String, Active)> = vec![];
+    let mut last_opts: std::collections::HashMap<String, Vec<Value>> = Default::default();
     for item in items {
         let files = item["files"].as_array().map(|_| strs(&item["files"]));
         let ignores = strs(&item["ignores"]);
@@ -121,7 +188,13 @@ pub fn import(file: &Path, root: &Path) -> Result<Imported> {
             resolver_settings(r, &prefix, &mut options, &mut warnings);
         }
         for (name, value) in item["rules"].as_object().cloned().unwrap_or_default() {
-            let (sev, opts) = severity(&value);
+            let (sev, mut opts) = severity(&value);
+            // A severity on its own keeps the options set earlier (as ESLint merges).
+            if opts.is_empty() {
+                opts = last_opts.get(&name).cloned().unwrap_or_default();
+            } else {
+                last_opts.insert(name.clone(), opts.clone());
+            }
             let short = name.rsplit('/').next().unwrap_or(&name).to_string();
             let boundary_rule = name == "boundaries/element-types" || name == "boundaries/dependencies";
             if name.starts_with("boundaries/") && !boundary_rule {
@@ -183,10 +256,7 @@ pub fn import(file: &Path, root: &Path) -> Result<Imported> {
             }
         }
     }
-    let extends = strs(&v["extends"]);
-    if extends.iter().any(|e| e.contains("import")) {
-        warnings.push(format!("extends {extends:?}: rules enabled only through shared configs aren't converted — list them in the config itself"));
-    }
+    warnings.extend(strs(&v["warnings"]));
     let scoped = active.iter().filter(|(_, a)| a.scoped).count();
     let mut config = Config::empty();
     config.options = options;
@@ -554,14 +624,20 @@ fn convert(full: &str, short: &str, sev: Severity, opts: &[Value], ctx: &Ctx, wa
         "enforce-module-boundaries" => convert_nx(full, sev, &o, warnings),
         "element-types" | "dependencies" if full.starts_with("boundaries/") => convert_boundaries(full, sev, &o, ctx, warnings),
         "no-cycle" => {
-            if let Some(d) = o.get("maxDepth").filter(|d| d.as_u64().is_some()) {
-                warnings.push(format!("{full}: maxDepth {d} isn't supported — cycles of any length are reported"));
-            }
+            // The plugin searches breadth-first up to maxDepth imports beyond
+            // the imported module, so it finds cycles of up to maxDepth + 1.
+            let max_cycle_length = o.get("maxDepth").and_then(Value::as_u64).map(|d| d as usize + 1);
             if o.get("allowUnsafeDynamicCyclicDependency") == Some(&json!(true)) {
                 warnings.push(format!("{full}: allowUnsafeDynamicCyclicDependency isn't supported — cycles through dynamic imports are reported"));
             }
             // Like the plugin, `import type` doesn't count (tangle's default).
-            vec![rule(full, sev, "Circular dependency (converted from ESLint).", FromSpec::default(), ToSpec { circular: Some(true), ..Default::default() })]
+            vec![rule(
+                full,
+                sev,
+                "Circular dependency (converted from ESLint).",
+                FromSpec::default(),
+                ToSpec { circular: Some(true), max_cycle_length, ..Default::default() },
+            )]
         }
         "no-restricted-paths" => {
             let base = o.get("basePath").and_then(Value::as_str).map(|b| b.trim_start_matches("./").trim_end_matches('/').to_string());
@@ -650,13 +726,4 @@ fn convert(full: &str, short: &str, sev: Severity, opts: &[Value], ctx: &Ctx, wa
         }
         _ => vec![],
     }
-}
-
-/// Fails with a clear message if `file` isn't a config we understand.
-pub fn check_supported(file: &Path) -> Result<()> {
-    let name = file.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    if name.ends_with(".yml") || name.ends_with(".yaml") {
-        bail!("YAML ESLint configs aren't supported; convert {name} to JSON or JS first");
-    }
-    Ok(())
 }

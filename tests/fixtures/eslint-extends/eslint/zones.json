@@ -1,0 +1,6 @@
+{
+  "plugins": ["import"],
+  "rules": {
+    "import/no-restricted-paths": ["error", { "zones": [{ "target": "./src/lib", "from": "./src/app" }] }]
+  }
+}

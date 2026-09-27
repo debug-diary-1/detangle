@@ -500,6 +500,10 @@ pub struct ToSpec {
     /// modules matching this.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub via_only: Option<PathSpec>,
+    /// Circular only: the shortest cycle through this dependency has at
+    /// most this many modules (2 = the two modules import each other).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_cycle_length: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dependency_types: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -1,0 +1,5 @@
+{
+  "root": true,
+  "extends": ["./eslint/zones.json", "deps"],
+  "rules": { "import/no-cycle": "warn" }
+}
