@@ -52,8 +52,8 @@
     "detangle-linux-arm64-gnu": "0.1.0",
     "detangle-linux-x64-musl": "0.1.0",
     "detangle-linux-arm64-musl": "0.1.0",
-    "detangle-win32-x64": "0.1.0",
-    "detangle-win32-arm64": "0.1.0"
+    "detangle-windows-x64": "0.1.0",
+    "detangle-windows-arm64": "0.1.0"
   },
   "engines": {
     "node": ">=18"
