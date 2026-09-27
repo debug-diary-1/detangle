@@ -167,35 +167,30 @@ fn read_source(path: &Path) -> std::io::Result<(String, Stamp)> {
 mod cache {
     use super::*;
     use crate::config::CacheStrategy;
-    use serde::Deserialize;
+    use std::ffi::OsString;
     use std::hash::{Hash, Hasher};
 
-    const FILE: &str = "parse-cache.json";
+    /// A compact binary file: it loads several times faster than JSON.
+    const FILE: &str = "parse-cache.bin";
+    const MAGIC: &[u8] = b"tangle-parse-cache-1\n";
 
-    #[derive(Clone, Serialize, Deserialize)]
+    #[derive(Clone)]
     struct Entry {
         /// Modification time and size.
         meta: String,
-        /// Content hash (`content` strategy only).
-        #[serde(default, skip_serializing_if = "String::is_empty")]
+        /// Content hash (`content` strategy only; else empty).
         hash: String,
         errors: usize,
         /// (specifier, `ImportFlags::to_bits`)
-        imports: Vec<(String, u32)>,
-    }
-
-    #[derive(Serialize, Deserialize)]
-    struct Stored {
-        /// Invalidates everything when tangle or what it detects changes.
-        fingerprint: String,
-        files: HashMap<String, Entry>,
+        imports: Vec<(Arc<str>, u32)>,
     }
 
     /// A loaded cache: each file's previous scan, plus what's needed to save
     /// the cache again.
     #[derive(Default)]
     pub struct Loaded {
-        pub files: HashMap<PathBuf, Hit>,
+        /// By path; `OsString` hashes much faster than `PathBuf`.
+        pub files: HashMap<OsString, Hit>,
         entries: HashMap<String, Entry>,
     }
 
@@ -231,32 +226,77 @@ mod cache {
         format!("{:016x}:{}", h.finish(), bytes.len())
     }
 
+    /// Length-prefixed strings and little-endian numbers.
+    struct Writer(Vec<u8>);
+
+    impl Writer {
+        fn num(&mut self, n: usize) {
+            self.0.extend_from_slice(&(n as u32).to_le_bytes());
+        }
+        fn str(&mut self, s: &str) {
+            self.num(s.len());
+            self.0.extend_from_slice(s.as_bytes());
+        }
+    }
+
+    struct Reader<'b>(&'b [u8]);
+
+    impl<'b> Reader<'b> {
+        fn num(&mut self) -> Option<usize> {
+            let (n, rest) = self.0.split_first_chunk::<4>()?;
+            self.0 = rest;
+            Some(u32::from_le_bytes(*n) as usize)
+        }
+        fn str(&mut self) -> Option<&'b str> {
+            let n = self.num()?;
+            let (s, rest) = self.0.split_at_checked(n)?;
+            self.0 = rest;
+            std::str::from_utf8(s).ok()
+        }
+    }
+
+    fn decode(bytes: &[u8], opts: &Options) -> Option<HashMap<String, Entry>> {
+        let mut r = Reader(bytes.strip_prefix(MAGIC)?);
+        if r.str()? != fingerprint(opts) {
+            return None;
+        }
+        let n = r.num()?;
+        let mut entries = HashMap::with_capacity(n);
+        for _ in 0..n {
+            let rel = r.str()?.to_string();
+            let meta = r.str()?.to_string();
+            let hash = r.str()?.to_string();
+            let errors = r.num()?;
+            let count = r.num()?;
+            let imports = (0..count).map(|_| Some((Arc::from(r.str()?), r.num()? as u32))).collect::<Option<_>>()?;
+            entries.insert(rel, Entry { meta, hash, errors, imports });
+        }
+        r.0.is_empty().then_some(entries)
+    }
+
     pub fn load(dir: &Path, root: &Path, opts: &Options) -> Loaded {
-        let Some(stored) = std::fs::read(dir.join(FILE)).ok().and_then(|b| serde_json::from_slice::<Stored>(&b).ok()) else {
+        let Some(entries) = std::fs::read(dir.join(FILE)).ok().and_then(|b| decode(&b, opts)) else {
             return Loaded::default();
         };
-        if stored.fingerprint != fingerprint(opts) {
-            return Loaded::default();
-        }
         let content = opts.cache_strategy == CacheStrategy::Content;
-        let files = stored
-            .files
+        let files = entries
             .iter()
             .map(|(rel, e)| {
                 let path = root.join(rel);
-                let raw = e.imports.iter().map(|(s, b)| (Arc::from(s.as_str()), ImportFlags::from_bits(*b))).collect();
-                let file = ScannedFile { path: path.clone(), imports: vec![], parse_errors: e.errors, raw, stamp: parse_meta(&e.meta) };
+                let raw = e.imports.iter().map(|(s, b)| (s.clone(), ImportFlags::from_bits(*b))).collect();
+                let key = path.as_os_str().to_os_string();
+                let file = ScannedFile { path, imports: vec![], parse_errors: e.errors, raw, stamp: parse_meta(&e.meta) };
                 let hash = (content && !e.hash.is_empty()).then(|| e.hash.clone());
-                (path, Hit { file, hash })
+                (key, Hit { file, hash })
             })
             .collect();
-        Loaded { files, entries: stored.files }
+        Loaded { files, entries }
     }
 
     /// Saves the cache, reusing loaded entries (and their hashes) where current.
     fn save(dir: &Path, root: &Path, opts: &Options, files: &[ScannedFile], loaded: &HashMap<String, Entry>) -> Result<()> {
         let content = opts.cache_strategy == CacheStrategy::Content;
-        let entries: HashMap<String, Entry> = files
+        let entries: Vec<(String, Entry)> = files
             .par_iter()
             .filter_map(|f| {
                 let rel = f.path.strip_prefix(root).ok()?.to_string_lossy().into_owned();
@@ -264,14 +304,28 @@ mod cache {
                 if let Some(e) = loaded.get(&rel).filter(|e| e.meta == m) {
                     return Some((rel, e.clone()));
                 }
-                let imports = f.raw.iter().map(|(s, fl)| (s.to_string(), fl.to_bits())).collect();
+                let imports = f.raw.iter().map(|(s, fl)| (s.clone(), fl.to_bits())).collect();
                 let hash = if content { hash(&std::fs::read(&f.path).ok()?) } else { String::new() };
                 Some((rel, Entry { meta: m, hash, errors: f.parse_errors, imports }))
             })
             .collect();
+        let mut w = Writer(MAGIC.to_vec());
+        w.str(&fingerprint(opts));
+        w.num(entries.len());
+        for (rel, e) in &entries {
+            w.str(rel);
+            w.str(&e.meta);
+            w.str(&e.hash);
+            w.num(e.errors);
+            w.num(e.imports.len());
+            for (spec, bits) in &e.imports {
+                w.str(spec);
+                w.num(*bits as usize);
+            }
+        }
         std::fs::create_dir_all(dir)?;
         let tmp = dir.join(format!("{FILE}.{}", std::process::id()));
-        std::fs::write(&tmp, serde_json::to_vec(&Stored { fingerprint: fingerprint(opts), files: entries })?)?;
+        std::fs::write(&tmp, w.0)?;
         std::fs::rename(tmp, dir.join(FILE))?;
         Ok(())
     }
@@ -330,7 +384,7 @@ impl Session {
         // walker thread that finds it, so parsing starts with the first file.
         let (fresh, seen) = (AtomicBool::new(false), AtomicUsize::new(0));
         let mut files = walk_sources(root, dir, opts, |p| {
-            let hit = cached.files.get(&p);
+            let hit = cached.files.get(p.as_os_str());
             seen.fetch_add(usize::from(hit.is_some()), Ordering::Relaxed);
             let (mut f, how) = parse_file(p, hit.map(|h| &h.file), hit.and_then(|h| h.hash.as_deref()), &detect);
             if how != Scanned::Reused {

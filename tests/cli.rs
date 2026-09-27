@@ -828,7 +828,7 @@ fn parse_cache_reuses_and_notices_edits() {
             a["dependencies"].as_array().unwrap().iter().map(|d| d["module"].as_str().unwrap().to_string()).collect::<Vec<_>>()
         };
         assert_eq!(deps_of_a(), ["src/b.js"]);
-        assert!(dir.join("node_modules/.cache/tangle/parse-cache.json").is_file());
+        assert!(dir.join("node_modules/.cache/tangle/parse-cache.bin").is_file());
         assert_eq!(deps_of_a(), ["src/b.js"]); // from the cache
         // Same size, new content: the edit must still be seen.
         std::fs::write(dir.join("src/a.js"), "import { c } from \"./c.js\";\nexport const a = () => [c];\n").unwrap();
