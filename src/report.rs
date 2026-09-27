@@ -5,6 +5,7 @@ use std::fmt::Write as _;
 use std::io::IsTerminal;
 
 use regex::Regex;
+use serde::Serialize;
 use serde_json::json;
 
 use crate::config::Severity;
@@ -393,53 +394,94 @@ pub fn stale_json(stale: &Stale) -> Vec<serde_json::Value> {
         .collect()
 }
 
-pub fn violations_json(g: &Graph, vs: &[Violation]) -> serde_json::Value {
+/// A violation as JSON (`check -f json`, `graph -f json`).
+#[derive(Serialize)]
+pub struct ViolationJson<'g> {
+    rule: &'g str,
+    severity: Severity,
+    comment: Option<&'g str>,
+    scope: crate::config::Scope,
+    from: &'g str,
+    to: Option<&'g str>,
+    cycle: Vec<&'g str>,
+    imports: Vec<ImportJson<'g>>,
+}
+
+#[derive(Serialize)]
+struct ImportJson<'g> {
+    from: &'g str,
+    specifier: &'g str,
+    to: &'g str,
+}
+
+pub fn violations_json<'g>(g: &'g Graph, vs: &'g [Violation]) -> Vec<ViolationJson<'g>> {
     vs.iter()
-        .map(|v| {
-            json!({
-                "rule": v.rule,
-                "severity": v.severity,
-                "comment": v.comment,
-                "scope": v.scope,
-                "from": v.source_id(g),
-                "to": v.target_id(g),
-                "cycle": v.cycle_ids(g),
-                "imports": imports(g, v).map(|(from, specifier, to)| json!({ "from": from, "specifier": specifier, "to": to })).collect::<Vec<_>>(),
-            })
+        .map(|v| ViolationJson {
+            rule: &v.rule,
+            severity: v.severity,
+            comment: v.comment.as_deref(),
+            scope: v.scope,
+            from: v.source_id(g),
+            to: v.target_id(g),
+            cycle: v.cycle_ids(g),
+            imports: imports(g, v).map(|(from, specifier, to)| ImportJson { from, specifier, to }).collect(),
         })
         .collect()
 }
 
-pub fn full_json(g: &Graph, vs: &[Violation]) -> serde_json::Value {
-    let (e, w, i) = counts(vs);
-    json!({
-        "summary": {
-            "modules": g.local_count(),
-            "dependencies": g.edges.len(),
-            "cycles": g.cycles.len(),
-            "errors": e, "warnings": w, "info": i,
-            "timings": g.timings,
-        },
-        "modules": g.modules.iter().enumerate().map(|(m, module)| json!({
-            "id": module.id,
-            "kind": module.kind,
-            "fanIn": g.fan_in(m),
-            "fanOut": g.fan_out(m),
-            "instability": (g.instability(m) * 1000.0).round() / 1000.0,
-            "cycle": g.cycle_of[m],
-            "dependencies": g.out[m].iter().map(|&e| {
-                let edge = &g.edges[e];
-                json!({
-                    "module": g.modules[edge.to].id,
-                    "specifier": edge.specifier,
-                    "types": edge.types,
-                    "circular": edge.circular,
-                })
-            }).collect::<Vec<_>>(),
-        })).collect::<Vec<_>>(),
-        "cycles": g.cycles.iter().map(|c| c.iter().map(|&m| &g.modules[m].id).collect::<Vec<_>>()).collect::<Vec<_>>(),
-        "violations": violations_json(g, vs),
-    })
+/// `check -f json`: the violations, then stale baseline entries.
+pub fn check_json<'g>(g: &'g Graph, vs: &'g [Violation], stale: &Stale) -> impl Serialize + 'g {
+    #[derive(Serialize)]
+    #[serde(untagged)]
+    enum Finding<'g> {
+        Violation(ViolationJson<'g>),
+        Stale(serde_json::Value),
+    }
+    let mut all: Vec<Finding> = violations_json(g, vs).into_iter().map(Finding::Violation).collect();
+    all.extend(stale_json(stale).into_iter().map(Finding::Stale));
+    all
+}
+
+// Field order is the JSON key order.
+#[derive(Serialize)]
+struct GraphJson<'g> {
+    summary: SummaryJson,
+    modules: Vec<ModuleJson<'g>>,
+    cycles: Vec<Vec<&'g str>>,
+    violations: Vec<ViolationJson<'g>>,
+}
+
+#[derive(Serialize)]
+struct SummaryJson {
+    modules: usize,
+    dependencies: usize,
+    cycles: usize,
+    errors: usize,
+    warnings: usize,
+    info: usize,
+    timings: crate::graph::Timings,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ModuleJson<'g> {
+    id: &'g str,
+    kind: ModuleKind,
+    fan_in: usize,
+    fan_out: usize,
+    instability: f64,
+    cycle: Option<usize>,
+    dependencies: Vec<DependencyJson<'g>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    highlighted: Option<bool>,
+}
+
+#[derive(Serialize)]
+struct DependencyJson<'g> {
+    module: &'g str,
+    specifier: &'g str,
+    types: &'g [&'static str],
+    circular: bool,
 }
 
 /// How `--collapse` merges modules.
@@ -451,32 +493,52 @@ pub enum Collapse {
     Pattern(Regex),
 }
 
-/// `full_json`, narrowed to the modules `--focus` / `--reaches` select, with
-/// `--highlight`ed modules marked.
-pub fn graph_json(g: &Graph, vs: &[Violation], view: &GraphView) -> serde_json::Value {
-    let mut v = full_json(g, vs);
+/// The whole graph as JSON, narrowed to the modules `--focus` / `--reaches`
+/// select, with `--highlight`ed modules marked.
+pub fn graph_json<'g>(g: &'g Graph, vs: &'g [Violation], view: &GraphView) -> impl Serialize + 'g {
     let selected = view.selected(g);
-    if selected.is_none() && view.highlight.is_none() {
-        return v;
-    }
     let keep: Option<HashSet<&str>> = selected.as_ref().map(|s| s.iter().map(|&m| g.modules[m].id.as_str()).collect());
-    if let Some(mods) = v["modules"].as_array_mut() {
-        if let Some(keep) = &keep {
-            mods.retain(|m| m["id"].as_str().is_some_and(|id| keep.contains(id)));
-            for m in mods.iter_mut() {
-                if let Some(deps) = m["dependencies"].as_array_mut() {
-                    deps.retain(|d| d["module"].as_str().is_some_and(|id| keep.contains(id)));
-                }
-            }
-        }
-        if let Some(re) = &view.highlight {
-            for m in mods.iter_mut() {
-                let hit = m["id"].as_str().is_some_and(|id| re.is_match(id));
-                m["highlighted"] = json!(hit);
-            }
-        }
+    let kept = |id: &str| keep.as_ref().is_none_or(|k| k.contains(id));
+    let (e, w, i) = counts(vs);
+    GraphJson {
+        summary: SummaryJson {
+            modules: g.local_count(),
+            dependencies: g.edges.len(),
+            cycles: g.cycles.len(),
+            errors: e,
+            warnings: w,
+            info: i,
+            timings: g.timings,
+        },
+        modules: g
+            .modules
+            .iter()
+            .enumerate()
+            .filter(|(_, module)| kept(&module.id))
+            .map(|(m, module)| ModuleJson {
+                id: &module.id,
+                kind: module.kind,
+                fan_in: g.fan_in(m),
+                fan_out: g.fan_out(m),
+                instability: (g.instability(m) * 1000.0).round() / 1000.0,
+                cycle: g.cycle_of[m],
+                dependencies: g.out[m]
+                    .iter()
+                    .map(|&e| &g.edges[e])
+                    .filter(|edge| kept(&g.modules[edge.to].id))
+                    .map(|edge| DependencyJson {
+                        module: &g.modules[edge.to].id,
+                        specifier: &edge.specifier,
+                        types: &edge.types,
+                        circular: edge.circular,
+                    })
+                    .collect(),
+                highlighted: view.highlight.as_ref().map(|re| re.is_match(&module.id)),
+            })
+            .collect(),
+        cycles: g.cycles.iter().map(|c| c.iter().map(|&m| g.modules[m].id.as_str()).collect()).collect(),
+        violations: violations_json(g, vs),
     }
-    v
 }
 
 pub struct GraphView {

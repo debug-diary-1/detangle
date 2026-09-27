@@ -478,9 +478,7 @@ fn run() -> Result<ExitCode> {
             match format {
                 CheckFormat::Text => print!("{}", report::text(g, vs, suppressed, &stale)),
                 CheckFormat::Json => {
-                    let mut all = report::violations_json(g, vs).as_array().cloned().unwrap_or_default();
-                    all.extend(report::stale_json(&stale));
-                    println!("{}", serde_json::to_string_pretty(&all)?)
+                    println!("{}", serde_json::to_string_pretty(&report::check_json(g, vs, &stale))?)
                 }
                 CheckFormat::Markdown => print!("{}", report::markdown(g, vs, &stale)),
                 CheckFormat::Github | CheckFormat::Teamcity | CheckFormat::Azure => {
