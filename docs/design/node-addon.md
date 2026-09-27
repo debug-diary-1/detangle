@@ -531,3 +531,49 @@ Same setup: three parallel subagents, one read of revision 2 each.
   - The Windows case test is listed.
   - `scripts/cmp-output.sh` is committed.
 - **Terms:** Problem section added. Glossary adds root/`dir`, parse cache, exotic require, rule kinds, structural update, `one_shot`, `--concurrency`. `PATH` for `node` in GUI editors is an edge case.
+
+## Cold Read 3 Findings — 2026-09-27
+
+Same setup: three parallel subagents, one read of revision 3 each.
+
+### Risks (blocking)
+
+1. **Lint tracking only counts Session members.** New files never count as re-lints, and in `Broken`/`Failed` nothing does, so the watcher never starts and a config broken at open can't recover in an editor.
+2. **The D5 shared result is keyed only on `sourceCode`.** When the two rules have different options (different Projects), the second rule reuses the wrong Project's result.
+3. **JS can't see a re-open.** D8 clears the `rootOf` cache on a re-open, but the D3 result doesn't report re-opens.
+4. **A root added later is never picked up.** A `detangle.toml` added above per-package roots lies outside every watched tree. And with no eviction, a superseded Project would leak.
+5. **`dir` and root are ambiguous.** A `root` option without a marker file makes `find_root` walk further up. "All three give the same root" is false when the config file sits in a subdirectory. Which directory the watcher watches is unstated.
+6. **Watcher filters aren't specified.**
+   - The watcher already skips `node_modules`, `.git` and `target` events (`src/watch.rs`), but the doc doesn't say so, or whether those directories are still *watched*.
+   - A config change is matched by file name anywhere under the root, so nested `package.json` and `.env*` edits force re-opens.
+   - `notify`'s lost-event signals (macOS rescan flag, inotify overflow) are ignored.
+
+### Gaps
+
+- **Targets whose basis doesn't cover the work:**
+  - First re-lint: re-resolution, re-analysis and the Linux watcher start aren't counted.
+  - Import edit: 57–61 ms measured against a ≤ 60 ms target, and the ~20 ms free-time saving was measured for `one_shot`.
+  - Config reload: the `node` spawn, and freeing the Session.
+  - Branch switch: drains spread over several lints.
+  - Unmeasured: the 1 s basis, Session memory (and N× under `--concurrency`), add-on size.
+- **Contract:**
+  - The message format, which the oracle needs.
+  - The folder-subtree rule for targets that are subfolders of `F`.
+  - The group `imports` entry shape.
+  - `filename` vs `physicalFilename`, and BOM.
+  - Whether the parse cache is used, and which `check` options `open` inherits.
+  - The `FileReport`/`Changes`/`Disconnected` shapes.
+  - napi-rs and Node-API versions.
+  - `Project::open` vs clap types.
+  - `TSImportType` shape, and dotted exotic-require names.
+  - What `Stale` applies overlays and drains to.
+  - A panic during `open`.
+  - Cleanup-hook cost at process exit vs `one_shot`.
+- **Context:** the `22899e5` baseline, the `conditions` fixture, "the standing rule", and "configured groups or Nx projects" aren't introduced.
+
+### Verdict
+
+- Explain-back: NEEDS REVISION. Three contract holes (new-file tracking, re-open signalling, shared-result key).
+- Implementation: NEEDS REVISION. 17 questions.
+- Critique: RISKS FOUND. Roots added later, the catch-up cost basis, watcher filters.
+- Trend: the core (D3, overlay, placement) held. The lifecycle around the lazy watcher keeps producing corner cases. Before revision 4: measure the Linux watcher setup and consider starting the watcher at open.
