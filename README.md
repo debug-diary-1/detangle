@@ -279,6 +279,20 @@ At folder scope, a module edge `a → b` makes every folder containing `a` but n
 
 Dependency types: `local`, `npm`, `npm-dev`, `npm-peer`, `npm-optional`, `npm-undeclared`, `npm-bundled`, `core`, `unresolvable`, `type-only`, `dynamic`, `require`, `reexport`, `resource`, `amd`, `triple-slash`, `jsdoc`, `exotic-require`, `process-get-builtin-module`, `import` (a plain `import`/`export`), `aliased` (a tsconfig-paths, `#imports` or workspace import of a local file), `deprecated` (the installed package is marked deprecated). A package declared in several `package.json` sections has all of the matching types, for example `npm` and `npm-dev`. npm packages can also be matched as `node_modules/<name>/`.
 
+## Node.js API
+
+`npm/` is a small package (`tangle-deps`, not published yet) that runs the `tangle` binary and returns plain JavaScript values, with TypeScript types for both ESM and CommonJS. It uses `options.bin`, then `$TANGLE_BIN`, then `tangle` on `PATH`.
+
+```js
+import { analyze, check, report, graph, migrate } from "tangle-deps";
+
+const { modules, cycles, violations } = await analyze("src", { cache: true });
+const { errors, exitCode } = await check(".", { strict: true });
+const { output } = await report(".", { format: "markdown" });        // text, markdown, github, teamcity, azure
+const svgSource = await graph(".", { format: "dot", focus: /cart/, focusDepth: 2 });
+const { config } = await migrate(".");                               // the tangle.toml migrate would write
+```
+
 ## HTML report
 
 `tangle report` writes one self-contained HTML file with no external requests, so it can be attached to CI runs or shared as a file. It has:

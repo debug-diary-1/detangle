@@ -1,0 +1,29 @@
+{
+  "name": "tangle-deps",
+  "version": "0.1.0",
+  "description": "Node.js API for tangle: dependency analysis and architecture rules for JS/TS",
+  "private": true,
+  "main": "index.js",
+  "types": "index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./index.d.mts",
+        "default": "./index.mjs"
+      },
+      "require": {
+        "types": "./index.d.ts",
+        "default": "./index.js"
+      }
+    }
+  },
+  "files": [
+    "index.js",
+    "index.mjs",
+    "index.d.ts",
+    "index.d.mts"
+  ],
+  "engines": {
+    "node": ">=18"
+  }
+}

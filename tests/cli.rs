@@ -836,3 +836,19 @@ fn parse_cache_reuses_and_notices_edits() {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
+
+#[test]
+fn node_api() {
+    // The npm package's own tests, against this build.
+    let Ok(out) = Command::new("node")
+        .args(["--test", "npm/test.mjs"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .env("TANGLE_BIN", env!("CARGO_BIN_EXE_tangle"))
+        .env_remove("NODE_ENV")
+        .output()
+    else {
+        eprintln!("node not installed; skipping");
+        return;
+    };
+    assert!(out.status.success(), "{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+}
