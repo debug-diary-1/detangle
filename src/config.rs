@@ -183,9 +183,37 @@ pub struct ConfigEnv {
     /// webpack's `env` argument, as with `webpack --env production`.
     #[serde(skip_serializing_if = "serde_json::Map::is_empty")]
     pub webpack_env: serde_json::Map<String, serde_json::Value>,
-    /// Environment variables while the configs are evaluated.
+    /// Environment variables while the configs are evaluated. These beat the
+    /// shell environment, which beats `.env` files.
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub vars: std::collections::BTreeMap<String, String>,
+    /// `.env` files to load (later override earlier; `{mode}` is replaced).
+    /// Default: `.env`, `.env.local`, `.env.{mode}`, `.env.{mode}.local`.
+    /// `false` disables loading.
+    #[serde(skip_serializing_if = "EnvFiles::is_default")]
+    pub env_files: EnvFiles,
+    /// Directory holding the `.env` files (default: the project root).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub env_dir: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum EnvFiles {
+    Enabled(bool),
+    List(Vec<String>),
+}
+
+impl Default for EnvFiles {
+    fn default() -> Self {
+        EnvFiles::Enabled(true)
+    }
+}
+
+impl EnvFiles {
+    fn is_default(&self) -> bool {
+        *self == EnvFiles::default()
+    }
 }
 
 impl ConfigEnv {
@@ -201,14 +229,28 @@ impl ConfigEnv {
         self.command.as_deref().unwrap_or("serve")
     }
 
-    /// `NODE_ENV` unless set explicitly: "production" for a production mode
-    /// or a build, else "development" (as Vite does).
-    pub fn node_env(&self) -> String {
+    /// The `.env` file names to load, in order, with `{mode}` filled in.
+    pub fn env_file_names(&self) -> Vec<String> {
+        let names: Vec<String> = match &self.env_files {
+            EnvFiles::Enabled(false) => return vec![],
+            EnvFiles::Enabled(true) => [".env", ".env.local", ".env.{mode}", ".env.{mode}.local"].map(String::from).to_vec(),
+            EnvFiles::List(l) => l.clone(),
+        };
+        names.into_iter().map(|n| n.replace("{mode}", self.mode())).collect()
+    }
+
+    /// `NODE_ENV` unless set explicitly (tangle.toml `vars`, then the shell,
+    /// then `.env` files): "production" for a production mode or a build,
+    /// else "development" (as Vite does).
+    pub fn node_env(&self, files: &std::collections::BTreeMap<String, String>) -> String {
         if let Some(v) = self.vars.get("NODE_ENV") {
             return v.clone();
         }
         if let Ok(v) = std::env::var("NODE_ENV") {
             return v;
+        }
+        if let Some(v) = files.get("NODE_ENV") {
+            return v.clone();
         }
         if self.mode() == "production" || self.command() == "build" { "production" } else { "development" }.into()
     }

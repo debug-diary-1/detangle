@@ -6,3 +6,5 @@ import "@cli";
 import "@vite-cmd";
 import "@vite-mode";
 import "@babel-env";
+import "@dotenv";
+import "@expanded";

@@ -147,7 +147,16 @@ mode = "production"                  # Vite `mode`, webpack `argv.mode` (default
 command = "build"                    # Vite `command`: "serve" (default) or "build"
 webpack_env = { production = true }  # webpack `env`, as with `webpack --env production`
 vars = { API_TARGET = "staging" }    # environment variables while evaluating configs
+env_files = [".env", ".env.{mode}"]  # default: .env, .env.local, .env.{mode}, .env.{mode}.local; false = off
+env_dir = "config"                   # where .env files live (default: project root)
 ```
+
+`.env` files are loaded into the environment the configs are evaluated in, so a webpack config that reads `process.env.X` from a `.env` file works. The rules:
+
+- **Precedence:** later files override earlier ones; `vars` beat your shell, which beats `.env` files.
+- **Syntax:** as `dotenv` + `dotenv-expand`: `export`, `#` comments, single, double or backtick quotes, multi-line quoted values, `\n` escapes in double quotes, and `${VAR}`, `${VAR:-default}` and `$VAR` expansion (`\$` for a literal `$`).
+- **Expansion order:** expansion runs after merging, with the same precedence, so `.env.production` can change a value that `.env` builds on.
+- **Watch mode:** editing a `.env*` file triggers a rebuild.
 
 - **`--mode`:** `tangle check --mode staging` (and every other command) overrides `mode` for one run.
 - **`NODE_ENV`:** defaults to `production` for a production mode or a `build`, otherwise `development`, as in Vite. A value in `vars` or your shell wins.

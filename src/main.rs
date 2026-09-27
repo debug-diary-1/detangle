@@ -1,5 +1,6 @@
 mod aliases;
 mod config;
+mod dotenv;
 mod graph;
 mod migrate;
 mod report;

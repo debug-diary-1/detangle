@@ -315,7 +315,7 @@ fn config_env_targets(extra: &[&str]) -> Vec<String> {
 fn config_env_defaults() {
     assert_eq!(
         config_env_targets(&[]),
-        ["api/dev", "mode/development", "node-env/development", "var/none", "cli/serve", "cmd/serve", "vmode/development", "benv/development"]
+        ["api/dev", "mode/development", "node-env/development", "var/none", "cli/serve", "cmd/serve", "vmode/development", "benv/development", "dotenv/base", "expanded/base-x"]
     );
 }
 
@@ -343,7 +343,7 @@ vars = { API_TARGET = "staging" }
     assert_eq!(
         got,
         // NODE_ENV follows mode/command; Babel's api.env() follows NODE_ENV.
-        ["api/prod", "mode/production", "node-env/production", "var/staging", "cli/build", "cmd/build", "vmode/production", "benv/production"]
+        ["api/prod", "mode/production", "node-env/production", "var/staging", "cli/build", "cmd/build", "vmode/production", "benv/production", "dotenv/prod", "expanded/prod-x"]
     );
 }
 
@@ -352,4 +352,48 @@ fn config_env_mode_flag() {
     let got = config_env_targets(&["--mode", "staging"]);
     assert_eq!(got[1], "mode/staging");
     assert_eq!(got[6], "vmode/staging");
+}
+
+/// Like `config_env_targets`, with extra environment variables for tangle.
+fn config_env_targets_with(extra: &[&str], vars: &[(&str, &str)]) -> Vec<String> {
+    let mut args = vec!["graph", "tests/fixtures/config-env", "-f", "json"];
+    args.extend(extra);
+    let out = Command::new(env!("CARGO_BIN_EXE_tangle"))
+        .args(&args)
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .env_remove("NODE_ENV")
+        .env_remove("BABEL_ENV")
+        .envs(vars.iter().copied())
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let index = v["modules"].as_array().unwrap().iter().find(|m| m["id"] == "src/index.js").unwrap();
+    index["dependencies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["module"].as_str().unwrap().trim_start_matches("src/").trim_end_matches("/index.js").to_string())
+        .filter(|m| m.starts_with("dotenv/") || m.starts_with("expanded/"))
+        .collect()
+}
+
+#[test]
+fn dotenv_precedence() {
+    // Shell environment beats .env files (and feeds their expansions).
+    assert_eq!(config_env_targets_with(&[], &[("DOTENV_TARGET", "shell")]), ["dotenv/shell", "expanded/shell-x"]);
+    // tangle.toml `vars` beat the shell.
+    let cfg = std::env::temp_dir().join(format!("tangle-dotenv-vars-{}.toml", std::process::id()));
+    std::fs::write(
+        &cfg,
+        "[options]\nwebpack_config = \"webpack.config.js\"\n[options.config_env]\nvars = { DOTENV_TARGET = \"vars\" }\n",
+    )
+    .unwrap();
+    let with_vars = config_env_targets_with(&["-c", cfg.to_str().unwrap()], &[("DOTENV_TARGET", "shell")]);
+    // `env_files = false` turns loading off.
+    std::fs::write(&cfg, "[options]\nwebpack_config = \"webpack.config.js\"\n[options.config_env]\nenv_files = false\n").unwrap();
+    let disabled = config_env_targets_with(&["-c", cfg.to_str().unwrap()], &[]);
+    std::fs::remove_file(&cfg).unwrap();
+    // Expansion inside .env uses the same precedence, so `vars` win there too.
+    assert_eq!(with_vars, ["dotenv/vars", "expanded/vars-x"]);
+    assert_eq!(disabled, ["dotenv/none", "expanded/none"]);
 }

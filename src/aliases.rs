@@ -64,14 +64,24 @@ impl Aliases {
         for (k, v) in native {
             a.rules.push(Rule { key: key_for(k)?, targets: vec![Some(v.clone())], base: Some(root.to_path_buf()), url_root: None });
         }
+        let needs_node = opts.webpack_config.is_some() || opts.vite_config.is_some() || opts.babel_config.is_some();
+        let env = EvalEnv {
+            cfg: &opts.config_env,
+            files: if needs_node {
+                let dir = opts.config_env.env_dir.as_ref().map_or(root.to_path_buf(), |d| root.join(d));
+                crate::dotenv::load(&dir, &opts.config_env.env_file_names(), &opts.config_env.vars)?
+            } else {
+                Default::default()
+            },
+        };
         if let Some(file) = &opts.webpack_config {
-            a.add_webpack(&root.join(file), &opts.config_env).with_context(|| format!("loading webpack config {file}"))?;
+            a.add_webpack(&root.join(file), &env).with_context(|| format!("loading webpack config {file}"))?;
         }
         if let Some(file) = &opts.vite_config {
-            a.add_vite(&root.join(file), &opts.config_env).with_context(|| format!("loading vite config {file}"))?;
+            a.add_vite(&root.join(file), &env).with_context(|| format!("loading vite config {file}"))?;
         }
         if let Some(file) = &opts.babel_config {
-            a.add_babel(&root.join(file), &opts.config_env).with_context(|| format!("loading babel config {file}"))?;
+            a.add_babel(&root.join(file), &env).with_context(|| format!("loading babel config {file}"))?;
         }
         Ok(a)
     }
@@ -135,7 +145,7 @@ impl Aliases {
         None
     }
 
-    fn add_webpack(&mut self, file: &Path, env: &ConfigEnv) -> Result<()> {
+    fn add_webpack(&mut self, file: &Path, env: &EvalEnv) -> Result<()> {
         #[derive(Deserialize)]
         struct Entry {
             name: String,
@@ -187,7 +197,7 @@ impl Aliases {
         Ok(())
     }
 
-    fn add_vite(&mut self, file: &Path, env: &ConfigEnv) -> Result<()> {
+    fn add_vite(&mut self, file: &Path, env: &EvalEnv) -> Result<()> {
         #[derive(Deserialize)]
         #[serde(untagged)]
         enum Find {
@@ -226,7 +236,7 @@ impl Aliases {
         Ok(())
     }
 
-    fn add_babel(&mut self, file: &Path, env: &ConfigEnv) -> Result<()> {
+    fn add_babel(&mut self, file: &Path, env: &EvalEnv) -> Result<()> {
         #[derive(Deserialize, Default)]
         #[serde(default)]
         struct Resolver {
@@ -276,7 +286,15 @@ fn key_for(k: &str) -> Result<Key> {
     })
 }
 
-fn run_node(script: &str, file: &Path, env: &ConfigEnv) -> Result<String> {
+/// What a config sees when evaluated: the `config_env` settings plus the
+/// variables loaded from `.env` files.
+struct EvalEnv<'a> {
+    cfg: &'a ConfigEnv,
+    files: std::collections::BTreeMap<String, String>,
+}
+
+fn run_node(script: &str, file: &Path, eval: &EvalEnv) -> Result<String> {
+    let env = eval.cfg;
     let abs = std::fs::canonicalize(file).with_context(|| format!("{} not found", file.display()))?;
     let command = env.command();
     if command != "serve" && command != "build" {
@@ -290,10 +308,13 @@ fn run_node(script: &str, file: &Path, env: &ConfigEnv) -> Result<String> {
     }
     webpack_env.extend(env.webpack_env.clone());
     let args = serde_json::json!({ "mode": env.mode(), "command": command, "webpackEnv": webpack_env });
+    // Precedence: tangle.toml `vars` > shell environment > `.env` files.
+    let from_files = eval.files.iter().filter(|(k, _)| std::env::var_os(k).is_none());
     let out = Command::new("node")
         .args(["-e", script])
+        .envs(from_files)
         .envs(&env.vars)
-        .env("NODE_ENV", env.node_env())
+        .env("NODE_ENV", env.node_env(&eval.files))
         .env("TANGLE_CONFIG_ARGS", args.to_string())
         .env("TANGLE_CONFIG_FILE", &abs)
         .current_dir(abs.parent().unwrap_or(Path::new(".")))

@@ -8,6 +8,8 @@ module.exports = (env, argv) => ({
       "@node-env": at("node-env", process.env.NODE_ENV || "unset"),
       "@var": at("var", process.env.API_TARGET || "none"),
       "@cli": at("cli", env.WEBPACK_BUILD ? "build" : env.WEBPACK_SERVE ? "serve" : "none"),
+      "@dotenv": at("dotenv", process.env.DOTENV_TARGET || "none"),
+      "@expanded": at("expanded", process.env.EXPANDED || "none"),
     },
   },
 });
