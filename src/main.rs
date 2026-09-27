@@ -268,7 +268,7 @@ pub struct Project {
 
 impl Project {
     fn open(path: &Path, config: Option<&Path>, mode: Option<&str>) -> Result<Self> {
-        let dir = std::fs::canonicalize(path).with_context(|| format!("{} not found", path.display()))?;
+        let dir = dunce::canonicalize(path).with_context(|| format!("{} not found", path.display()))?;
         if !dir.is_dir() {
             bail!("{} is not a directory", path.display());
         }
@@ -432,7 +432,7 @@ fn run() -> Result<ExitCode> {
             tui::run(a, |changes| project.rebuild(changes), watcher)?;
         }
         Cmd::Watch { target: t } => {
-            let dir = std::fs::canonicalize(&t.path).with_context(|| format!("{} not found", t.path.display()))?;
+            let dir = dunce::canonicalize(&t.path).with_context(|| format!("{} not found", t.path.display()))?;
             let root = config::find_root(&dir);
             let mut watcher = watch::Watcher::new(&root)?;
             let mut project: Option<Project> = None;
@@ -624,7 +624,7 @@ fn run() -> Result<ExitCode> {
             print!("{}", report::stats(&a.graph, &a.violations, top));
         }
         Cmd::Migrate { path, dry_run, force } => {
-            let dir = std::fs::canonicalize(&path).with_context(|| format!("{} not found", path.display()))?;
+            let dir = dunce::canonicalize(&path).with_context(|| format!("{} not found", path.display()))?;
             let root = config::find_root(&dir);
             let sources = migrate::discover(&root);
             if sources.is_empty() {
@@ -727,7 +727,7 @@ fn run() -> Result<ExitCode> {
                     }
                 }
                 None => {
-                    let existing = migrate::discover(&config::find_root(&std::fs::canonicalize(&path)?));
+                    let existing = migrate::discover(&config::find_root(&dunce::canonicalize(&path)?));
                     if !existing.is_empty() && !force {
                         let names: Vec<String> = existing.iter().map(|s| s.label(&path)).collect();
                         println!("Found existing dependency rules: {}", names.join(", "));

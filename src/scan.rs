@@ -1173,12 +1173,12 @@ export const f = (x) => [module.require("./g"), process.getBuiltinModule("fs"), 
         w("node_modules/field-pkg/browser.js", "");
         w("src/dir/main.js", "");
         w("src/index.js", "");
-        let root = root.canonicalize().unwrap();
+        let root = dunce::canonicalize(&root).unwrap();
         let from = root.join("src/index.js");
         let resolved = |opts: &Options, spec: &str| -> String {
             let r = make_resolver(&root, opts).unwrap();
             match resolve(&r, &from, spec) {
-                Some(Target::Local(p)) => p.strip_prefix(&root).unwrap().to_string_lossy().into_owned(),
+                Some(Target::Local(p)) => p.strip_prefix(&root).unwrap().to_string_lossy().replace('\\', "/"),
                 Some(Target::Builtin(b)) => format!("builtin:{b}"),
                 Some(Target::Npm(n)) => format!("npm:{n}"),
                 other => format!("{other:?}"),
@@ -1192,7 +1192,7 @@ export const f = (x) => [module.require("./g"), process.getBuiltinModule("fs"), 
         browser.resolve.builtins_add = vec!["electron".into()];
         let file = |opts: &Options, spec: &str| {
             let r = make_resolver(&root, opts).unwrap();
-            r.resolve_file(&from, spec).map(|x| x.path().strip_prefix(&root).unwrap().to_string_lossy().into_owned()).unwrap_or_default()
+            r.resolve_file(&from, spec).map(|x| x.path().strip_prefix(&root).unwrap().to_string_lossy().replace('\\', "/")).unwrap_or_default()
         };
         assert_eq!(file(&plain, "cond-pkg"), "node_modules/cond-pkg/i.js");
         assert_eq!(file(&browser, "cond-pkg"), "node_modules/cond-pkg/b.js");
@@ -1252,7 +1252,7 @@ export const f = (x) => [module.require("./g"), process.getBuiltinModule("fs"), 
         let tmp = std::env::temp_dir().join(format!("detangle-inc-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(tmp.join("src/feat")).unwrap();
-        let root = std::fs::canonicalize(&tmp).unwrap();
+        let root = dunce::canonicalize(&tmp).unwrap();
         let w = |rel: &str, body: &str| std::fs::write(root.join(rel), body).unwrap();
         let snapshot = |s: &Session| -> Vec<String> {
             let mut v: Vec<String> = s

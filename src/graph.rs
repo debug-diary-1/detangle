@@ -661,7 +661,7 @@ impl Graph {
         if let Some(i) = self.modules.iter().position(|m| m.id == q) {
             return Ok(i);
         }
-        if let Ok(abs) = std::fs::canonicalize(query)
+        if let Ok(abs) = dunce::canonicalize(query)
             && let Some(i) = self.find(ModuleKind::Local, &self.rel(&abs)) {
                 return Ok(i);
             }

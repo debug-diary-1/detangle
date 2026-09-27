@@ -295,7 +295,7 @@ struct EvalEnv<'a> {
 
 fn run_node(script: &str, file: &Path, eval: &EvalEnv) -> Result<String> {
     let env = eval.cfg;
-    let abs = std::fs::canonicalize(file).with_context(|| format!("{} not found", file.display()))?;
+    let abs = dunce::canonicalize(file).with_context(|| format!("{} not found", file.display()))?;
     let command = env.command();
     if command != "serve" && command != "build" {
         bail!("config_env.command must be \"serve\" or \"build\", not {command:?}");
@@ -437,7 +437,8 @@ mod tests {
 
     fn cands(a: &Aliases, spec: &str) -> Option<Vec<String>> {
         match a.rewrite(spec)? {
-            Rewrite::Candidates(c) => Some(c),
+            // Joined paths use the platform's separator.
+            Rewrite::Candidates(c) => Some(c.into_iter().map(|p| p.replace('\\', "/")).collect()),
             Rewrite::Ignore => Some(vec!["<ignored>".into()]),
         }
     }

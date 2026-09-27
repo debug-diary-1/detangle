@@ -82,7 +82,7 @@ fn load_json(path: &Path) -> Result<Value> {
             return Ok(v);
         }
     }
-    let abs = std::fs::canonicalize(path).with_context(|| format!("{} not found", path.display()))?;
+    let abs = dunce::canonicalize(path).with_context(|| format!("{} not found", path.display()))?;
     let out = Command::new("node")
         .args(["-e", LOADER])
         .env("DETANGLE_DC_CONFIG", &abs)

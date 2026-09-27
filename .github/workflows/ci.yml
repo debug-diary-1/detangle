@@ -27,7 +27,7 @@ jobs:
           node-version: 22
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets --locked -- -D warnings
-      - run: cargo test --locked
+      - run: cargo test --locked --no-fail-fast
 
   npm-packaging:
     name: npm packaging
