@@ -37,6 +37,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.94
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --locked --all-targets
+      # What `cargo install detangle` does: no lockfile, newest compatible
+      # dependencies whatever their rust-version. Fails when a dependency
+      # release needs a newer Rust than we declare.
+      - name: Build like cargo install (no lockfile, newest dependencies)
+        env:
+          CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS: allow
+        run: |
+          rm Cargo.lock
+          cargo build --release
 
   npm-packaging:
     name: npm packaging

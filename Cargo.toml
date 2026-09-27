@@ -1,6 +1,6 @@
 [package]
 name = "detangle"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 rust-version = "1.94"
 description = "Fast dependency analysis and architecture rules for JavaScript and TypeScript"
@@ -26,7 +26,10 @@ oxc_allocator = "0.139.0"
 oxc_ast = "0.139.0"
 oxc_ast_visit = "0.139.0"
 oxc_parser = "0.139.0"
-oxc_resolver = { version = "11.23.0", features = ["yarn_pnp"] }
+# 11.24 needs Rust 1.95, and `cargo install` (without --locked) picks the
+# newest compatible release regardless of rust-version; keep within 11.23
+# until the minimum Rust version moves.
+oxc_resolver = { version = ">=11.23.0, <11.24", features = ["yarn_pnp"] }
 oxc_span = "0.139.0"
 petgraph = "0.8.3"
 ratatui = "0.30.2"
