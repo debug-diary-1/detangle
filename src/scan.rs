@@ -312,6 +312,8 @@ pub struct Session {
     opts: Options,
     resolver: Resolvers,
     files: Vec<ScannedFile>,
+    /// Position of each file, by path; built on the first `update` (one-shot
+    /// commands never need it).
     index: HashMap<PathBuf, usize>,
     pub work: Work,
 }
@@ -337,7 +339,7 @@ impl Session {
             f.resolve(&resolver);
             f
         })?;
-        files.sort_unstable_by(|a, b| path_cmp(&a.path, &b.path));
+        files.sort_by_cached_key(|f| path_key(&f.path));
         // Rewrite the cache only when a file changed or went away.
         let changed = fresh.into_inner() || seen.into_inner() != cached.files.len();
         if let Some(d) = &cache_dir
@@ -355,7 +357,6 @@ impl Session {
             index: HashMap::new(),
             work: Work::default(),
         };
-        s.reindex();
         let n = s.files.len();
         s.work = Work { walked: true, reparsed: n, reresolved: n, graph_changed: true, scan_ms: ms(t) };
         Ok(s)
@@ -380,6 +381,9 @@ impl Session {
         let mut work = Work::default();
         // Decide from the filesystem, not from event kinds: watchers (notably
         // macOS FSEvents) often report a plain save as a create.
+        if self.index.len() != self.files.len() {
+            self.reindex();
+        }
         let structural = changed.iter().any(|p| match self.index.get(p) {
             Some(_) => !p.is_file(),                                      // removed
             None if p.is_file() => has_source_ext(p),                     // added
@@ -469,16 +473,16 @@ fn globset(patterns: &[String]) -> Result<Option<GlobSet>> {
 /// the include/exclude globs, which are matched against root-relative paths.
 pub fn discover(root: &Path, dir: &Path, opts: &Options) -> Result<Vec<PathBuf>> {
     let mut files = walk_sources(root, dir, opts, |p| p)?;
-    files.sort_unstable_by(|a, b| path_cmp(a, b));
+    files.sort_by_cached_key(|p| path_key(p));
     Ok(files)
 }
 
-/// The same order as `Path::cmp` (component by component) for the
-/// normalised paths the walker produces, but much faster: bytewise, with
-/// separators sorting before everything else.
-fn path_cmp(a: &Path, b: &Path) -> std::cmp::Ordering {
-    let key = |c: &u8| if std::path::is_separator(char::from(*c)) { 0 } else { *c };
-    a.as_os_str().as_encoded_bytes().iter().map(key).cmp(b.as_os_str().as_encoded_bytes().iter().map(key))
+/// A sort key giving `Path::cmp`'s order (component by component) for the
+/// normalised paths the walker produces: the bytes, with separators mapped
+/// below everything else. Keys compare with memcmp, far faster than
+/// comparing paths (13 ms → 1 ms for VS Code's 10k files).
+fn path_key(p: &Path) -> Vec<u8> {
+    p.as_os_str().as_encoded_bytes().iter().map(|&c| if std::path::is_separator(char::from(c)) { 0 } else { c }).collect()
 }
 
 /// Like `discover`, but maps each source file with `f` on the walker thread
@@ -1038,11 +1042,11 @@ mod tests {
     }
 
     #[test]
-    fn path_cmp_orders_like_path_cmp() {
+    fn path_key_orders_like_path_cmp() {
         let names = ["/a/b", "/a.b", "/a/b/c", "/a-b/c", "/a/b.ts", "/a/bc", "/a/b-c/d", "/a", "/ab", "/a/B", "/a/_b"];
         let mut fast: Vec<&Path> = names.iter().map(Path::new).collect();
         let mut std = fast.clone();
-        fast.sort_by(|a, b| path_cmp(a, b));
+        fast.sort_by_cached_key(|p| path_key(p));
         std.sort();
         assert_eq!(fast, std);
     }
