@@ -423,7 +423,7 @@ pub fn html(g: &Graph, vs: &[Violation], config: Option<&std::path::Path>) -> St
         "v": vs.iter().map(|v| json!({
             "r": v.rule,
             "s": v.severity.as_str(),
-            "sc": if v.scope == crate::config::Scope::Folder { "folder" } else { "module" },
+            "sc": v.scope,
             "f": v.source_id(g),
             "t": v.target_id(g),
             "c": v.cycle_ids(g),

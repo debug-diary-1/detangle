@@ -97,8 +97,24 @@ pub struct Config {
     /// Modules matching `module` must depend on something matching `to`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub required: Vec<RequiredRule>,
+    /// Named, tagged groups of modules (features, layers, packages…) for
+    /// `scope = "group"` rules and `tags` conditions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<GroupDef>,
 }
 
+/// A kind of group. Each distinct match of `path` (at the start of a module
+/// path) is one group instance: `^src/features/[^/]+` makes every feature
+/// folder its own group. A module belongs to the first definition matching it.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GroupDef {
+    /// The group's type; also usable as a tag.
+    pub name: String,
+    pub path: Pat,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+}
 impl Default for Config {
     fn default() -> Self {
         toml::from_str(DEFAULT_CONFIG).expect("built-in config is valid")
@@ -113,6 +129,7 @@ impl Config {
             allowed: vec![],
             allowed_severity: Severity::Warn,
             required: vec![],
+            groups: vec![],
         }
     }
 }
@@ -168,6 +185,10 @@ pub struct Options {
     /// `tangle migrate`), relative to the root.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub baseline: Option<String>,
+    /// Discover Nx projects (project.json, package.json "nx") on every run
+    /// and treat each as a group with its tags (+ `projectType:<type>`).
+    #[serde(skip_serializing_if = "is_false")]
+    pub nx_projects: bool,
     /// How Vite / webpack / Babel configs are evaluated.
     #[serde(default, skip_serializing_if = "ConfigEnv::is_default")]
     pub config_env: ConfigEnv,
@@ -275,6 +296,7 @@ impl Default for Options {
             vite_config: None,
             config_env: ConfigEnv::default(),
             baseline: None,
+            nx_projects: false,
             babel_config: None,
         }
     }
@@ -367,6 +389,8 @@ pub enum Scope {
     #[default]
     Module,
     Folder,
+    /// The group graph: one node per group instance (see `[[groups]]`).
+    Group,
 }
 
 impl Scope {
@@ -406,11 +430,25 @@ pub struct FromSpec {
     pub path_not: Option<Pat>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub orphan: Option<bool>,
+    /// Has at least one of these tags (Nx-style patterns: `*` globs, `/regex/`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tags: Option<Vec<String>>,
+    /// Has none of these tags.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tags_not: Option<Vec<String>>,
+    /// Has all of these tags.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tags_all: Option<Vec<String>>,
 }
 
 impl FromSpec {
     fn is_empty(&self) -> bool {
-        self.path.is_none() && self.path_not.is_none() && self.orphan.is_none()
+        self.path.is_none()
+            && self.path_not.is_none()
+            && self.orphan.is_none()
+            && self.tags.is_none()
+            && self.tags_not.is_none()
+            && self.tags_all.is_none()
     }
 }
 
@@ -485,6 +523,14 @@ pub struct ToSpec {
     pub license: Option<Pat>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub license_not: Option<Pat>,
+    /// Target has at least one / none of these tags.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tags: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tags_not: Option<Vec<String>>,
+    /// Module scope: source and target are in different group instances.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cross_group: Option<bool>,
 }
 
 impl ToSpec {

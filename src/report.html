@@ -259,7 +259,7 @@ function renderViolations() {
     const g = h("div", { class: "group" + (openGroups.has(rule) || q ? " open" : "") });
     const head = h("div", { class: "ghead", onclick: () => { g.classList.toggle("open"); g.classList.contains("open") ? openGroups.add(rule) : openGroups.delete(rule); fill(); } },
       h("span", { class: "caret" }, "▸"), h("span", { class: "sev " + list[0].s }, list[0].s), h("span", { class: "name" }, rule),
-      list[0].sc === "folder" ? h("span", { class: "scope" }, "folder scope") : null,
+      list[0].sc !== "module" ? h("span", { class: "scope" }, list[0].sc + " scope") : null,
       h("span", { class: "count" }, fmt(list.length)), h("span", { class: "comment", title: D.rc[rule] || "" }, D.rc[rule] || ""));
     const rows = h("div", { class: "rows" });
     let shown = 0;
@@ -270,7 +270,7 @@ function renderViolations() {
     const more = () => {
       const next = Math.min(list.length, shown + 200);
       for (const v of list.slice(shown, next)) {
-        const line = h("div", {}, v.sc === "folder" ? pathEl(v.f) : idLink(v.f), v.t ? [h("span", { class: "arrow" }, "→"), v.sc === "folder" ? pathEl(v.t) : idLink(v.t)] : null);
+        const line = h("div", {}, v.sc !== "module" ? pathEl(v.f) : idLink(v.f), v.t ? [h("span", { class: "arrow" }, "→"), v.sc !== "module" ? pathEl(v.t) : idLink(v.t)] : null);
         rows.append(h("div", { class: "row" }, line, v.c.length > 1 ? h("div", { class: "cyc" }, "cycle: " + v.c.join(" → ")) : null));
       }
       shown = next;
@@ -289,7 +289,7 @@ $("#vexpand").addEventListener("click", () => { const all = openGroups.size === 
 
 // ── modules ─────────────────────────────────────────────────────────────
 const violCount = new Int32Array(N);
-for (const v of D.v) if (v.sc !== "folder") { for (const id of [v.f, v.t]) { const i = id && byId.get(id + "\u0000" + 0); if (i !== undefined && i !== null && i !== "") violCount[i]++; } }
+for (const v of D.v) if (v.sc === "module") { for (const id of [v.f, v.t]) { const i = id && byId.get(id + "\u0000" + 0); if (i !== undefined && i !== null && i !== "") violCount[i]++; } }
 const COLS = [
   ["Module", (i) => D.m[i], false], ["In", (i) => inc[i].length, true], ["Out", (i) => out[i].length, true],
   ["Instability", instability, true], ["Cycle", (i) => (D.cy[i] < 0 ? -1 : D.cycles[D.cy[i]].length), true], ["Violations", (i) => violCount[i], true]];
@@ -335,7 +335,7 @@ function openModule(i, stay) {
   selected = i;
   if (!stay) { show("modules"); if (!mExt && !local(i)) { mExt = true; $("#mext").classList.add("on"); } $("#mq").value = D.m[i]; }
   renderModules();
-  const vs = D.v.filter((v) => v.sc !== "folder" && (v.f === D.m[i] || v.t === D.m[i]));
+  const vs = D.v.filter((v) => v.sc === "module" && (v.f === D.m[i] || v.t === D.m[i]));
   const cy = D.cy[i];
   fill($("#mdrawer"),
     h("h3", {}, D.m[i]),

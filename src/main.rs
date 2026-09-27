@@ -2,6 +2,7 @@ mod aliases;
 mod config;
 mod dotenv;
 mod graph;
+mod groups;
 mod migrate;
 mod report;
 mod rules;
@@ -207,6 +208,8 @@ pub struct Project {
     config_path: Option<PathBuf>,
     /// Notes from loading the config (e.g. JavaScript config import warnings).
     notes: Vec<String>,
+    /// `[[groups]]` and discovered Nx projects.
+    groups: Vec<groups::Group>,
     session: scan::Session,
 }
 
@@ -227,7 +230,9 @@ impl Project {
             None => "in the built-in rules".into(),
         })?;
         let session = scan::Session::new(&root, &dir, &cfg.options)?;
+        let groups = groups::resolve(&root, &cfg)?;
         Ok(Project {
+            groups,
             dir,
             root,
             config_arg: config.map(Path::to_path_buf),
@@ -249,7 +254,8 @@ impl Project {
     }
 
     fn analyze_with(&self, use_baseline: bool) -> Result<Analysis> {
-        let graph = Graph::build(&self.root, self.session.files(), self.session.work, &self.cfg.options);
+        let mut graph = Graph::build(&self.root, self.session.files(), self.session.work, &self.cfg.options);
+        graph.assign_groups(&self.groups);
         let mut violations = rules::evaluate(&graph, &self.cfg)?;
         let suppressed = match self.baseline_path().filter(|p| use_baseline && p.is_file()) {
             Some(p) => rules::apply_baseline(&graph, &mut violations, &p)?,

@@ -252,6 +252,10 @@ impl<'a> App<'a> {
         for (i, v) in a.violations.iter().enumerate() {
             let touched: Vec<usize> = match v.scope {
                 Scope::Module => std::iter::once(v.from).chain(v.to).collect(),
+                Scope::Group => std::iter::once(v.from)
+                    .chain(v.to)
+                    .flat_map(|gi| (0..n).filter(move |&m| g.group_of.get(m).copied().flatten() == Some(gi)).collect::<Vec<_>>())
+                    .collect(),
                 Scope::Folder => std::iter::once(v.source_id(g))
                     .chain(v.target_id(g))
                     .flat_map(|f| by_folder.get(f).cloned().unwrap_or_default())
@@ -602,10 +606,13 @@ impl<'a> App<'a> {
         let Some(m) = target else { return };
         match v.scope {
             Scope::Module => self.goto(m),
-            Scope::Folder => {
-                // Show the folder's modules.
-                let folder = &v.graph(self.g).modules[m].id;
-                self.filter = if folder == "." { String::new() } else { format!("{folder}/") };
+            Scope::Folder | Scope::Group => {
+                // Show the folder's / group's modules.
+                let folder = match v.scope {
+                    Scope::Group => self.g.groups().group_roots[m].clone(),
+                    _ => v.graph(self.g).modules[m].id.clone(),
+                };
+                self.filter = if folder == "." || folder.is_empty() { String::new() } else { format!("{folder}/") };
                 self.tab = Tab::Modules;
                 self.pane = Pane::List;
                 self.rebuild();

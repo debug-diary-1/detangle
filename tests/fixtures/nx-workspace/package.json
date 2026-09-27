@@ -1,0 +1,7 @@
+{
+  "name": "@org/source",
+  "private": true,
+  "dependencies": {
+    "lodash": "4"
+  }
+}

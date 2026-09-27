@@ -1,0 +1,118 @@
+{
+  "settings": {
+    "boundaries/elements": [
+      {
+        "type": "app",
+        "pattern": "src/app"
+      },
+      {
+        "type": "feature",
+        "pattern": "src/features/*"
+      },
+      {
+        "type": "ui",
+        "pattern": "src/ui/*"
+      },
+      {
+        "type": "util",
+        "pattern": "src/utils"
+      }
+    ]
+  },
+  "rules": {
+    "boundaries/dependencies": [
+      "error",
+      {
+        "default": "disallow",
+        "policies": [
+          {
+            "from": {
+              "element": {
+                "type": "app"
+              }
+            },
+            "allow": {
+              "to": {
+                "element": {
+                  "types": {
+                    "anyOf": [
+                      "feature",
+                      "ui",
+                      "util"
+                    ]
+                  }
+                }
+              }
+            }
+          },
+          {
+            "from": {
+              "element": {
+                "type": "feature"
+              }
+            },
+            "allow": [
+              {
+                "to": {
+                  "element": {
+                    "type": "ui"
+                  }
+                }
+              },
+              {
+                "to": {
+                  "element": {
+                    "type": "util"
+                  }
+                }
+              }
+            ]
+          },
+          {
+            "from": {
+              "element": {
+                "type": "ui"
+              }
+            },
+            "allow": {
+              "to": {
+                "element": {
+                  "type": "util"
+                }
+              }
+            }
+          },
+          {
+            "from": {
+              "element": {
+                "type": "feature"
+              }
+            },
+            "disallow": {
+              "to": {
+                "element": {
+                  "type": "util"
+                }
+              }
+            },
+            "message": "features must not use utils directly"
+          },
+          {
+            "from": {
+              "element": {
+                "type": "!app"
+              }
+            },
+            "disallow": {
+              "to": {
+                "element": {
+                  "type": "app"
+                }
+              }
+            }
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -33,6 +33,7 @@ impl Violation {
         match self.scope {
             Scope::Module => g,
             Scope::Folder => g.folders(),
+            Scope::Group => g.groups(),
         }
     }
 
@@ -67,6 +68,7 @@ pub fn canonical_type(name: &str) -> Option<&'static str> {
         "require" | "exotic-require" | "import-equals" => "require",
         "reexport" | "export" => "reexport",
         "resource" => "resource",
+        "relative" => "relative",
         "import" => "import",
         "deprecated" => "deprecated",
         "aliased" | "aliased-tsconfig" | "aliased-tsconfig-paths" | "aliased-tsconfig-base-url"
@@ -192,6 +194,7 @@ fn types(list: &Option<Vec<String>>, rule: &str) -> Result<Option<Vec<&'static s
 
 /// A compiled `from` + `to` pair.
 struct Compiled<'r> {
+    from: &'r FromSpec,
     to: &'r ToSpec,
     from_orphan: Option<bool>,
     source: Source,
@@ -204,12 +207,13 @@ struct Compiled<'r> {
     license_not: Option<Regex>,
 }
 
-fn compile<'r>(name: &str, from: &FromSpec, to: &'r ToSpec) -> Result<Compiled<'r>> {
+fn compile<'r>(name: &str, from: &'r FromSpec, to: &'r ToSpec) -> Result<Compiled<'r>> {
     if to.reachable.is_some() && from.path.is_none() {
         bail!("rule '{name}': `to.reachable` needs `from.path` to name the entry points");
     }
     let via = |v: &Option<PathSpec>| v.as_ref().map(|v| Target::new(&v.path, &v.path_not, name)).transpose();
     Ok(Compiled {
+        from,
         to,
         from_orphan: from.orphan,
         source: Source::new(&from.path, &from.path_not, name)?,
@@ -331,6 +335,7 @@ impl<'g> Ctx<'g> {
         let g = self.g;
         match t {
             "import" => !e.flags.require && !e.flags.dynamic,
+            "relative" => e.specifier.starts_with('.') || e.specifier.starts_with('/'),
             "aliased" => g.modules[e.to].kind == ModuleKind::Local && is_bare(&e.specifier),
             "deprecated" => {
                 g.modules[e.to].kind == ModuleKind::Npm && self.pkg_meta(e.from, &g.modules[e.to].id).is_some_and(|m| m.deprecated)
@@ -340,7 +345,24 @@ impl<'g> Ctx<'g> {
     }
 }
 
+/// `tags` (any of) / `tags_not` (none of) / `tags_all` (all of).
+fn tags_ok(tags: &[String], any: &Option<Vec<String>>, none: &Option<Vec<String>>, all: Option<&Vec<String>>) -> bool {
+    use crate::groups::{has_any, tag_matches};
+    any.as_ref().is_none_or(|p| has_any(p, tags))
+        && !none.as_ref().is_some_and(|p| has_any(p, tags))
+        && all.is_none_or(|p| p.iter().all(|pat| tags.iter().any(|t| tag_matches(pat, t))))
+}
+
 impl Compiled<'_> {
+    /// Does module `m` satisfy `from` (tags and path)? Yields path captures.
+    fn source_ok(&self, cx: &Ctx, m: usize) -> Option<Caps> {
+        let f = self.from;
+        if !tags_ok(&cx.g.modules[m].tags, &f.tags, &f.tags_not, f.tags_all.as_ref()) {
+            return None;
+        }
+        self.source.matches(&cx.names(m))
+    }
+
     /// Whether edge `i` matches; returns the cycle witness for circular edges.
     fn edge_matches(&self, cx: &mut Ctx, i: usize, caps: &[String]) -> Option<Vec<usize>> {
         let g = cx.g;
@@ -366,6 +388,19 @@ impl Compiled<'_> {
             && list.iter().any(|x| cx.edge_has_type(e, x))
         {
             return None;
+        }
+        if !tags_ok(&to.tags, &t.tags, &t.tags_not, None) {
+            return None;
+        }
+        if let Some(want) = t.cross_group {
+            let cross = match (g.group_of.get(e.from).copied().flatten(), g.group_of.get(e.to).copied().flatten()) {
+                (Some(a), Some(b)) => a != b,
+                // On the group graph every edge joins two different groups.
+                _ => g.group_of.is_empty(),
+            };
+            if cross != want {
+                return None;
+            }
         }
         if !cx.target_matches(&self.target, e.to, caps) {
             return None;
@@ -430,7 +465,7 @@ fn for_each_edge(cx: &mut Ctx, c: &Compiled, mut f: impl FnMut(usize, Vec<usize>
         if g.out[m].is_empty() {
             continue;
         }
-        let Some(caps) = c.source.matches(&cx.names(m)) else { continue };
+        let Some(caps) = c.source_ok(cx, m) else { continue };
         for &i in &g.out[m] {
             if let Some(cycle) = c.edge_matches(cx, i, &caps) {
                 f(i, cycle);
@@ -475,14 +510,14 @@ fn eval_forbidden(cx: &mut Ctx, rule: &Rule, out: &mut Vec<Violation>) -> Result
     let c = compile(&rule.name, &rule.from, &rule.to)?;
     if c.from_orphan == Some(true) {
         for m in 0..n {
-            if g.is_orphan(m) && c.source.matches(&cx.names(m)).is_some() {
+            if g.is_orphan(m) && c.source_ok(cx, m).is_some() {
                 out.push(violation(m, None, vec![]));
             }
         }
     } else if let Some(reachable) = rule.to.reachable {
         let entries: Vec<usize> = (0..n)
             .filter(|&m| g.modules[m].kind == ModuleKind::Local)
-            .filter(|&m| c.source.matches(&[g.modules[m].id.as_str()]).is_some())
+            .filter(|&m| c.source_ok(cx, m).is_some())
             .collect();
         if entries.is_empty() {
             return Ok(());
@@ -511,12 +546,17 @@ pub fn evaluate(g: &Graph, cfg: &Config) -> Result<Vec<Violation>> {
     let mut cx = Ctx::new(g);
     let n = g.modules.len();
     let mut folder_cx: Option<Ctx> = None;
+    let mut group_cx: Option<Ctx> = None;
     for rule in cfg.forbidden.iter().filter(|r| r.severity != Severity::Off) {
         match rule.scope {
             Scope::Module => eval_forbidden(&mut cx, rule, &mut out)?,
             Scope::Folder => {
                 let fcx = folder_cx.get_or_insert_with(|| Ctx::new(g.folders()));
                 eval_forbidden(fcx, rule, &mut out)?;
+            }
+            Scope::Group => {
+                let gcx = group_cx.get_or_insert_with(|| Ctx::new(g.groups()));
+                eval_forbidden(gcx, rule, &mut out)?;
             }
         }
     }

@@ -39,6 +39,9 @@ pub struct Module {
     /// Parsed by tangle (as opposed to e.g. a .css/.json file that was only imported).
     pub scanned: bool,
     pub parse_errors: usize,
+    /// Tags from the module's group (or the group's own, on the group graph).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -80,6 +83,11 @@ pub struct Graph {
     folders: std::sync::OnceLock<Box<Graph>>,
     /// Folder graphs only: (afferent, efferent) module-level coupling per node.
     couplings: Vec<(u32, u32)>,
+    /// Group instance of each module (index into `groups()`), if any.
+    pub group_of: Vec<Option<usize>>,
+    groups: Option<Box<Graph>>,
+    /// Group graphs only: each node's root path.
+    pub group_roots: Vec<String>,
 }
 
 impl Graph {
@@ -98,6 +106,9 @@ impl Graph {
             cycles_ignore_type_only: opts.cycles_ignore_type_only,
             folders: Default::default(),
             couplings: vec![],
+            group_of: vec![],
+            groups: None,
+            group_roots: vec![],
         };
         for f in files {
             let id = g.rel(&f.path);
@@ -184,6 +195,104 @@ impl Graph {
         self.find_cycles(self.cycles_ignore_type_only);
     }
 
+    /// Assigns modules to groups (first matching definition wins), gives
+    /// them their group's tags, and builds the group graph.
+    pub fn assign_groups(&mut self, defs: &[crate::groups::Group]) {
+        let mut g = Graph {
+            root: self.root.clone(),
+            modules: vec![],
+            edges: vec![],
+            out: vec![],
+            inc: vec![],
+            cycles: vec![],
+            cycle_of: vec![],
+            timings: self.timings,
+            index: Default::default(),
+            cycles_ignore_type_only: self.cycles_ignore_type_only,
+            folders: Default::default(),
+            couplings: vec![],
+            group_of: vec![],
+            groups: None,
+            group_roots: vec![],
+        };
+        self.group_of = vec![None; self.modules.len()];
+        if !defs.is_empty() {
+            for m in 0..self.modules.len() {
+                if self.modules[m].kind != ModuleKind::Local {
+                    continue;
+                }
+                let Some((def, (label, root))) = defs.iter().find_map(|d| d.instance(&self.modules[m].id).map(|i| (d, i))) else {
+                    continue;
+                };
+                let i = match g.index[ModuleKind::Local as usize].get(&label) {
+                    Some(&i) => i,
+                    None => {
+                        let i = g.intern(ModuleKind::Local, label);
+                        g.modules[i].tags = def.tags.clone();
+                        g.group_roots.push(root);
+                        i
+                    }
+                };
+                g.modules[i].scanned |= self.modules[m].scanned;
+                self.modules[m].tags = def.tags.clone();
+                self.group_of[m] = Some(i);
+            }
+            let mut seen: HashMap<(usize, usize), usize> = HashMap::default();
+            for e in &self.edges {
+                let (Some(a), Some(b)) = (self.group_of[e.from], self.group_of[e.to]) else { continue };
+                if a == b {
+                    continue;
+                }
+                match seen.get(&(a, b)) {
+                    Some(&i) => {
+                        let ge = &mut g.edges[i];
+                        ge.flags = ge.flags.merge(e.flags);
+                        for t in &e.types {
+                            if !ge.types.contains(t) {
+                                ge.types.push(t);
+                            }
+                        }
+                    }
+                    None => {
+                        seen.insert((a, b), g.edges.len());
+                        g.edges.push(Edge { from: a, to: b, circular: false, ..e.clone() });
+                    }
+                }
+            }
+            for ge in &mut g.edges {
+                ge.types.retain(|t| !matches!(*t, "type-only" | "dynamic" | "require" | "reexport" | "resource"));
+                ge.types = edge_types(std::mem::take(&mut ge.types), ge.flags);
+            }
+        }
+        g.link();
+        self.groups = Some(Box::new(g));
+    }
+
+    /// The group graph (empty until `assign_groups`).
+    pub fn groups(&self) -> &Graph {
+        static EMPTY: std::sync::OnceLock<Graph> = std::sync::OnceLock::new();
+        match &self.groups {
+            Some(g) => g,
+            None => EMPTY.get_or_init(|| Graph {
+                root: PathBuf::new(),
+                modules: vec![],
+                edges: vec![],
+                out: vec![],
+                inc: vec![],
+                cycles: vec![],
+                cycle_of: vec![],
+                timings: Timings::default(),
+                index: Default::default(),
+                cycles_ignore_type_only: true,
+                folders: Default::default(),
+                couplings: vec![],
+                group_of: vec![],
+                groups: None,
+                group_roots: vec![],
+            }),
+        }
+    }
+
     /// The folder a module belongs to: `src/features/cart` for
     /// `src/features/cart/cart.ts`, `.` for root-level files.
     pub fn folder_of(&self, m: usize) -> Option<String> {
@@ -218,6 +327,9 @@ impl Graph {
                 cycles_ignore_type_only: self.cycles_ignore_type_only,
                 folders: Default::default(),
                 couplings: vec![],
+                group_of: vec![],
+                groups: None,
+                group_roots: vec![],
             };
             for (m, module) in self.modules.iter().enumerate() {
                 if module.kind != ModuleKind::Local {
@@ -306,7 +418,7 @@ impl Graph {
         }
         let i = self.modules.len();
         self.index[kind as usize].insert(id.clone(), i);
-        self.modules.push(Module { id, kind, scanned: false, parse_errors: 0 });
+        self.modules.push(Module { id, kind, scanned: false, parse_errors: 0, tags: vec![] });
         i
     }
 

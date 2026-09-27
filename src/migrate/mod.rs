@@ -194,16 +194,25 @@ pub fn migrate(root: &Path, sources: &[Source]) -> Result<Migration> {
         }
         m.converted.push((label.clone(), imported.summary.clone()));
         options.push((label, imported.config.options.clone()));
+        // Rules from earlier sources; one source may use a name several times.
+        let earlier = m.config.forbidden.len();
         for rule in imported.config.forbidden {
-            add_rule(&mut m, rule);
+            add_rule(&mut m, rule, earlier);
         }
         if !imported.config.allowed.is_empty() {
             m.config.allowed.extend(imported.config.allowed);
             m.config.allowed_severity = imported.config.allowed_severity;
         }
         m.config.required.extend(imported.config.required);
+        for g in imported.config.groups {
+            if !m.config.groups.contains(&g) {
+                m.config.groups.push(g);
+            }
+        }
     }
     m.config.options = merge_options(options, &mut m.warnings);
+    let mut seen = std::collections::HashSet::new();
+    m.warnings.retain(|w| seen.insert(w.clone()));
 
     if let Some(file) = known.first() {
         match baseline::convert(file) {
@@ -224,17 +233,19 @@ fn shape(r: &Rule) -> String {
     toml::to_string(&r).unwrap_or_default()
 }
 
-fn add_rule(m: &mut Migration, rule: Rule) {
+fn add_rule(m: &mut Migration, rule: Rule, earlier: usize) {
     let s = shape(&rule);
     if let Some(existing) = m.config.forbidden.iter_mut().find(|r| shape(r) == s) {
         m.merged.push(format!("{} = {} (kept the stricter severity)", rule.name, existing.name));
         existing.severity = existing.severity.max(rule.severity);
         return;
     }
-    // Different rules with the same name would be confusing in reports.
+    // A different rule from another source with the same name would be
+    // confusing in reports, so rename; a source's own same-named rules
+    // (e.g. one per Nx constraint) stay grouped under one name.
     let mut rule = rule;
-    let taken = |n: &str, rules: &[Rule]| rules.iter().any(|r| r.name == n && shape(r) != s);
-    if taken(&rule.name, &m.config.forbidden) && !rule.name.starts_with("import") {
+    let taken = |n: &str, rules: &[Rule]| rules[..earlier].iter().any(|r| r.name == n && shape(r) != s);
+    if taken(&rule.name, &m.config.forbidden) {
         let mut i = 2;
         while taken(&format!("{}-{i}", rule.name), &m.config.forbidden) {
             i += 1;
@@ -269,6 +280,7 @@ fn merge_options(list: Vec<(String, Options)>, warnings: &mut Vec<String>) -> Op
         take!(config_env);
         take!(ignore_type_only);
         take!(cycles_ignore_type_only);
+        take!(nx_projects);
         for g in &o.exclude {
             if !out.exclude.contains(g) {
                 out.exclude.push(g.clone());

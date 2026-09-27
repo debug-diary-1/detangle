@@ -1,0 +1,29 @@
+{
+  "compilerOptions": {
+    "baseUrl": ".",
+    "allowJs": true,
+    "paths": {
+      "@org/shop-app": [
+        "apps/shop/src/index.js"
+      ],
+      "@org/shop-feature": [
+        "libs/shop/feature/src/index.js"
+      ],
+      "@org/shop-ui": [
+        "libs/shop/ui/src/index.js"
+      ],
+      "@org/shared-util": [
+        "libs/shared/util/src/index.js"
+      ],
+      "@org/shared-data": [
+        "libs/shared/data/src/index.js"
+      ],
+      "@org/admin-feature": [
+        "libs/admin/feature/src/index.js"
+      ],
+      "@org/legacy": [
+        "libs/legacy/src/index.js"
+      ]
+    }
+  }
+}

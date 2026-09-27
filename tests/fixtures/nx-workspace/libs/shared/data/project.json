@@ -1,0 +1,1 @@
+{ "name": "shared-data", "projectType": "library", "sourceRoot": "libs/shared/data/src", "tags": ["scope:shared", "type:util"] }

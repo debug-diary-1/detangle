@@ -56,6 +56,7 @@ fn is_config(name: &str) -> bool {
         || name.starts_with("babel.config.")
         || name.starts_with(".babelrc")
         || name.starts_with(".env")
+        || name == "project.json"
 }
 
 impl Watcher {

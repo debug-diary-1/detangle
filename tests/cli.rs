@@ -474,3 +474,99 @@ fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
         }
     }
 }
+
+/// Migrates a fixture copy and returns the imports flagged by `tangle check`
+/// as (file, specifier) — group-scope violations expanded to their imports.
+fn migrated_flagged_imports(fixture: &str) -> std::collections::BTreeSet<(String, String)> {
+    let dir = std::env::temp_dir().join(format!("tangle-{fixture}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    copy_dir(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(fixture), &dir);
+    let run = |args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_tangle")).args(args).current_dir(&dir).env("NO_COLOR", "1").output().unwrap();
+        String::from_utf8(out.stdout).unwrap()
+    };
+    run(&["migrate"]);
+    let violations: serde_json::Value = serde_json::from_str(&run(&["check", "-f", "json"])).unwrap();
+    let graph: serde_json::Value = serde_json::from_str(&run(&["graph", "-f", "json", "--externals"])).unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+    let modules = graph["modules"].as_array().unwrap();
+    // Group ids are Nx project names or element folders; map both to folders.
+    let root_of = |id: &str| -> String {
+        modules
+            .iter()
+            .filter_map(|m| m["id"].as_str())
+            .find(|m| m.starts_with(&format!("{id}/")))
+            .map(|_| id.to_string())
+            .unwrap_or_else(|| {
+                // Nx project name → its folder (project.json "name").
+                walk_project_json(&graph, id)
+            })
+    };
+    let mut out = std::collections::BTreeSet::new();
+    for v in violations.as_array().unwrap() {
+        let (from, to) = (v["from"].as_str().unwrap(), v["to"].as_str());
+        for m in modules {
+            let id = m["id"].as_str().unwrap();
+            for d in m["dependencies"].as_array().unwrap() {
+                let target = d["module"].as_str().unwrap();
+                let hit = if v["scope"] == "group" {
+                    id.starts_with(&format!("{}/", root_of(from))) && to.is_none_or(|t| target.starts_with(&format!("{}/", root_of(t))))
+                } else {
+                    id == from && to == Some(target)
+                };
+                if hit {
+                    out.insert((id.to_string(), d["specifier"].as_str().unwrap().to_string()));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Nx fixture project names → roots (from the files in the fixture).
+fn walk_project_json(_graph: &serde_json::Value, name: &str) -> String {
+    let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/nx-workspace");
+    for dir in ["apps/shop", "libs/shop/feature", "libs/shop/ui", "libs/shared/util", "libs/shared/data", "libs/admin/feature", "libs/legacy"] {
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(base.join(dir).join("project.json")).unwrap()).unwrap();
+        if v["name"] == name {
+            return dir.to_string();
+        }
+    }
+    panic!("unknown project {name}")
+}
+
+#[test]
+fn nx_boundaries_match_nx() {
+    // Exactly the imports real Nx 21 (@nx/enforce-module-boundaries) flags on this workspace.
+    let expected: std::collections::BTreeSet<(String, String)> = [
+        ("apps/shop/src/index.js", "@org/shop-feature"),
+        ("libs/admin/feature/src/index.js", "../../../shared/util/src/index.js"),
+        ("libs/legacy/src/index.js", "@org/shared-util"),
+        ("libs/shared/data/src/index.js", "@org/shared-util"),
+        ("libs/shared/util/src/index.js", "@org/shared-data"),
+        ("libs/shop/feature/src/index.js", "@org/admin-feature"),
+        ("libs/shop/feature/src/index.js", "@org/shop-ui"),
+        ("libs/shop/feature/src/index.js", "@org/shop-app"),
+        ("libs/shop/ui/src/index.js", "@org/shop-feature"),
+        ("libs/shop/ui/src/index.js", "lodash"),
+    ]
+    .into_iter()
+    .map(|(a, b)| (a.to_string(), b.to_string()))
+    .collect();
+    assert_eq!(migrated_flagged_imports("nx-workspace"), expected);
+}
+
+#[test]
+fn element_boundaries_match_eslint_plugin_boundaries() {
+    // Exactly the imports real eslint-plugin-boundaries 7.2 flags on this project.
+    let expected: std::collections::BTreeSet<(String, String)> = [
+        ("src/features/cart/index.js", "../user/index.js"),
+        ("src/features/cart/index.js", "../../utils/fmt.js"),
+        ("src/ui/button/index.js", "../../features/cart/index.js"),
+        ("src/utils/fmt.js", "../app/main.js"),
+    ]
+    .into_iter()
+    .map(|(a, b)| (a.to_string(), b.to_string()))
+    .collect();
+    assert_eq!(migrated_flagged_imports("boundaries"), expected);
+}

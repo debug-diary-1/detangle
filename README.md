@@ -163,6 +163,30 @@ env_dir = "config"                   # where .env files live (default: project r
 - **webpack:** as with webpack-cli, `env` also gets `WEBPACK_SERVE`, or `WEBPACK_BUILD` and `WEBPACK_BUNDLE`.
 - **Babel:** `api.env()` follows `BABEL_ENV`, then `NODE_ENV`. They only run when named here, never by auto-detection. Aliases rewrite the import before resolution, so tsconfig `paths`, package `exports` and the other resolution rules still apply to the result. Editing any of these config files triggers a full rebuild in watch mode.
 
+### Groups, tags and Nx projects
+
+Groups name parts of the codebase: features, layers, packages. Each distinct match of a group's `path` regex (at the start of a module path) is one group instance, and a module belongs to the first group that matches it. Modules inherit their group's tags. `scope = "group"` rules run on the group graph, where dependencies inside one group instance don't count and cycles are computed between groups.
+
+```toml
+[[groups]]
+name = "feature"                       # the group's type, also a tag
+path = '^src/features/[^/]+'           # one group per feature folder
+tags = ["layer:domain"]
+
+[[groups]]
+name = "ui"
+path = '^src/ui/[^/]+'
+
+# features may only use ui and each other
+[[forbidden]]
+name = "feature-deps"
+scope = "group"
+from = { tags = ["feature"] }
+to = { tags_not = ["feature", "ui"] }
+```
+
+With `options.nx_projects = true`, every Nx project (`project.json`, or a `package.json` with an `nx` section) is a group, rediscovered on each run with its `tags`. Each project also gets the tag `projectType:<type>`, and nested projects take precedence over their parents. Tag conditions (`tags`, `tags_not`, and `tags_all` on `from`) accept Nx patterns: exact tags, `*` globs and `/regex/`. On the module scope, `to.cross_group = true` matches dependencies between different groups, and the `relative` dependency type matches imports written as a relative or absolute path.
+
 ### Folder scope
 
 Add `scope = "folder"` to evaluate a rule on the folder graph instead of the module graph. Every directory stands for its whole subtree, so `src/features/cart` includes `src/features/cart/ui/…`. Folder names have no trailing slash, and root-level files belong to no folder.
@@ -231,6 +255,8 @@ tangle check               # same checks as before, much faster
 |---|---|
 | **JavaScript rules configs** (`.js`, `.cjs`, `.mjs` or `.json` files declaring `forbidden`, `allowed` or `required` rules). These are recognised by content, not file name. | Every rule, `extends` presets, options, and the known-violations file they point at |
 | **ESLint** (`eslint.config.*`, `.eslintrc.{js,cjs,json}`, `package.json` `eslintConfig`) | `import/no-cycle`, `import/no-restricted-paths` (zones, `except`, `basePath`, messages) and `import/no-extraneous-dependencies` (dev/optional/peer globs), also under `import-x`. `files`, `ignores` and `overrides` scoping carry over (an `"off"` for test files becomes a `path_not`), and so do the `import/resolver` webpack and TypeScript settings. |
+| **Nx** (`@nx/enforce-module-boundaries` in an ESLint config) | Project discovery (`nx_projects`), every depConstraint (`sourceTag` or `allSourceTags`, `onlyDependOnLibsWithTags`, `notDependOnLibsWithTags`, `bannedExternalImports`, `allowedExternalImports`), and Nx's built-in checks: project cycles, importing applications, relative imports across projects, and "a project without tags matching a constraint can't depend on libraries" |
+| **eslint-plugin-boundaries** (`boundaries/dependencies` or `boundaries/element-types`) | `boundaries/elements` become `[[groups]]` (folder, file and full modes, `basePattern`). Policies, in both the v6+ `{ to: { element: { type } } }` format and the legacy format, including `types.anyOf` and `!type`, are replayed with the plugin's last-match-wins semantics. Capture conditions are skipped with a warning. |
 | **madge** (`.madgerc`, `package.json` `madge`, or `madge --circular` in a script) | A circular-dependency rule, `excludeRegExp`, `tsConfig`, `webpackConfig`, `skipTypeImports` |
 | **Known-violation files** (JSON arrays of `{ from, to, rule: { name } }`) | `.tangle-baseline.json`, applied automatically through `options.baseline` |
 
@@ -243,6 +269,8 @@ You can also run a JavaScript rules config directly without converting it: `tang
 ### Verified against the tools themselves
 
 - **ESLint 9 + eslint-plugin-import 2.32**, on a project using all three rules with zones, `except`, file-scoped overrides and dev-dependency globs: tangle's migrated config reports **exactly the same 7 violations**, rule for rule, file for file, import for import.
+- **Nx 21** (`@nx/enforce-module-boundaries`), on a workspace with scope and type tags, an application, an untagged lib, a banned external, a relative cross-project import and project cycles: tangle flags **exactly the same 10 imports**. Adding a new tagged project afterwards is enforced without migrating again, because projects are rediscovered on every run.
+- **eslint-plugin-boundaries 7.2**, using both the legacy `rules` and v6+ `policies` formats, with a later `disallow` overriding an `allow` and a negated `!app` selector: **exactly the same 4 violations**.
 - **madge 8 on excalidraw** (873 modules): madge's own dependency graph puts 168 files on cycles. `madge --circular` lists 128 of them; tangle reports all 168, with no extras, in 0.03 s against madge's 2.5 s.
 - **A JavaScript rules config with known violations:** all 14 known violations were carried into the baseline. The only findings left were genuine cycle dependencies the original setup never reported, each shown with its cycle.
 
