@@ -91,12 +91,22 @@ enum Cmd {
         target: Target,
         #[arg(short, long, value_enum, default_value_t = GraphFormat::Dot)]
         format: GraphFormat,
-        /// Collapse local modules to their first N path segments (e.g. 2 → src/feature/)
+        /// Collapse local modules to their first N path segments (e.g. 2 → src/feature/),
+        /// or modules matching a regex to what it matches (e.g. '^packages/[^/]+/')
         #[arg(long)]
-        collapse: Option<usize>,
-        /// Only show modules matching this regex, plus their direct neighbours
+        collapse: Option<String>,
+        /// Only show modules matching this regex, plus their neighbours
         #[arg(long)]
         focus: Option<String>,
+        /// How many steps from a --focus module to show, in both directions
+        #[arg(long, default_value_t = 1, requires = "focus")]
+        focus_depth: usize,
+        /// Only show modules matching this regex, plus everything that depends on them
+        #[arg(long)]
+        reaches: Option<String>,
+        /// Mark modules matching this regex
+        #[arg(long)]
+        highlight: Option<String>,
         /// Include npm packages, node builtins and unresolved imports
         #[arg(long)]
         externals: bool,
@@ -420,20 +430,30 @@ fn run() -> Result<ExitCode> {
             let failing = errors > 0 || (strict && warnings > 0);
             return Ok(if failing { ExitCode::FAILURE } else { ExitCode::SUCCESS });
         }
-        Cmd::Graph { target, format, collapse, focus, externals, no_types, output } => {
+        Cmd::Graph { target, format, collapse, focus, focus_depth, reaches, highlight, externals, no_types, output } => {
             let a = analyze(&target.path, target.config.as_deref(), target.mode.as_deref())?;
+            let re = |r: Option<String>, what: &str| {
+                r.map(|r| regex::Regex::new(&r).with_context(|| format!("--{what}: invalid regex {r:?}"))).transpose()
+            };
             let view = report::GraphView {
-                collapse,
-                focus: focus.map(|f| regex::Regex::new(&f)).transpose()?,
+                collapse: match collapse {
+                    Some(c) => Some(match c.parse::<usize>() {
+                        Ok(depth) => report::Collapse::Depth(depth),
+                        Err(_) => report::Collapse::Pattern(re(Some(c), "collapse")?.expect("given")),
+                    }),
+                    None => None,
+                },
+                focus: re(focus, "focus")?,
+                focus_depth,
+                reaches: re(reaches, "reaches")?,
+                highlight: re(highlight, "highlight")?,
                 externals,
                 type_only: !no_types,
             };
             let text = match format {
                 GraphFormat::Dot => report::dot(&a.graph, &view),
                 GraphFormat::Mermaid => report::mermaid(&a.graph, &view),
-                GraphFormat::Json => {
-                    serde_json::to_string_pretty(&report::full_json(&a.graph, &a.violations))? + "\n"
-                }
+                GraphFormat::Json => serde_json::to_string_pretty(&report::graph_json(&a.graph, &a.violations, &view))? + "\n",
             };
             match output {
                 Some(path) => std::fs::write(&path, text)?,

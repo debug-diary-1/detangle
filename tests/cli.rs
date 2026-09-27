@@ -731,3 +731,30 @@ fn ci_formats_and_baseline_maintenance() {
     assert_eq!(code, 1);
     assert!(text.contains("libs/util/src/new.js") && !text.contains("stale-baseline-entry"), "{text}");
 }
+
+#[test]
+fn graph_filters_select_like_the_js_rules_tool() {
+    // Module sets the JavaScript rules tool selects on this fixture.
+    let ids = |args: &[&str]| -> Vec<String> {
+        let mut all = vec!["graph", "tests/fixtures/conditions", "-c", "/dev/null", "-f", "json"];
+        all.extend(args);
+        let (out, _) = tangle(&all);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let mut ids: Vec<String> =
+            v["modules"].as_array().unwrap().iter().filter_map(|m| m["id"].as_str()).filter(|id| id.starts_with("src/")).map(String::from).collect();
+        ids.sort();
+        ids
+    };
+    assert_eq!(ids(&["--focus", "src/c4"]), ["src/c3.ts", "src/c4.ts", "src/c5.ts"]);
+    assert_eq!(ids(&["--focus", "mid"]), ["src/a/b/deep.ts", "src/a/mid.ts"]);
+    assert_eq!(ids(&["--reaches", "top"]), ["src/a/b/deep.ts", "src/top.ts"]);
+    assert_eq!(ids(&["--focus", "c6", "--reaches", "c7"]), ["src/c6.ts", "src/c7.ts"]);
+    let (json, _) = tangle(&["graph", "tests/fixtures/conditions", "-c", "/dev/null", "-f", "json", "--highlight", "c[12]"]);
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let lit: Vec<&str> = v["modules"].as_array().unwrap().iter().filter(|m| m["highlighted"] == true).filter_map(|m| m["id"].as_str()).collect();
+    assert_eq!(lit, ["src/c1.ts", "src/c2.ts"]);
+    let (mmd, _) = tangle(&["graph", "tests/fixtures/conditions", "-c", "/dev/null", "-f", "mermaid", "--collapse", "^src/[^/]+/", "--highlight", "deep"]);
+    // src/a/ collapses a/mid.ts and a/b/*; it's highlighted because deep.ts is in it.
+    assert!(mmd.contains("[\"src/a/\"]:::highlight"), "{mmd}");
+    assert!(!mmd.contains("src/a/mid.ts"), "{mmd}");
+}

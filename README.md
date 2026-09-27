@@ -26,6 +26,9 @@ tangle why src/app.ts lodash  # shortest import chain from A to B
 tangle affected --since origin/main --filter '\.test\.ts$'   # tests to run
 tangle graph -f mermaid --collapse 2 > deps.mmd               # architecture diagram
 tangle graph -f dot --focus 'features/cart' | dot -Tsvg > cart.svg
+tangle graph --focus 'cart' --focus-depth 2 --highlight 'api/'   # two steps out, api modules marked
+tangle graph --reaches 'src/db/' -f mermaid                       # everything that depends on db
+tangle graph --collapse '^packages/[^/]+/' -f mermaid             # one node per package
 tangle init                   # write a starter tangle.toml
 ```
 

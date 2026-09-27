@@ -442,15 +442,94 @@ pub fn full_json(g: &Graph, vs: &[Violation]) -> serde_json::Value {
     })
 }
 
+/// How `--collapse` merges modules.
+pub enum Collapse {
+    /// Local modules to their first N path segments.
+    Depth(usize),
+    /// Modules matching the regex to the text it matches (e.g.
+    /// `^packages/[^/]+/` → one node per package).
+    Pattern(Regex),
+}
+
+/// `full_json`, narrowed to the modules `--focus` / `--reaches` select, with
+/// `--highlight`ed modules marked.
+pub fn graph_json(g: &Graph, vs: &[Violation], view: &GraphView) -> serde_json::Value {
+    let mut v = full_json(g, vs);
+    let selected = view.selected(g);
+    if selected.is_none() && view.highlight.is_none() {
+        return v;
+    }
+    let keep: Option<HashSet<&str>> = selected.as_ref().map(|s| s.iter().map(|&m| g.modules[m].id.as_str()).collect());
+    if let Some(mods) = v["modules"].as_array_mut() {
+        if let Some(keep) = &keep {
+            mods.retain(|m| m["id"].as_str().is_some_and(|id| keep.contains(id)));
+            for m in mods.iter_mut() {
+                if let Some(deps) = m["dependencies"].as_array_mut() {
+                    deps.retain(|d| d["module"].as_str().is_some_and(|id| keep.contains(id)));
+                }
+            }
+        }
+        if let Some(re) = &view.highlight {
+            for m in mods.iter_mut() {
+                let hit = m["id"].as_str().is_some_and(|id| re.is_match(id));
+                m["highlighted"] = json!(hit);
+            }
+        }
+    }
+    v
+}
+
 pub struct GraphView {
-    pub collapse: Option<usize>,
+    pub collapse: Option<Collapse>,
     pub focus: Option<Regex>,
+    /// How many steps from a focused module to show (in both directions).
+    pub focus_depth: usize,
+    /// Only modules matching this, and every module that (indirectly) depends on them.
+    pub reaches: Option<Regex>,
+    pub highlight: Option<Regex>,
     pub externals: bool,
     pub type_only: bool,
 }
 
+impl GraphView {
+    /// Modules left by `focus` / `reaches` (None = all).
+    pub fn selected(&self, g: &Graph) -> Option<HashSet<usize>> {
+        let hits = |re: &Regex| -> Vec<usize> { (0..g.modules.len()).filter(|&m| re.is_match(&g.modules[m].id)).collect() };
+        let focused = self.focus.as_ref().map(|re| {
+            let mut keep: HashSet<usize> = HashSet::new();
+            for forward in [true, false] {
+                let mut level: Vec<usize> = hits(re);
+                keep.extend(&level);
+                for _ in 0..self.focus_depth {
+                    let mut next = vec![];
+                    for &m in &level {
+                        let adj = if forward { &g.out[m] } else { &g.inc[m] };
+                        for &e in adj {
+                            let n = if forward { g.edges[e].to } else { g.edges[e].from };
+                            if keep.insert(n) {
+                                next.push(n);
+                            }
+                        }
+                    }
+                    level = next;
+                }
+            }
+            keep
+        });
+        let reaching = self.reaches.as_ref().map(|re| g.closure(&hits(re), false));
+        match (focused, reaching) {
+            (Some(a), Some(b)) => Some(a.intersection(&b).copied().collect()),
+            (a, b) => a.or(b),
+        }
+    }
+
+    pub fn highlighted(&self, g: &Graph, m: usize) -> bool {
+        self.highlight.as_ref().is_some_and(|re| re.is_match(&g.modules[m].id))
+    }
+}
+
 struct Projected {
-    nodes: Vec<(String, ModuleKind, bool)>, // id, kind, in a cycle
+    nodes: Vec<(String, ModuleKind, bool, bool)>, // id, kind, in a cycle, highlighted
     edges: Vec<(usize, usize, bool, bool, bool)>, // from, to, circular, type-only, dynamic
 }
 
@@ -458,34 +537,30 @@ struct Projected {
 fn project(g: &Graph, view: &GraphView) -> Projected {
     let name = |m: usize| -> String {
         let module = &g.modules[m];
-        match (view.collapse, module.kind) {
-            (Some(depth), ModuleKind::Local) => {
+        match (&view.collapse, module.kind) {
+            (Some(Collapse::Depth(depth)), ModuleKind::Local) => {
                 let parts: Vec<&str> = module.id.split('/').collect();
-                if parts.len() > depth { parts[..depth].join("/") + "/" } else { module.id.clone() }
+                if parts.len() > *depth { parts[..*depth].join("/") + "/" } else { module.id.clone() }
             }
+            (Some(Collapse::Pattern(re)), _) => re.find(&module.id).map_or(module.id.clone(), |m| m.as_str().to_string()),
             _ => module.id.clone(),
         }
     };
     let keep_module = |m: usize| view.externals || g.modules[m].kind == ModuleKind::Local;
-    let focused: Option<HashSet<usize>> = view.focus.as_ref().map(|re| {
-        let hits: Vec<usize> = (0..g.modules.len()).filter(|&m| re.is_match(&g.modules[m].id)).collect();
-        let mut keep: HashSet<usize> = hits.iter().copied().collect();
-        for &m in &hits {
-            keep.extend(g.out[m].iter().map(|&e| g.edges[e].to));
-            keep.extend(g.inc[m].iter().map(|&e| g.edges[e].from));
-        }
-        keep
-    });
-    let visible = |m: usize| keep_module(m) && focused.as_ref().is_none_or(|f| f.contains(&m));
+    let selected = view.selected(g);
+    let visible = |m: usize| keep_module(m) && selected.as_ref().is_none_or(|f| f.contains(&m));
 
     let mut index: HashMap<String, usize> = HashMap::new();
     let mut p = Projected { nodes: vec![], edges: vec![] };
     let mut node = |p: &mut Projected, m: usize| -> usize {
         let id = name(m);
-        *index.entry(id.clone()).or_insert_with(|| {
-            p.nodes.push((id, g.modules[m].kind, false));
+        let n = *index.entry(id.clone()).or_insert_with(|| {
+            p.nodes.push((id, g.modules[m].kind, false, false));
             p.nodes.len() - 1
-        })
+        });
+        // A collapsed node is highlighted if any module in it is.
+        p.nodes[n].3 |= view.highlighted(g, m);
+        n
     };
     for m in 0..g.modules.len() {
         if visible(m) && (g.modules[m].kind == ModuleKind::Local || !g.inc[m].is_empty()) {
@@ -518,7 +593,7 @@ pub fn dot(g: &Graph, view: &GraphView) -> String {
     let mut out = String::from(
         "digraph tangle {\n  rankdir=LR;\n  splines=true;\n  node [shape=box, style=\"rounded,filled\", fontname=\"Helvetica\", fontsize=10, fillcolor=\"#ffffff\", color=\"#999999\"];\n  edge [color=\"#00000055\", arrowsize=0.6];\n",
     );
-    for (i, (id, kind, cyclic)) in p.nodes.iter().enumerate() {
+    for (i, (id, kind, cyclic, highlighted)) in p.nodes.iter().enumerate() {
         let (fill, border) = match kind {
             ModuleKind::Local if *cyclic => ("#fde2e1", "#d33"),
             ModuleKind::Local if id.ends_with('/') => ("#eef3ff", "#6b8cce"),
@@ -527,7 +602,8 @@ pub fn dot(g: &Graph, view: &GraphView) -> String {
             ModuleKind::Builtin => ("#e5f5e5", "#3a3"),
             ModuleKind::Unresolved => ("#ffd6d6", "#c00"),
         };
-        let _ = writeln!(out, "  n{i} [label=\"{}\", fillcolor=\"{fill}\", color=\"{border}\"];", id.replace('"', "\\\""));
+        let (fill, border, pen) = if *highlighted { ("#fff3b0", "#e6a100", ", penwidth=2") } else { (fill, border, "") };
+        let _ = writeln!(out, "  n{i} [label=\"{}\", fillcolor=\"{fill}\", color=\"{border}\"{pen}];", id.replace('"', "\\\""));
     }
     for (a, b, circular, type_only, dynamic) in &p.edges {
         let mut attrs = vec![];
@@ -548,8 +624,9 @@ pub fn dot(g: &Graph, view: &GraphView) -> String {
 pub fn mermaid(g: &Graph, view: &GraphView) -> String {
     let p = project(g, view);
     let mut out = String::from("flowchart LR\n");
-    for (i, (id, kind, cyclic)) in p.nodes.iter().enumerate() {
+    for (i, (id, kind, cyclic, highlighted)) in p.nodes.iter().enumerate() {
         let class = match kind {
+            _ if *highlighted => ":::highlight",
             ModuleKind::Local if *cyclic => ":::cycle",
             ModuleKind::Local => "",
             ModuleKind::Npm => ":::npm",
@@ -569,7 +646,7 @@ pub fn mermaid(g: &Graph, view: &GraphView) -> String {
     if !red.is_empty() {
         let _ = writeln!(out, "  linkStyle {} stroke:#d33,stroke-width:2px", red.join(","));
     }
-    out.push_str("  classDef npm fill:#e0f4f7,stroke:#2a9bb0\n  classDef core fill:#e5f5e5,stroke:#3a3\n  classDef unresolved fill:#ffd6d6,stroke:#c00\n  classDef cycle fill:#fde2e1,stroke:#d33\n");
+    out.push_str("  classDef npm fill:#e0f4f7,stroke:#2a9bb0\n  classDef core fill:#e5f5e5,stroke:#3a3\n  classDef unresolved fill:#ffd6d6,stroke:#c00\n  classDef cycle fill:#fde2e1,stroke:#d33\n  classDef highlight fill:#fff3b0,stroke:#e6a100,stroke-width:2px\n");
     out
 }
 
