@@ -1,8 +1,27 @@
 {
-  "name": "detangle-deps",
+  "name": "detangle",
   "version": "0.1.0",
-  "description": "Node.js API for detangle: dependency analysis and architecture rules for JS/TS",
-  "private": true,
+  "description": "Fast dependency analysis and architecture rules for JavaScript and TypeScript (CLI and Node.js API)",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/debug-diary-1/detangle.git",
+    "directory": "npm"
+  },
+  "homepage": "https://github.com/debug-diary-1/detangle#readme",
+  "keywords": [
+    "dependencies",
+    "architecture",
+    "lint",
+    "cycles",
+    "import",
+    "typescript",
+    "javascript",
+    "monorepo"
+  ],
+  "bin": {
+    "detangle": "bin/detangle.js"
+  },
   "main": "index.js",
   "types": "index.d.ts",
   "exports": {
@@ -18,11 +37,24 @@
     }
   },
   "files": [
+    "bin/detangle.js",
+    "binary.js",
+    "platforms.json",
     "index.js",
     "index.mjs",
     "index.d.ts",
     "index.d.mts"
   ],
+  "optionalDependencies": {
+    "detangle-darwin-arm64": "0.1.0",
+    "detangle-darwin-x64": "0.1.0",
+    "detangle-linux-x64-gnu": "0.1.0",
+    "detangle-linux-arm64-gnu": "0.1.0",
+    "detangle-linux-x64-musl": "0.1.0",
+    "detangle-linux-arm64-musl": "0.1.0",
+    "detangle-win32-x64": "0.1.0",
+    "detangle-win32-arm64": "0.1.0"
+  },
   "engines": {
     "node": ">=18"
   }

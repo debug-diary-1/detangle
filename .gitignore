@@ -1,2 +1,5 @@
 /target
 !tests/fixtures/**/node_modules
+/dist
+/bins
+/npm-dist

@@ -1,0 +1,158 @@
+name: Release
+
+# Push a tag like v0.1.0 (matching Cargo.toml and npm/package.json) to build
+# binaries for every platform and publish them to GitHub Releases, npm,
+# crates.io and the Homebrew tap.
+#
+# Repository secrets:
+#   NPM_TOKEN           npm automation token allowed to publish detangle and detangle-*
+#   CARGO_REGISTRY_TOKEN  crates.io token
+#   HOMEBREW_TAP_TOKEN  token with push access to debug-diary-1/homebrew-tap
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          cargo=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          npm=$(node -p 'require("./npm/package.json").version')
+          if [ "$tag" != "$cargo" ] || [ "$tag" != "$npm" ]; then
+            echo "::error::tag $tag, Cargo.toml $cargo and npm/package.json $npm must match"
+            exit 1
+          fi
+          echo "version=$tag" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: version
+    name: build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: aarch64-apple-darwin, os: macos-14 }
+          - { target: x86_64-apple-darwin, os: macos-14 }
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-22.04 }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-22.04-arm }
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-22.04, musl: true }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-22.04-arm, musl: true }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest }
+          - { target: aarch64-pc-windows-msvc, os: windows-11-arm }
+    runs-on: ${{ matrix.os }}
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - if: matrix.musl
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo build --locked --profile dist --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: |
+          exe=detangle; [[ "$TARGET" == *windows* ]] && exe=detangle.exe
+          name="detangle-$VERSION-$TARGET"
+          mkdir -p "dist/$name" "bin/$TARGET"
+          cp "target/$TARGET/dist/$exe" "dist/$name/"
+          cp "target/$TARGET/dist/$exe" "bin/$TARGET/"
+          cp README.md LICENSE-MIT LICENSE-APACHE "dist/$name/"
+          cd dist
+          if [[ "$exe" == *.exe ]]; then 7z a -tzip "$name.zip" "$name" >/dev/null; else tar czf "$name.tar.gz" "$name"; fi
+          rm -r "$name"
+      - name: Smoke test
+        if: ${{ !contains(matrix.target, 'x86_64-apple') }}
+        shell: bash
+        run: |
+          exe=detangle; [[ "$TARGET" == *windows* ]] && exe=detangle.exe
+          "./bin/$TARGET/$exe" --version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ matrix.target }}
+          path: |
+            dist/*
+            bin/*
+
+  github-release:
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: build-*
+          merge-multiple: true
+      - run: cd dist && sha256sum -- * > SHA256SUMS
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --title "detangle ${{ needs.version.outputs.version }}" --generate-notes
+
+  npm:
+    needs: [version, github-release]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: build-*
+          merge-multiple: true
+      - run: node scripts/npm-packages.mjs "${{ needs.version.outputs.version }}" bin npm-dist
+      # Platform packages first, so the main package's optionalDependencies resolve.
+      - env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          for d in npm-dist/detangle-*/; do (cd "$d" && npm publish --access public --provenance); done
+          cd npm-dist/detangle && npm publish --access public --provenance
+
+  crates:
+    needs: [version, github-release]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --locked
+
+  homebrew:
+    needs: [version, github-release]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: build-*
+          merge-multiple: true
+      - run: node scripts/homebrew-formula.mjs "${{ needs.version.outputs.version }}" dist > detangle.rb
+      - env:
+          TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          git clone "https://x-access-token:$TOKEN@github.com/debug-diary-1/homebrew-tap.git" tap
+          mkdir -p tap/Formula && cp detangle.rb tap/Formula/detangle.rb
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/detangle.rb
+          git commit -m "detangle ${{ needs.version.outputs.version }}"
+          git push

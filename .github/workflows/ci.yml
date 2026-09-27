@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      # The Node.js API's tests run from `cargo test`.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+
+  npm-packaging:
+    name: npm packaging
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # Every platform package gets a stand-in binary: this checks the
+      # packaging script and manifests, not the binaries themselves.
+      - run: |
+          for t in $(node -p 'require("./npm/platforms.json").map(p => p.target + (p.os === "win32" ? "/detangle.exe" : "/detangle")).join(" ")'); do
+            mkdir -p "bins/$(dirname "$t")" && echo stub > "bins/$t"
+          done
+          node scripts/npm-packages.mjs 0.0.0-ci bins npm-dist
+          for d in npm-dist/*/; do (cd "$d" && npm pack --dry-run >/dev/null); done

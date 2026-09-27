@@ -1,11 +1,13 @@
 "use strict";
 // Node.js API for detangle. Runs the `detangle` binary (from `options.bin`,
-// $DETANGLE_BIN, or PATH) and returns its results as JavaScript values.
+// $DETANGLE_BIN, the installed platform package, or PATH) and returns its
+// results as JavaScript values.
 
 const { execFile } = require("node:child_process");
+const { binaryPath } = require("./binary.js");
 
 function run(args, options = {}) {
-  const bin = options.bin || process.env.DETANGLE_BIN || "detangle";
+  const bin = options.bin || binaryPath() || "detangle";
   return new Promise((resolve, reject) => {
     execFile(bin, args, { maxBuffer: 1 << 30, cwd: options.cwd, env: { ...process.env, NO_COLOR: "1" } }, (error, stdout, stderr) => {
       if (error && typeof error.code !== "number") {
@@ -110,5 +112,5 @@ async function migrate(dir, options = {}) {
 }
 
 module.exports = { analyze, check, report, graph, migrate };
-// `import detangle from "detangle-deps"` and `require("detangle-deps").default` both work.
+// `import detangle from "detangle"` and `require("detangle").default` both work.
 module.exports.default = module.exports;

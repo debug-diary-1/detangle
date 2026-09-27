@@ -2,13 +2,17 @@
 
 Fast dependency analysis and architecture rules for JavaScript/TypeScript, React, Vue, Svelte and Angular, with a live-reloading terminal explorer. Written in Rust on top of the [oxc](https://oxc.rs) parser and resolver.
 
-Analyses VS Code's `src/` (9.6k files, 113k dependencies) in **0.3 s**.
+Analyses VS Code's `src/` (10k modules, 113k dependencies) in **0.2 s**, using 160 MB. The same analysis takes the JavaScript rules tool 40 s and 3.7 GB.
 
 ## Install
 
 ```sh
-cargo install --path .
+npm install --save-dev detangle      # or: npx detangle check
+brew install debug-diary-1/tap/detangle
+cargo install detangle
 ```
+
+Prebuilt binaries for macOS, Linux (glibc and musl) and Windows, on x64 and arm64, are attached to every [GitHub release](https://github.com/debug-diary-1/detangle/releases). The npm package installs only the binary for your platform, and needs no Rust toolchain.
 
 ## Usage
 
@@ -284,10 +288,10 @@ Dependency types: `local`, `npm`, `npm-dev`, `npm-peer`, `npm-optional`, `npm-un
 
 ## Node.js API
 
-`npm/` is a small package (`detangle-deps`, not published yet) that runs the `detangle` binary and returns plain JavaScript values, with TypeScript types for both ESM and CommonJS. It uses `options.bin`, then `$DETANGLE_BIN`, then `detangle` on `PATH`.
+The `detangle` npm package also has an API that runs the binary and returns plain JavaScript values, with TypeScript types for both ESM and CommonJS. It uses `options.bin`, then `$DETANGLE_BIN`, then the binary installed for your platform, then `detangle` on `PATH`.
 
 ```js
-import { analyze, check, report, graph, migrate } from "detangle-deps";
+import { analyze, check, report, graph, migrate } from "detangle";
 
 const { modules, cycles, violations } = await analyze("src", { cache: true });
 const { errors, exitCode } = await check(".", { strict: true });
@@ -356,3 +360,14 @@ You can also run a JavaScript rules config directly without converting it: `deta
 ## Cycle detection
 
 On VS Code, checked against an independently computed ground truth, detangle finds all 1,945 dependencies that sit on a cycle, with no false positives. Each one is reported with a concrete cycle as evidence. `via` and `viaOnly` consider every simple cycle through a dependency, not just one arbitrary cycle.
+
+## Releasing
+
+1. Set the same version in `Cargo.toml` and `npm/package.json`, and commit.
+2. Tag it and push the tag: `git tag v0.1.0 && git push origin v0.1.0`.
+
+The `Release` workflow then builds binaries for all eight targets, attaches them (with `SHA256SUMS`) to a GitHub release, and publishes the npm packages, the crate and the Homebrew formula. It needs the repository secrets `NPM_TOKEN`, `CARGO_REGISTRY_TOKEN` and `HOMEBREW_TAP_TOKEN`.
+
+## License
+
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT), at your option.
