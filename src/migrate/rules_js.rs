@@ -237,7 +237,7 @@ const HARMLESS_OPTIONS: &[&str] = &[
     "reporterOptions", "progress", "cache", "prefix", "outputType", "outputTo", "moduleSystems",
     "combinedDependencies", "preserveSymlinks", "externalModuleResolutionStrategy", "parser",
     "skipAnalysisNotInRules", "metrics", "forceDeriveDependents", "experimentalStats", "baseDir",
-    "validate", "ruleSet", "rulesFile", "detectJSDocImports", "builtInModules", "mainFields",
+    "validate", "ruleSet", "rulesFile", "mainFields",
     "exportsFields", "conditionNames", "extensions",
 ];
 
@@ -296,6 +296,20 @@ pub fn convert(v: &Value) -> Imported {
                     opts.ignore_type_only = !on;
                     opts.cycles_ignore_type_only = !on;
                 }
+                "detectJSDocImports" => opts.jsdoc_imports = val == &json!(true),
+                "detectProcessBuiltinModuleCalls" => opts.builtin_module_calls = val == &json!(true),
+                "exoticRequireStrings" => {
+                    opts.exotic_require = val.as_array().into_iter().flatten().filter_map(|s| s.as_str().map(String::from)).collect()
+                }
+                "moduleSystems" => {
+                    // tangle always reads ES modules, CommonJS, AMD and TypeScript directives.
+                    let listed: Vec<&str> = val.as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+                    let off: Vec<&str> = ["amd", "tsd"].into_iter().filter(|m| !listed.contains(m)).collect();
+                    if !off.is_empty() {
+                        warnings.push(format!("options.moduleSystems leaves out {off:?}, but tangle always reads those imports"));
+                    }
+                }
+                "builtInModules" => warnings.push("options.builtInModules isn't supported (Node's own list of builtins is used)".into()),
                 // Converted to a tangle baseline by `tangle migrate`.
                 "knownViolations" => known_violations = val.as_str().map(String::from),
                 k if HARMLESS_OPTIONS.contains(&k) => {}
@@ -421,7 +435,7 @@ mod tests {
         assert_eq!(o.config_env.mode.as_deref(), Some("production"));
         assert_eq!(o.babel_config.as_deref(), Some(".babelrc"));
         assert!(!w.contains("webpackConfig") && !w.contains("babelConfig"), "{w}");
-        assert!(w.contains("options.exoticRequireStrings"), "{w}");
+        assert_eq!(o.exotic_require, ["want"]);
         assert_eq!(imp.known_violations.as_deref(), Some("known.json"));
         assert!(!w.contains("reporterOptions") && !w.contains("doNotFollow"), "{w}");
         // Round-trips through TOML.

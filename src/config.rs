@@ -16,7 +16,8 @@ pub const DEFAULT_CONFIG: &str = r#"# tangle.toml — dependency rules for this 
 #
 # Dependency types usable in `to.dependency_types`:
 #   local, npm, npm-dev, npm-peer, npm-optional, npm-undeclared, core,
-#   unresolvable, type-only, dynamic, require, reexport, resource, import,
+#   unresolvable, type-only, dynamic, require, reexport, resource, amd,
+#   triple-slash, jsdoc, exotic-require, process-get-builtin-module, import,
 #   aliased, deprecated
 
 [options]
@@ -189,6 +190,15 @@ pub struct Options {
     /// and treat each as a group with its tags (+ `projectType:<type>`).
     #[serde(skip_serializing_if = "is_false")]
     pub nx_projects: bool,
+    /// Also read JSDoc type imports (`@import … from "x"`, `{import("x")}`).
+    #[serde(skip_serializing_if = "is_false")]
+    pub jsdoc_imports: bool,
+    /// Also count `process.getBuiltinModule("fs")` as a dependency.
+    #[serde(skip_serializing_if = "is_false")]
+    pub builtin_module_calls: bool,
+    /// Functions that load modules like `require`, e.g. `["module.require"]`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub exotic_require: Vec<String>,
     /// Which group a module joins when several match: "first" (the first
     /// definition) or "deepest" (the one matching the longest path).
     #[serde(skip_serializing_if = "GroupMatch::is_default")]
@@ -316,6 +326,9 @@ impl Default for Options {
             baseline: None,
             nx_projects: false,
             group_match: GroupMatch::First,
+            jsdoc_imports: false,
+            builtin_module_calls: false,
+            exotic_require: vec![],
             babel_config: None,
         }
     }

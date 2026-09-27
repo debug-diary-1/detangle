@@ -47,6 +47,16 @@ pub struct ImportFlags {
     pub reexport: bool,
     /// Angular component resource (`templateUrl`, `styleUrl(s)`).
     pub resource: bool,
+    /// AMD `define([...])` / `require([...])`, or `/// <amd-dependency>`.
+    pub amd: bool,
+    /// JSDoc `@import` / `{import("…")}` (with `options.jsdoc_imports`).
+    pub jsdoc: bool,
+    /// A `/// <reference path|types="…" />` directive.
+    pub triple_slash: bool,
+    /// A call to one of `options.exotic_require` (`module.require`, …).
+    pub exotic: bool,
+    /// `process.getBuiltinModule("fs")` (with `options.builtin_module_calls`).
+    pub builtin_call: bool,
 }
 
 impl ImportFlags {
@@ -59,7 +69,32 @@ impl ImportFlags {
             require: self.require || o.require,
             reexport: self.reexport || o.reexport,
             resource: self.resource && o.resource,
+            amd: self.amd || o.amd,
+            jsdoc: self.jsdoc && o.jsdoc,
+            triple_slash: self.triple_slash || o.triple_slash,
+            exotic: self.exotic || o.exotic,
+            builtin_call: self.builtin_call || o.builtin_call,
         }
+    }
+
+    /// A plain `import`/`export` (not require, dynamic, AMD, a directive…).
+    pub fn is_import(self) -> bool {
+        !(self.require || self.dynamic || self.amd || self.triple_slash || self.exotic || self.builtin_call)
+    }
+}
+
+/// Import forms detected only when asked for, as in other tools.
+#[derive(Debug, Clone, Default)]
+pub struct Detect {
+    pub jsdoc: bool,
+    pub builtin_calls: bool,
+    /// Callees that act like `require`, e.g. `module.require`.
+    pub exotic: Vec<String>,
+}
+
+impl Detect {
+    pub fn new(opts: &Options) -> Self {
+        Detect { jsdoc: opts.jsdoc_imports, builtin_calls: opts.builtin_module_calls, exotic: opts.exotic_require.clone() }
     }
 }
 
@@ -125,7 +160,8 @@ impl Session {
         let walk_ms = ms(t);
         let t = Instant::now();
         let resolver = make_resolver(root, opts)?;
-        let files: Vec<ScannedFile> = paths.into_par_iter().map(|p| parse_file(p, None).0).collect();
+        let detect = Detect::new(opts);
+        let files: Vec<ScannedFile> = paths.into_par_iter().map(|p| parse_file(p, None, &detect).0).collect();
         let mut s = Session {
             root: root.to_path_buf(),
             dir: dir.to_path_buf(),
@@ -168,6 +204,7 @@ impl Session {
         });
 
         let t = Instant::now();
+        let detect = Detect::new(&self.opts);
         let dirty: Vec<usize> = if structural {
             let paths = discover(&self.root, &self.dir, &self.opts)?;
             work.walked = true;
@@ -182,7 +219,7 @@ impl Session {
                 let reused: Vec<(PathBuf, Option<ScannedFile>)> =
                     paths.into_iter().map(|p| { let o = old.remove(&p); (p, o) }).collect();
                 let parsed: Vec<(ScannedFile, bool)> =
-                    reused.into_par_iter().map(|(p, prev)| parse_file(p, prev)).collect();
+                    reused.into_par_iter().map(|(p, prev)| parse_file(p, prev, &detect)).collect();
                 work.reparsed = parsed.iter().filter(|(_, fresh)| *fresh).count();
                 self.files = parsed.into_iter().map(|(f, _)| f).collect();
                 self.resolver = make_resolver(&self.root, &self.opts)?;
@@ -214,7 +251,7 @@ impl Session {
         let updated: Vec<(usize, ScannedFile)> = dirty
             .par_iter()
             .map(|&i| {
-                let (mut f, _) = parse_file(self.files[i].path.clone(), None);
+                let (mut f, _) = parse_file(self.files[i].path.clone(), None, &detect);
                 f.resolve(r);
                 (i, f)
             })
@@ -349,7 +386,7 @@ thread_local! {
 
 /// Parses `path`, reusing `prev`'s imports when the file is unchanged
 /// (returns whether it actually parsed). The result still needs `resolve`.
-fn parse_file(path: PathBuf, prev: Option<ScannedFile>) -> (ScannedFile, bool) {
+fn parse_file(path: PathBuf, prev: Option<ScannedFile>, detect: &Detect) -> (ScannedFile, bool) {
     let st = stamp(&path);
     if let Some(prev) = prev
         && prev.stamp.is_some()
@@ -363,7 +400,7 @@ fn parse_file(path: PathBuf, prev: Option<ScannedFile>) -> (ScannedFile, bool) {
     let (raw, parse_errors) = ALLOC.with(|a| {
         let mut alloc = a.borrow_mut();
         alloc.reset();
-        extract(&alloc, &path, &source)
+        extract(&alloc, &path, &source, detect)
     });
     (ScannedFile { path, imports: vec![], parse_errors, raw, stamp: st }, true)
 }
@@ -386,8 +423,8 @@ impl ScannedFile {
     }
 }
 
-fn extract(alloc: &Allocator, path: &Path, source: &str) -> (Vec<(String, ImportFlags)>, usize) {
-    let mut c = Collector::default();
+fn extract(alloc: &Allocator, path: &Path, source: &str, detect: &Detect) -> (Vec<(String, ImportFlags)>, usize) {
+    let mut c = Collector { out: vec![], decorator_depth: 0, detect };
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
     if !matches!(ext, "vue" | "svelte") {
         let st = SourceType::from_path(path).unwrap_or_default();
@@ -397,6 +434,7 @@ fn extract(alloc: &Allocator, path: &Path, source: &str) -> (Vec<(String, Import
         let st = if st.is_javascript() { st.with_jsx(true) } else { st };
         let ret = Parser::new(alloc, source, st).parse();
         c.visit_program(&ret.program);
+        c.comments(&ret.program, source);
         return (c.out, ret.diagnostics.len());
     }
     let mut errors = 0;
@@ -412,6 +450,7 @@ fn extract(alloc: &Allocator, path: &Path, source: &str) -> (Vec<(String, Import
         };
         let ret = Parser::new(alloc, block.content, st).parse();
         c.visit_program(&ret.program);
+        c.comments(&ret.program, block.content);
         errors += ret.diagnostics.len();
     }
     (c.out, errors)
@@ -518,15 +557,72 @@ fn resolve(resolver: &Resolvers, from: &Path, spec: &str) -> Option<Target> {
     }
 }
 
-#[derive(Default)]
-struct Collector {
+struct Collector<'d> {
     out: Vec<(String, ImportFlags)>,
     decorator_depth: usize,
+    detect: &'d Detect,
 }
 
-impl Collector {
+static TRIPLE_SLASH: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r#"^///\s*<(reference\s+(path|types)|amd-dependency\s+path)\s*=\s*["']([^"']+)["']"#).expect("valid")
+});
+static JSDOC_IMPORT_TAG: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r#"@import\s[^@]*?\bfrom\s*["']([^"']+)["']"#).expect("valid")
+});
+static JSDOC_BRACKET: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r#"\bimport\(\s*["']([^"']+)["']\s*\)"#).expect("valid"));
+
+impl Collector<'_> {
     fn push(&mut self, spec: &str, flags: ImportFlags) {
         self.out.push((spec.to_string(), flags));
+    }
+
+    /// Imports written in comments: triple-slash directives and (when
+    /// enabled) JSDoc type imports.
+    fn comments(&mut self, program: &Program, source: &str) {
+        for c in &program.comments {
+            let text = c.span.source_text(source);
+            if let Some(m) = TRIPLE_SLASH.captures(text) {
+                let spec = &m[3];
+                let flags = ImportFlags { triple_slash: true, amd: m[1].starts_with("amd"), ..Default::default() };
+                // `path` is relative to the file even without "./".
+                if m.get(2).is_some_and(|k| k.as_str() == "types") || !is_bare(spec) {
+                    self.push(spec, flags);
+                } else {
+                    self.push(&format!("./{spec}"), flags);
+                }
+            } else if self.detect.jsdoc && text.starts_with("/**") {
+                let flags = ImportFlags { type_only: true, jsdoc: true, ..Default::default() };
+                for re in [&*JSDOC_IMPORT_TAG, &*JSDOC_BRACKET] {
+                    for m in re.captures_iter(text) {
+                        self.push(&m[1], flags);
+                    }
+                }
+            }
+        }
+    }
+
+    /// AMD dependency arrays: `define([...], f)`, `define("id", [...], f)`,
+    /// `require([...], f)`.
+    fn amd(&mut self, args: &[Argument]) {
+        let Some(Expression::ArrayExpression(a)) = args.iter().filter_map(|a| a.as_expression()).find(|e| !matches!(e, Expression::StringLiteral(_))) else {
+            return;
+        };
+        for e in &a.elements {
+            // The special dependencies AMD loaders provide themselves.
+            if let Some(s) = e.as_expression().and_then(static_string).filter(|s| !matches!(*s, "require" | "exports" | "module")) {
+                self.push(s, ImportFlags { amd: true, ..Default::default() });
+            }
+        }
+    }
+}
+
+/// `a`, `a.b`, `a.b.c` as written, for matching callee names.
+fn callee_name(e: &Expression) -> Option<String> {
+    match e {
+        Expression::Identifier(id) => Some(id.name.to_string()),
+        Expression::StaticMemberExpression(m) => Some(format!("{}.{}", callee_name(&m.object)?, m.property.name)),
+        _ => None,
     }
 }
 
@@ -540,7 +636,7 @@ fn static_string<'a>(e: &'a Expression<'_>) -> Option<&'a str> {
     }
 }
 
-impl<'a> Visit<'a> for Collector {
+impl<'a> Visit<'a> for Collector<'_> {
     fn visit_import_declaration(&mut self, it: &ImportDeclaration<'a>) {
         let all_type_specifiers = it.specifiers.as_ref().is_some_and(|s| {
             !s.is_empty()
@@ -579,10 +675,20 @@ impl<'a> Visit<'a> for Collector {
     }
 
     fn visit_call_expression(&mut self, it: &CallExpression<'a>) {
-        if it.callee.is_specific_id("require") && it.arguments.len() == 1
-            && let Some(s) = it.arguments[0].as_expression().and_then(static_string) {
-                self.push(s, ImportFlags { require: true, ..Default::default() });
-            }
+        let single = (it.arguments.len() == 1).then(|| it.arguments[0].as_expression().and_then(static_string)).flatten();
+        let callee = callee_name(&it.callee);
+        let plain = |f: fn(&mut ImportFlags)| {
+            let mut flags = ImportFlags::default();
+            f(&mut flags);
+            flags
+        };
+        match (callee.as_deref(), single) {
+            (Some("require"), Some(s)) => self.push(s, plain(|f| f.require = true)),
+            (Some("require" | "define"), _) => self.amd(&it.arguments),
+            (Some("process.getBuiltinModule"), Some(s)) if self.detect.builtin_calls => self.push(s, plain(|f| f.builtin_call = true)),
+            (Some(name), Some(s)) if self.detect.exotic.iter().any(|x| x == name) => self.push(s, plain(|f| f.exotic = true)),
+            _ => {}
+        }
         walk::walk_call_expression(self, it);
     }
 
@@ -635,7 +741,7 @@ mod tests {
 
     fn specs(src: &str) -> Vec<(String, ImportFlags)> {
         let alloc = Allocator::default();
-        extract(&alloc, Path::new("x.ts"), src).0
+        extract(&alloc, Path::new("x.ts"), src, &Detect::default()).0
     }
 
     #[test]
@@ -664,6 +770,30 @@ mod tests {
     }
 
     #[test]
+    fn amd_directives_jsdoc_and_exotic_requires() {
+        let alloc = Allocator::default();
+        let src = r#"/// <reference path="e.d.ts" />
+/// <reference types="node" />
+/// <amd-dependency path="./legacy" />
+define("id", ["./a", "require", "exports"], function (a) { require(["./b"], () => {}); });
+/** @import { C } from "./c.js" */
+/** @param {import("./d.js").D} x */
+export const f = (x) => [module.require("./g"), process.getBuiltinModule("fs"), other.require("./no")];
+"#;
+        let plain: Vec<String> = extract(&alloc, Path::new("x.js"), src, &Detect::default()).0.into_iter().map(|(s, _)| s).collect();
+        assert_eq!(plain, ["./a", "./b", "./e.d.ts", "node", "./legacy"]);
+        let detect = Detect { jsdoc: true, builtin_calls: true, exotic: vec!["module.require".into()] };
+        let got = extract(&alloc, Path::new("x.js"), src, &detect).0;
+        let names: Vec<&str> = got.iter().map(|(s, _)| s.as_str()).collect();
+        assert_eq!(names, ["./a", "./b", "./g", "fs", "./e.d.ts", "node", "./legacy", "./c.js", "./d.js"]);
+        let f = |i: usize| got[i].1;
+        assert!(f(0).amd && f(1).amd && f(2).exotic && f(3).builtin_call);
+        assert!(f(4).triple_slash && f(6).triple_slash && f(6).amd);
+        assert!(f(7).jsdoc && f(7).type_only && f(8).jsdoc);
+        assert!(!f(0).is_import() && ImportFlags::default().is_import());
+    }
+
+    #[test]
     fn angular_component_resources() {
         let got = specs(
             r#"
@@ -684,12 +814,12 @@ mod tests {
     fn vue_and_svelte_scripts() {
         let alloc = Allocator::default();
         let vue = "<template><Child/></template>\n<script setup lang=\"ts\">\nimport Child from './Child.vue'\nimport type { P } from './types'\n</script>\n";
-        let (got, errors) = extract(&alloc, Path::new("A.vue"), vue);
+        let (got, errors) = extract(&alloc, Path::new("A.vue"), vue, &Detect::default());
         assert_eq!(errors, 0);
         assert_eq!(got.iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>(), ["./Child.vue", "./types"]);
         assert!(got[1].1.type_only);
         let svelte = "<script>\n  import Button from './Button.svelte';\n  $: doubled = count * 2;\n</script>\n<Button />";
-        let (got, errors) = extract(&alloc, Path::new("B.svelte"), svelte);
+        let (got, errors) = extract(&alloc, Path::new("B.svelte"), svelte, &Detect::default());
         assert_eq!((got.len(), errors), (1, 0));
     }
 
@@ -754,11 +884,11 @@ mod tests {
         let alloc = Allocator::default();
         let src = "import Button from './Button';\nexport default () => <div><Button /></div>;\n";
         for file in ["App.js", "App.mjs", "App.cjs", "App.jsx"] {
-            let (got, errors) = extract(&alloc, Path::new(file), src);
+            let (got, errors) = extract(&alloc, Path::new(file), src, &Detect::default());
             assert_eq!((got.len(), errors), (1, 0), "{file}");
         }
         // TS keeps `<T>x` casts working.
-        let (_, errors) = extract(&alloc, Path::new("a.ts"), "const x = <number>y;");
+        let (_, errors) = extract(&alloc, Path::new("a.ts"), "const x = <number>y;", &Detect::default());
         assert_eq!(errors, 0);
     }
 

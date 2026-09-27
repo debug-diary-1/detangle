@@ -297,7 +297,7 @@ impl Graph {
                 }
             }
             for ge in &mut g.edges {
-                ge.types.retain(|t| !matches!(*t, "type-only" | "dynamic" | "require" | "reexport" | "resource"));
+                ge.types.retain(|t| !IMPORT_KIND_TYPES.contains(t));
                 ge.types = edge_types(std::mem::take(&mut ge.types), ge.flags);
             }
         }
@@ -683,8 +683,27 @@ fn edge_types(base: Vec<&'static str>, f: ImportFlags) -> Vec<&'static str> {
     if f.resource {
         t.push("resource");
     }
+    if f.amd {
+        t.push("amd");
+    }
+    if f.jsdoc {
+        t.push("jsdoc");
+    }
+    if f.triple_slash {
+        t.push("triple-slash");
+    }
+    if f.exotic {
+        t.push("exotic-require");
+    }
+    if f.builtin_call {
+        t.push("process-get-builtin-module");
+    }
     t
 }
+
+/// Dependency types derived from how a module is imported (not what it is).
+pub const IMPORT_KIND_TYPES: &[&str] =
+    &["type-only", "dynamic", "require", "reexport", "resource", "amd", "jsdoc", "triple-slash", "exotic-require", "process-get-builtin-module"];
 
 #[derive(Default)]
 struct PackageDeps {
