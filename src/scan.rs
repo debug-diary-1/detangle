@@ -337,9 +337,20 @@ struct Resolvers {
     main: Resolver,
     plain: Resolver,
     aliases: Aliases,
+    /// `options.resolve.builtins` (a replacement list) and `builtins_add`.
+    builtins: Option<Vec<String>>,
+    builtins_add: Vec<String>,
 }
 
 impl Resolvers {
+    fn is_builtin(&self, spec: &str) -> bool {
+        let listed = |l: &[String]| l.iter().any(|b| b == spec || b == spec.trim_start_matches("node:"));
+        match &self.builtins {
+            Some(list) => listed(list),
+            None => is_builtin(spec) || listed(&self.builtins_add),
+        }
+    }
+
     fn resolve_file(&self, from: &Path, spec: &str) -> Result<Resolution, ResolveError> {
         self.main.resolve_file(from, spec).or_else(|e| match e {
             ResolveError::Ignored(_) => Err(e),
@@ -358,11 +369,15 @@ fn make_resolver(root: &Path, opts: &Options) -> Result<Resolvers> {
         }),
         None => TsconfigDiscovery::Auto,
     };
+    let r = &opts.resolve;
     let main = Resolver::new(ResolveOptions {
         tsconfig: Some(tsconfig),
-        extensions: with_extra(s(&[
-            ".ts", ".tsx", ".d.ts", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs", ".json", ".node", ".vue", ".svelte",
-        ]), &aliases.extensions),
+        extensions: with_extra(
+            r.extensions.clone().unwrap_or_else(|| {
+                s(&[".ts", ".tsx", ".d.ts", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs", ".json", ".node", ".vue", ".svelte"])
+            }),
+            &aliases.extensions,
+        ),
         // TS ESM projects write `./foo.js` while the file on disk is `foo.ts`.
         extension_alias: vec![
             // Prefer TS source, then the real runtime file, then its typings.
@@ -371,14 +386,19 @@ fn make_resolver(root: &Path, opts: &Options) -> Result<Resolvers> {
             (".mjs".into(), s(&[".mts", ".mjs"])),
             (".cjs".into(), s(&[".cts", ".cjs"])),
         ],
-        condition_names: s(&["import", "require", "node", "default", "types"]),
-        main_fields: s(&["module", "main", "types"]),
+        condition_names: r.condition_names.clone().unwrap_or_else(|| s(&["import", "require", "node", "default", "types"])),
+        main_fields: r.main_fields.clone().unwrap_or_else(|| s(&["module", "main", "types"])),
+        main_files: r.main_files.clone().unwrap_or_else(|| s(&["index"])),
+        exports_fields: r.exports_fields.as_ref().map_or_else(|| vec![s(&["exports"])], |f| f.iter().map(|x| x.split('.').map(String::from).collect()).collect()),
+        alias_fields: r.alias_fields.iter().map(|x| x.split('.').map(String::from).collect()).collect(),
+        symlinks: !r.preserve_symlinks,
+        yarn_pnp: r.yarn_pnp.unwrap_or_else(|| root.join(".pnp.cjs").is_file() || root.join(".pnp.js").is_file()),
         // webpack's resolve.modules (e.g. `src` or an absolute directory).
         modules: with_extra(s(&["node_modules"]), &aliases.modules),
         ..ResolveOptions::default()
     });
     let plain = main.clone_with_options(ResolveOptions { tsconfig: None, ..main.options().clone() });
-    Ok(Resolvers { main, plain, aliases })
+    Ok(Resolvers { main, plain, aliases, builtins: r.builtins.clone(), builtins_add: r.builtins_add.clone() })
 }
 
 thread_local! {
@@ -524,14 +544,14 @@ fn resolve(resolver: &Resolvers, from: &Path, spec: &str) -> Option<Target> {
         None => {}
     }
     // Babel `root`: bare specifiers are also looked up in these directories.
-    if is_bare(spec) && !is_builtin(spec) {
+    if is_bare(spec) && !resolver.is_builtin(spec) {
         for r in &resolver.aliases.roots {
             if let Ok(res) = resolver.resolve_file(from, &r.join(spec).to_string_lossy()) {
                 return Some(classify(res.path(), spec));
             }
         }
     }
-    if is_builtin(spec) {
+    if resolver.is_builtin(spec) {
         // `node:fs` ≡ `fs`, but `node:sqlite` / `node:test` only exist with the
         // prefix (plain `sqlite` is an npm package), so keep it for those.
         let bare = spec.trim_start_matches("node:");
@@ -795,6 +815,61 @@ export const f = (x) => [module.require("./g"), process.getBuiltinModule("fs"), 
         assert!(f(4).triple_slash && f(6).triple_slash && f(6).amd);
         assert!(f(7).jsdoc && f(7).type_only && f(8).jsdoc);
         assert!(!f(0).is_import() && ImportFlags::default().is_import());
+    }
+
+    #[test]
+    fn resolve_options_pick_conditions_fields_main_files_and_builtins() {
+        let root = std::env::temp_dir().join(format!("tangle-resolve-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let w = |p: &str, t: &str| {
+            let p = root.join(p);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, t).unwrap();
+        };
+        w("package.json", r#"{ "name": "r" }"#);
+        w("node_modules/cond-pkg/package.json", r#"{ "name": "cond-pkg", "exports": { ".": { "browser": "./b.js", "import": "./i.js", "default": "./d.js" } } }"#);
+        for f in ["b", "i", "d"] {
+            w(&format!("node_modules/cond-pkg/{f}.js"), "");
+        }
+        w("node_modules/field-pkg/package.json", r#"{ "name": "field-pkg", "main": "main.js", "browser": { "./main.js": "./browser.js" } }"#);
+        w("node_modules/field-pkg/main.js", "");
+        w("node_modules/field-pkg/browser.js", "");
+        w("src/dir/main.js", "");
+        w("src/index.js", "");
+        let root = root.canonicalize().unwrap();
+        let from = root.join("src/index.js");
+        let resolved = |opts: &Options, spec: &str| -> String {
+            let r = make_resolver(&root, opts).unwrap();
+            match resolve(&r, &from, spec) {
+                Some(Target::Local(p)) => p.strip_prefix(&root).unwrap().to_string_lossy().into_owned(),
+                Some(Target::Builtin(b)) => format!("builtin:{b}"),
+                Some(Target::Npm(n)) => format!("npm:{n}"),
+                other => format!("{other:?}"),
+            }
+        };
+        let plain = Options::default();
+        let mut browser = Options::default();
+        browser.resolve.condition_names = Some(vec!["browser".into(), "import".into()]);
+        browser.resolve.alias_fields = vec!["browser".into()];
+        browser.resolve.main_files = Some(vec!["main".into(), "index".into()]);
+        browser.resolve.builtins_add = vec!["electron".into()];
+        let file = |opts: &Options, spec: &str| {
+            let r = make_resolver(&root, opts).unwrap();
+            r.resolve_file(&from, spec).map(|x| x.path().strip_prefix(&root).unwrap().to_string_lossy().into_owned()).unwrap_or_default()
+        };
+        assert_eq!(file(&plain, "cond-pkg"), "node_modules/cond-pkg/i.js");
+        assert_eq!(file(&browser, "cond-pkg"), "node_modules/cond-pkg/b.js");
+        assert_eq!(file(&plain, "field-pkg"), "node_modules/field-pkg/main.js");
+        assert_eq!(file(&browser, "field-pkg"), "node_modules/field-pkg/browser.js");
+        assert_eq!(resolved(&plain, "./dir"), "Some(Unresolved)");
+        assert_eq!(resolved(&browser, "./dir"), "src/dir/main.js");
+        assert_eq!(resolved(&plain, "electron"), "Some(Unresolved)");
+        assert_eq!(resolved(&browser, "electron"), "builtin:electron");
+        let mut only = Options::default();
+        only.resolve.builtins = Some(vec!["vscode".into()]);
+        assert_eq!(resolved(&only, "vscode"), "builtin:vscode");
+        assert_eq!(resolved(&only, "fs"), "Some(Unresolved)");
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

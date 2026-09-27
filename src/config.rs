@@ -206,6 +206,9 @@ pub struct Options {
     /// Functions that load modules like `require`, e.g. `["module.require"]`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub exotic_require: Vec<String>,
+    /// Module resolution overrides (like webpack's / enhanced-resolve's).
+    #[serde(skip_serializing_if = "ResolveConfig::is_default")]
+    pub resolve: ResolveConfig,
     /// Which group a module joins when several match: "first" (the first
     /// definition) or "deepest" (the one matching the longest path).
     #[serde(skip_serializing_if = "GroupMatch::is_default")]
@@ -213,6 +216,48 @@ pub struct Options {
     /// How Vite / webpack / Babel configs are evaluated.
     #[serde(default, skip_serializing_if = "ConfigEnv::is_default")]
     pub config_env: ConfigEnv,
+}
+
+/// `[options.resolve]`: replaces tangle's resolution defaults where set.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ResolveConfig {
+    /// package.json `exports` / `imports` conditions, in priority order.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub condition_names: Option<Vec<String>>,
+    /// package.json fields naming the entry point (default: module, main, types).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub main_fields: Option<Vec<String>>,
+    /// File names tried for a directory (default: index).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub main_files: Option<Vec<String>>,
+    /// package.json fields holding export maps (default: exports).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exports_fields: Option<Vec<String>>,
+    /// package.json fields holding browser-style alias maps (e.g. browser).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub alias_fields: Vec<String>,
+    /// Extensions tried, in order (replaces the defaults).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extensions: Option<Vec<String>>,
+    /// Keep symlinked paths instead of following them to their target.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub preserve_symlinks: bool,
+    /// Resolve through Yarn Plug'n'Play (default: when .pnp.cjs exists).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub yarn_pnp: Option<bool>,
+    /// Extra module names treated as builtins (e.g. electron, vscode).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub builtins_add: Vec<String>,
+    /// Replace Node's builtin list entirely.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub builtins: Option<Vec<String>>,
+}
+
+impl ResolveConfig {
+    fn is_default(&self) -> bool {
+        *self == ResolveConfig::default()
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Deserialize, Serialize)]
@@ -334,6 +379,7 @@ impl Default for Options {
             baseline_stale: Severity::Off,
             nx_projects: false,
             group_match: GroupMatch::First,
+            resolve: ResolveConfig::default(),
             jsdoc_imports: false,
             builtin_module_calls: false,
             exotic_require: vec![],

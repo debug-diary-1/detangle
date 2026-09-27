@@ -74,6 +74,21 @@ tangle checks the filesystem itself to decide whether files were added or remove
 - Type-only and dynamic imports. By default type-only imports don't count toward cycles, because they're erased at runtime.
 - npm dependency classification by walking every enclosing `package.json`, so monorepo roots work: `npm`, `npm-dev`, `npm-peer`, `npm-optional`, `npm-undeclared`. `@types/*` packages count as declared for type-only packages.
 - `.gitignore` files are respected.
+- **Yarn Plug'n'Play**: when the root has a `.pnp.cjs`, packages resolve through it (from Yarn's zip cache), with PnP's strictness: undeclared transitive packages are unresolvable.
+- Resolution can be tuned in `[options.resolve]`, where each key replaces tangle's default:
+
+  ```toml
+  [options.resolve]
+  condition_names = ["browser", "import"]   # package.json exports conditions
+  main_fields = ["browser", "module", "main"]
+  main_files = ["index", "main"]
+  exports_fields = ["exports"]
+  alias_fields = ["browser"]                # browser-field remapping
+  extensions = [".ts", ".js"]
+  preserve_symlinks = true
+  builtins_add = ["electron", "vscode"]     # or builtins = [...] to replace Node's list
+  yarn_pnp = false                          # default: on when .pnp.cjs exists
+  ```
 
 ## Rules
 

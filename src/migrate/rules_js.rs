@@ -239,7 +239,7 @@ fn convert_rule(v: &Value, keys: &[&str]) -> Result<Value, Skip> {
 /// Options that only affect the originating tool's reporting or runtime.
 const HARMLESS_OPTIONS: &[&str] = &[
     "reporterOptions", "progress", "cache", "prefix", "outputType", "outputTo", "moduleSystems",
-    "combinedDependencies", "preserveSymlinks", "externalModuleResolutionStrategy", "parser",
+    "combinedDependencies", "parser",
     "skipAnalysisNotInRules", "metrics", "forceDeriveDependents", "experimentalStats", "baseDir",
     "validate", "ruleSet", "rulesFile", "mainFields",
     "exportsFields", "conditionNames", "extensions",
@@ -313,7 +313,28 @@ pub fn convert(v: &Value) -> Imported {
                         warnings.push(format!("options.moduleSystems leaves out {off:?}, but tangle always reads those imports"));
                     }
                 }
-                "builtInModules" => warnings.push("options.builtInModules isn't supported (Node's own list of builtins is used)".into()),
+                "builtInModules" => {
+                    let names = |k: &str| val.get(k).map(|l| l.as_array().into_iter().flatten().filter_map(|s| s.as_str().map(String::from)).collect::<Vec<_>>());
+                    opts.resolve.builtins = names("override");
+                    opts.resolve.builtins_add = names("add").unwrap_or_default();
+                }
+                "preserveSymlinks" => opts.resolve.preserve_symlinks = val == &json!(true),
+                "externalModuleResolutionStrategy" => opts.resolve.yarn_pnp = Some(val == &json!("yarn-pnp")),
+                "enhancedResolveOptions" => {
+                    let list = |k: &str| val.get(k).and_then(Value::as_array).map(|a| a.iter().filter_map(|s| s.as_str().map(String::from)).collect::<Vec<_>>());
+                    let r = &mut opts.resolve;
+                    r.condition_names = list("conditionNames");
+                    r.main_fields = list("mainFields");
+                    r.main_files = list("mainFiles");
+                    r.exports_fields = list("exportsFields");
+                    r.alias_fields = list("aliasFields").unwrap_or_default();
+                    r.extensions = list("extensions");
+                    for k in val.as_object().into_iter().flatten().map(|(k, _)| k) {
+                        if !["conditionNames", "mainFields", "mainFiles", "exportsFields", "aliasFields", "extensions", "cachedInputFileSystem"].contains(&k.as_str()) {
+                            warnings.push(format!("options.enhancedResolveOptions.{k} isn't supported (ignored)"));
+                        }
+                    }
+                }
                 // Converted to a tangle baseline by `tangle migrate`.
                 "knownViolations" => known_violations = val.as_str().map(String::from),
                 k if HARMLESS_OPTIONS.contains(&k) => {}
