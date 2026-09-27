@@ -143,10 +143,14 @@ impl Graph {
         let mut seen: HashMap<usize, usize> = HashMap::default();
         let mut bases: Vec<Vec<&'static str>> = vec![];
         let filter = PathFilter::new(opts);
+        let unfollowed = opts.do_not_follow.as_ref().and_then(|p| fancy_regex::Regex::new(&p.0).ok());
         for (from, f) in files.iter().enumerate() {
             seen.clear();
+            if unfollowed.as_ref().is_some_and(|r| r.is_match(&g.modules[from].id).unwrap_or(false)) {
+                continue;
+            }
             for imp in &f.imports {
-                if opts.ignore_type_only && imp.flags.type_only {
+                if (opts.ignore_type_only && imp.flags.type_only) || (opts.exclude_dynamic && imp.flags.dynamic) {
                     continue;
                 }
                 if filter.active() {

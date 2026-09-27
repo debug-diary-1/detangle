@@ -107,6 +107,12 @@ enum Cmd {
         /// Mark modules matching this regex
         #[arg(long)]
         highlight: Option<String>,
+        /// Start from the modules matching this regex: only show what they (indirectly) import
+        #[arg(long)]
+        from: Option<String>,
+        /// With --from, follow imports at most this many steps
+        #[arg(long, requires = "from")]
+        max_depth: Option<usize>,
         /// Include npm packages, node builtins and unresolved imports
         #[arg(long)]
         externals: bool,
@@ -433,7 +439,7 @@ fn run() -> Result<ExitCode> {
             let failing = errors > 0 || (strict && warnings > 0);
             return Ok(if failing { ExitCode::FAILURE } else { ExitCode::SUCCESS });
         }
-        Cmd::Graph { target, format, collapse, focus, focus_depth, reaches, highlight, externals, no_types, output } => {
+        Cmd::Graph { target, format, collapse, focus, focus_depth, reaches, highlight, from, max_depth, externals, no_types, output } => {
             let a = analyze(&target.path, target.config.as_deref(), target.mode.as_deref())?;
             let re = |r: Option<String>, what: &str| {
                 r.map(|r| regex::Regex::new(&r).with_context(|| format!("--{what}: invalid regex {r:?}"))).transpose()
@@ -450,6 +456,8 @@ fn run() -> Result<ExitCode> {
                 focus_depth,
                 reaches: re(reaches, "reaches")?,
                 highlight: re(highlight, "highlight")?,
+                from: re(from, "from")?,
+                max_depth,
                 externals,
                 type_only: !no_types,
             };

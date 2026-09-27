@@ -267,16 +267,32 @@ pub fn convert(v: &Value) -> Imported {
     if let Some(o) = v.get("options").and_then(Value::as_object) {
         for (k, val) in o {
             match k.as_str() {
-                "exclude" => opts.exclude_path = regex_option(val, k, &mut warnings),
-                "includeOnly" => opts.include_only = regex_option(val, k, &mut warnings),
-                "doNotFollow" => {
-                    // tangle never descends into node_modules; anything else can't be honoured.
-                    if let Some(p) = regex_option(val, k, &mut warnings)
-                        && !p.0.split('|').all(|alt| alt.contains("node_modules"))
-                    {
-                        warnings.push(format!("options.doNotFollow {:?} isn't supported (ignored)", p.0));
+                "exclude" => {
+                    opts.exclude_dynamic = val.get("dynamic") == Some(&json!(true));
+                    let path = match val {
+                        Value::Object(o) => o.get("path").cloned().map(|p| json!({ "path": p })).unwrap_or(Value::Null),
+                        other => other.clone(),
+                    };
+                    if !path.is_null() {
+                        opts.exclude_path = regex_option(&path, k, &mut warnings);
                     }
                 }
+                "includeOnly" => opts.include_only = regex_option(val, k, &mut warnings),
+                "doNotFollow" => {
+                    // tangle never descends into packages, so only other paths matter.
+                    let path = match val {
+                        Value::Object(o) => o.get("path").cloned().unwrap_or(Value::Null),
+                        other => other.clone(),
+                    };
+                    if let Ok(p) = serde_json::from_value::<Pat>(path)
+                        && !p.0.split('|').all(|alt| alt.contains("node_modules"))
+                    {
+                        opts.do_not_follow = Some(p);
+                    }
+                }
+                "maxDepth" => warnings.push(
+                    "options.maxDepth limits crawling from entry files; tangle checks the whole project (use `tangle graph --from … --max-depth N` to view a depth-limited graph)".into(),
+                ),
                 "tsConfig" => opts.tsconfig = val.get("fileName").and_then(Value::as_str).map(String::from),
                 "webpackConfig" => {
                     opts.webpack_config = val.get("fileName").and_then(Value::as_str).map(String::from);

@@ -295,6 +295,9 @@ fn compile_module(name: &str, m: &ModuleSpec) -> Result<CompiledModule> {
 }
 
 pub fn validate(cfg: &Config) -> Result<()> {
+    if let Some(p) = &cfg.options.do_not_follow {
+        regex(p, "options.do_not_follow")?;
+    }
     for r in &cfg.forbidden {
         if r.scope == Scope::Folder && (r.from.orphan.is_some() || r.to.reachable.is_some()) {
             bail!("rule '{}': `orphan` and `reachable` only apply to modules, not scope = \"folder\"", r.name);

@@ -164,6 +164,12 @@ pub struct Options {
     /// out of the graph entirely.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exclude_path: Option<Pat>,
+    /// Regex: these modules stay in the graph, but their own imports aren't followed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub do_not_follow: Option<Pat>,
+    /// Leave dynamic `import()` dependencies out of the graph.
+    #[serde(skip_serializing_if = "is_false")]
+    pub exclude_dynamic: bool,
     #[serde(default = "yes")]
     pub cycles_ignore_type_only: bool,
     /// Drop `import type` dependencies from the graph altogether.
@@ -368,6 +374,8 @@ impl Default for Options {
             exclude: vec!["**/node_modules/**".into()],
             include_only: None,
             exclude_path: None,
+            do_not_follow: None,
+            exclude_dynamic: false,
             cycles_ignore_type_only: true,
             ignore_type_only: false,
             tsconfig: None,

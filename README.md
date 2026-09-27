@@ -29,6 +29,8 @@ tangle graph -f dot --focus 'features/cart' | dot -Tsvg > cart.svg
 tangle graph --focus 'cart' --focus-depth 2 --highlight 'api/'   # two steps out, api modules marked
 tangle graph --reaches 'src/db/' -f mermaid                       # everything that depends on db
 tangle graph --collapse '^packages/[^/]+/' -f mermaid             # one node per package
+tangle graph --from 'src/main\.ts$' --max-depth 2                 # what the entry imports, 2 steps deep
+tangle graph -f d2 > deps.d2; tangle graph -f csv > matrix.csv    # D2 diagram, adjacency matrix
 tangle init                   # write a starter tangle.toml
 ```
 
@@ -101,6 +103,8 @@ allowed_severity = "error"    # for [[allowed]] below; top-level keys go before 
 exclude = ["**/node_modules/**", "**/dist/**"]   # globs of files to skip
 include_only = '^src/'        # regex: keep only these modules (sources and targets)
 exclude_path = '^src/generated/'
+do_not_follow = '^src/vendor/'   # keep these modules, but not their own imports
+exclude_dynamic = true           # leave import() dependencies out
 cycles_ignore_type_only = true
 
 [[forbidden]]

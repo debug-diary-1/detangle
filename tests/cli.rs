@@ -771,3 +771,41 @@ fn graph_csv_matrix_and_d2() {
     assert!(d2.contains("\"src\".\"c6.ts\": {class: cycle; link: \"src/c6.ts\"}"), "{d2}");
     assert!(d2.contains("\"src\".\"c6.ts\" -> \"src\".\"c7.ts\": {style.stroke: \"#dd3333\"; style.stroke-dash: 3}"), "{d2}");
 }
+
+#[test]
+fn do_not_follow_exclude_dynamic_and_max_depth() {
+    // Same results as the JavaScript rules tool on the cycle-depth fixture
+    // (c → d → e → c, j → k/l, …).
+    let dir = std::env::temp_dir().join(format!("tangle-follow-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    copy_dir(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cycle-depth"), &dir);
+    std::fs::remove_file(dir.join(".eslintrc.json")).unwrap();
+    std::fs::write(dir.join("src/lazy.js"), "export const lazy = () => import(\"./a.js\");\n").unwrap();
+    std::fs::write(dir.join("tangle.toml"), "[options]\ndo_not_follow = 'src/d\\.js'\nexclude_dynamic = true\n").unwrap();
+    let run = |args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_tangle")).args(args).current_dir(&dir).env("NO_COLOR", "1").output().unwrap();
+        serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()
+    };
+    let deps = |v: &serde_json::Value, id: &str| -> Vec<String> {
+        v["modules"].as_array().unwrap().iter().find(|m| m["id"] == id).unwrap()["dependencies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["module"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let all = run(&["graph", "-f", "json"]);
+    assert!(deps(&all, "src/d.js").is_empty()); // not followed, but still a module
+    assert_eq!(deps(&all, "src/c.js"), ["src/d.js"]);
+    assert!(deps(&all, "src/lazy.js").is_empty()); // dynamic import excluded
+    let ids = |v: serde_json::Value| -> Vec<String> {
+        let mut ids: Vec<String> = v["modules"].as_array().unwrap().iter().map(|m| m["id"].as_str().unwrap().to_string()).collect();
+        ids.sort();
+        ids
+    };
+    assert_eq!(ids(run(&["graph", "-f", "json", "--from", "^src/j", "--max-depth", "1"])), ["src/j.js", "src/k.js", "src/l.js"]);
+    assert_eq!(ids(run(&["graph", "-f", "json", "--from", "^src/j", "--max-depth", "2"])), ["src/j.js", "src/k.js", "src/l.js", "src/m.js"]);
+    // From c: d isn't followed, so e is never reached.
+    assert_eq!(ids(run(&["graph", "-f", "json", "--from", "^src/c"])), ["src/c.js", "src/d.js"]);
+    std::fs::remove_dir_all(&dir).unwrap();
+}

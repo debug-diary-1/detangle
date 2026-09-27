@@ -487,6 +487,9 @@ pub struct GraphView {
     /// Only modules matching this, and every module that (indirectly) depends on them.
     pub reaches: Option<Regex>,
     pub highlight: Option<Regex>,
+    /// Entry points: only modules they reach (within `max_depth` steps).
+    pub from: Option<Regex>,
+    pub max_depth: Option<usize>,
     pub externals: bool,
     pub type_only: bool,
 }
@@ -517,10 +520,21 @@ impl GraphView {
             keep
         });
         let reaching = self.reaches.as_ref().map(|re| g.closure(&hits(re), false));
-        match (focused, reaching) {
-            (Some(a), Some(b)) => Some(a.intersection(&b).copied().collect()),
-            (a, b) => a.or(b),
-        }
+        let reached = self.from.as_ref().map(|re| {
+            let mut keep: HashSet<usize> = hits(re).into_iter().collect();
+            let mut level: Vec<usize> = keep.iter().copied().collect();
+            let mut depth = 0;
+            while !level.is_empty() && self.max_depth.is_none_or(|max| depth < max) {
+                level = level
+                    .iter()
+                    .flat_map(|&m| g.out[m].iter().map(|&e| g.edges[e].to))
+                    .filter(|&n| keep.insert(n))
+                    .collect();
+                depth += 1;
+            }
+            keep
+        });
+        [focused, reaching, reached].into_iter().flatten().reduce(|a, b| a.intersection(&b).copied().collect())
     }
 
     pub fn highlighted(&self, g: &Graph, m: usize) -> bool {
