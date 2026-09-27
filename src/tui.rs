@@ -933,7 +933,7 @@ impl<'a> App<'a> {
             }
             if g.cycles[c].len() + 1 > path.len() {
                 lines.push(Line::raw(""));
-                lines.push(Line::styled(format!("All {} modules in this detangle", g.cycles[c].len()), Style::new().bold()));
+                lines.push(Line::styled(format!("All {} modules caught in these cycles", g.cycles[c].len()), Style::new().bold()));
                 for &m in &g.cycles[c] {
                     let mut l = vec![Span::raw("  ")];
                     l.extend(path_spans(&g.modules[m].id, ModuleKind::Local));
