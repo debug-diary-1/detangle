@@ -4,6 +4,8 @@ Fast dependency analysis and architecture rules for JavaScript and TypeScript: f
 
 **[Website](https://debug-diary-1.github.io/detangle/)** · **[Benchmarks](https://debug-diary-1.github.io/detangle/#benchmarks)** · **[Full reference](https://github.com/debug-diary-1/detangle/blob/main/docs/reference.md)** · **[Releases](https://github.com/debug-diary-1/detangle/releases)**
 
+![The detangle explorer on Excalidraw: a module's imports and importers, its import cycle, and the violations and hotspots tabs](https://raw.githubusercontent.com/debug-diary-1/detangle/main/docs/demo/explorer.gif)
+
 | Checking VS Code `src/` (10k modules, 113k imports) | Time | Memory |
 |---|---|---|
 | detangle | 0.19 s | 164 MB |
@@ -24,7 +26,7 @@ Prebuilt binaries for macOS, Linux and Windows (x64 and arm64) are on the [relea
 ## Quick start
 
 ```sh
-detangle                # interactive explorer, updates as you edit
+detangle                # interactive explorer (shown above), updates as you edit
 detangle check          # run the rules; exits 1 on errors
 detangle init           # write a starter detangle.toml
 detangle report --open  # HTML report

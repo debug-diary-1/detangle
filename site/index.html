@@ -70,6 +70,13 @@
   .card { border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; background: var(--card); }
   .card b { display: block; margin-bottom: 4px; }
   .card span { color: var(--muted); font-size: 15px; }
+  /* Wider than the text column, so terminal text stays readable. */
+  .demo {
+    display: block; margin-top: 12px; border-radius: 10px; overflow: hidden; border: 1px solid var(--line); background: #151515;
+    width: min(1100px, calc(100vw - 40px)); position: relative; left: 50%; transform: translateX(-50%);
+  }
+  .demo img { display: block; width: 100%; height: auto; }
+  .demo-caption { font-size: 14px; color: var(--muted); margin-top: 8px; }
   .controls { display: flex; flex-wrap: wrap; gap: 8px 20px; align-items: center; margin: 14px 0 6px; }
   .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
   .seg button {
@@ -118,6 +125,7 @@
     <nav>
       <a href="#install">Install</a>
       <a href="#start">Quick start</a>
+      <a href="#explorer">Explorer</a>
       <a href="#rules">Rules</a>
       <a href="#benchmarks">Benchmarks</a>
       <a href="https://github.com/debug-diary-1/detangle/blob/main/docs/reference.md">Reference</a>
@@ -181,6 +189,15 @@ detangle report --open</pre></div>
       <div class="card"><b><code>detangle graph</code></b><span>Diagrams in Mermaid, DOT, D2 or JSON, filtered to what matters.</span></div>
       <div class="card"><b><code>detangle affected</code></b><span>The modules, or tests, a change can affect.</span></div>
     </div>
+  </section>
+
+  <section id="explorer">
+    <h2>The explorer</h2>
+    <p>Run <code>detangle</code> with no arguments for an interactive view of your dependency graph. Filter to a module, see what it imports and what imports it, follow imports, and jump to the cycles and rule violations it's part of. It rebuilds as you edit.</p>
+    <a class="demo" href="explorer.gif" title="Open full size">
+      <img src="explorer.gif" width="1280" height="740" loading="lazy" alt="The detangle explorer on Excalidraw: filtering to App.tsx, browsing its 105 imports and 57 importers, following an import, then the Cycles, Violations and Hotspots tabs.">
+    </a>
+    <p class="demo-caption">Excalidraw's source, 852 modules. Keys: arrows to move, Enter to follow, <code>/</code> to filter, <code>1</code>–<code>4</code> for the tabs.</p>
   </section>
 
   <section id="rules">

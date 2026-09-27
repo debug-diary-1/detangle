@@ -5,3 +5,5 @@
 /npm-dist
 # Fixture .env files are test data (a global gitignore may exclude .env).
 !tests/fixtures/**/.env
+# Copied from docs/demo by the Pages workflow
+/site/explorer.gif

@@ -4,7 +4,7 @@ name: Pages
 on:
   push:
     branches: [main]
-    paths: ["site/**", ".github/workflows/pages.yml"]
+    paths: ["site/**", "docs/demo/**", ".github/workflows/pages.yml"]
   workflow_dispatch:
 
 permissions:
@@ -25,6 +25,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/configure-pages@v5
+      # The explorer demo lives with its recording script in docs/demo.
+      - run: cp docs/demo/explorer.gif site/
       - uses: actions/upload-pages-artifact@v3
         with:
           path: site
