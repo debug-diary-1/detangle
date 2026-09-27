@@ -4,10 +4,14 @@ name: Release
 # binaries for every platform and publish them to GitHub Releases, npm,
 # crates.io and the Homebrew tap.
 #
-# Repository secrets:
-#   NPM_TOKEN           npm automation token allowed to publish detangle and detangle-*
-#   CARGO_REGISTRY_TOKEN  crates.io token
-#   HOMEBREW_TAP_TOKEN  token with push access to debug-diary-1/homebrew-tap
+# npm and crates.io use trusted publishing (OIDC): no registry tokens are
+# stored here. On npmjs.com (each of detangle and detangle-*) and on crates.io
+# (detangle), the trusted publisher is: GitHub Actions, owner debug-diary-1,
+# repository detangle, workflow release.yml.
+#
+# Repository secret:
+#   HOMEBREW_TAP_TOKEN  fine-grained token with Contents read/write on
+#                       debug-diary-1/homebrew-tap
 
 on:
   push:
@@ -106,33 +110,66 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      id-token: write
+      id-token: write # npm trusted publishing (OIDC) + provenance
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
           registry-url: https://registry.npmjs.org
+      - name: Assert npm supports trusted publishing (>= 11.5.1)
+        run: |
+          # shellcheck disable=SC2016 # JavaScript in single quotes, on purpose
+          node -e '
+            const [maj, min, pat] = process.argv[1].split(".").map(Number);
+            if (!(maj > 11 || (maj === 11 && (min > 5 || (min === 5 && pat >= 1))))) {
+              console.error(`npm ${process.argv[1]} is older than 11.5.1; trusted publishing needs 11.5.1+`);
+              process.exit(1);
+            }' "$(npm --version)"
       - uses: actions/download-artifact@v4
         with:
           pattern: build-*
           merge-multiple: true
       - run: node scripts/npm-packages.mjs "${{ needs.version.outputs.version }}" bin npm-dist
-      # Platform packages first, so the main package's optionalDependencies resolve.
-      - env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      # npm exchanges this job's OIDC token for a short-lived publish token.
+      # Platform packages go first so the main package's optionalDependencies
+      # resolve. Versions already on the registry are skipped, so a rerun
+      # after a partial failure publishes only what's missing.
+      - name: Publish
         run: |
-          for d in npm-dist/detangle-*/; do (cd "$d" && npm publish --access public --provenance); done
-          cd npm-dist/detangle && npm publish --access public --provenance
+          for d in npm-dist/detangle-*/ npm-dist/detangle/; do
+            name=$(node -p "require('./$d/package.json').name")
+            version=$(node -p "require('./$d/package.json').version")
+            if [ "$(npm view "$name@$version" version 2>/dev/null)" = "$version" ]; then
+              echo "$name@$version is already published; skipping"
+              continue
+            fi
+            (cd "$d" && npm publish --access public --provenance)
+          done
 
   crates:
     needs: [version, github-release]
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # crates.io trusted publishing (OIDC)
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      - id: published
+        run: |
+          v="${{ needs.version.outputs.version }}"
+          if curl -sf -A "detangle-release (github.com/debug-diary-1/detangle)" "https://crates.io/api/v1/crates/detangle/$v" >/dev/null; then
+            echo "detangle $v is already on crates.io; skipping"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+      # Swaps this job's OIDC token for a crates.io token revoked when the job ends.
+      - if: steps.published.outputs.skip != 'true'
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1
+      - if: steps.published.outputs.skip != 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
         run: cargo publish --locked
 
   homebrew:
