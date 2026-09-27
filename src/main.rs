@@ -23,6 +23,11 @@ use crate::graph::{Graph, ModuleKind};
 use crate::report::Paint;
 use crate::rules::Violation;
 
+// Parsing and graph building allocate heavily from many threads, where
+// mimalloc is much faster than the system allocator (notably on macOS).
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[derive(Parser)]
 #[command(
     name = "tangle",
@@ -357,8 +362,18 @@ impl Project {
     }
 }
 
-fn analyze(path: &Path, config: Option<&Path>, mode: Option<&str>) -> Result<Analysis> {
-    Project::open(path, config, mode)?.announce().analyze()
+/// Analyses a project for a command that exits afterwards.
+fn analyze(path: &Path, config: Option<&Path>, mode: Option<&str>) -> Result<&'static mut Analysis> {
+    let project = one_shot(Project::open(path, config, mode)?.announce());
+    Ok(one_shot(project.analyze()?))
+}
+
+/// Keeps `v` until the process exits. One-shot commands use it for the
+/// project and its analysis: freeing a large graph piece by piece takes
+/// longer than the rest of the output (20 ms on VS Code), and the OS
+/// reclaims it all at once anyway.
+fn one_shot<T>(v: T) -> &'static mut T {
+    Box::leak(Box::new(v))
 }
 
 impl Project {
@@ -443,15 +458,15 @@ fn run() -> Result<ExitCode> {
             }
         }
         Cmd::Check { target, format, strict, baseline, write_baseline, baseline_mode } => {
-            let project = Project::open(&target.path, target.config.as_deref(), target.mode.as_deref())?.announce();
+            let project = one_shot(Project::open(&target.path, target.config.as_deref(), target.mode.as_deref())?.announce());
             if let Some(path) = write_baseline {
                 let path = path.or_else(|| project.baseline_path()).unwrap_or_else(|| PathBuf::from(".tangle-baseline.json"));
-                let a = project.analyze_with(false)?;
+                let a = one_shot(project.analyze_with(false)?);
                 let n = rules::write_baseline(&a.graph, &a.violations, &path, baseline_mode == BaselineMode::ShrinkOnly)?;
                 eprintln!("wrote {n} violations to {}", path.display());
                 return Ok(ExitCode::SUCCESS);
             }
-            let mut a = project.analyze()?;
+            let a = one_shot(project.analyze()?);
             let mut suppressed = a.suppressed;
             if let Some(b) = &baseline {
                 let used = rules::apply_baseline(&a.graph, &mut a.violations, b)?;
@@ -662,7 +677,7 @@ fn run() -> Result<ExitCode> {
             }
             println!("{} {}", p.green("wrote"), out.display());
             // Show where things stand right away.
-            let a = Project::open(&root, None, None)?.analyze()?;
+            let a = one_shot(one_shot(Project::open(&root, None, None)?).analyze()?);
             let (err, warn, info) = report::counts(&a.violations);
             println!(
                 "{} {err} errors, {warn} warnings, {info} info{} — see them with `tangle check` or `tangle report --open`",

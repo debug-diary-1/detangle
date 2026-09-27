@@ -5,6 +5,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use fancy_regex::Regex;
+use rayon::prelude::*;
 use rustc_hash::FxHashMap as HashMap;
 use serde::{Deserialize, Serialize};
 
@@ -783,23 +784,29 @@ fn eval_forbidden(cx: &mut Ctx, rule: &Rule, out: &mut Vec<Violation>) -> Result
 pub fn evaluate(g: &Graph, cfg: &Config) -> Result<Vec<Violation>> {
     let mut out = vec![];
     let exotic = &cfg.options.exotic_require;
-    let mut cx = Ctx::new(g).with_exotic(exotic);
     let n = g.modules.len();
-    let mut folder_cx: Option<Ctx> = None;
-    let mut group_cx: Option<Ctx> = None;
-    for rule in cfg.forbidden.iter().filter(|r| r.severity != Severity::Off) {
-        match rule.scope {
-            Scope::Module => eval_forbidden(&mut cx, rule, &mut out)?,
-            Scope::Folder => {
-                let fcx = folder_cx.get_or_insert_with(|| Ctx::new(g.folders()));
-                eval_forbidden(fcx, rule, &mut out)?;
-            }
-            Scope::Group => {
-                let gcx = group_cx.get_or_insert_with(|| Ctx::groups(g).with_exotic(exotic));
-                eval_forbidden(gcx, rule, &mut out)?;
-            }
-        }
+    // Rules are independent: evaluate them in parallel, each thread with its
+    // own contexts, and keep the configured order in the output.
+    let active: Vec<&Rule> = cfg.forbidden.iter().filter(|r| r.severity != Severity::Off).collect();
+    let found: Vec<Result<Vec<Violation>>> = active
+        .par_iter()
+        .map_init(
+            || (None::<Ctx>, None::<Ctx>, None::<Ctx>),
+            |(module_cx, folder_cx, group_cx), rule| {
+                let cx = match rule.scope {
+                    Scope::Module => module_cx.get_or_insert_with(|| Ctx::new(g).with_exotic(exotic)),
+                    Scope::Folder => folder_cx.get_or_insert_with(|| Ctx::new(g.folders())),
+                    Scope::Group => group_cx.get_or_insert_with(|| Ctx::groups(g).with_exotic(exotic)),
+                };
+                let mut out = vec![];
+                eval_forbidden(cx, rule, &mut out).map(|()| out)
+            },
+        )
+        .collect();
+    for f in found {
+        out.extend(f?);
     }
+    let mut cx = Ctx::new(g).with_exotic(exotic);
 
     // Allow-list: every dependency must match some `allowed` rule.
     if !cfg.allowed.is_empty() && cfg.allowed_severity != Severity::Off {

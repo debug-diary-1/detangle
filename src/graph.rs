@@ -3,6 +3,7 @@
 use std::collections::{HashSet, VecDeque};
 
 use rustc_hash::FxHashMap as HashMap;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
 use petgraph::algo::tarjan_scc;
@@ -107,6 +108,19 @@ pub struct Graph {
     pub members: Vec<Vec<usize>>,
 }
 
+/// Scratch space for `path_where`, reused across searches.
+#[derive(Default)]
+struct Bfs {
+    epoch: u32,
+    seen: Vec<u32>,
+    prev: Vec<usize>,
+    queue: VecDeque<usize>,
+}
+
+thread_local! {
+    static BFS: std::cell::RefCell<Bfs> = std::cell::RefCell::new(Bfs::default());
+}
+
 impl Graph {
     pub fn build(root: &Path, files: &[ScannedFile], work: Work, opts: &Options) -> Graph {
         let t = std::time::Instant::now();
@@ -136,8 +150,9 @@ impl Graph {
         }
 
         // Scanned files are modules 0..n in order; look targets up by path to
-        // avoid a path → string conversion per import.
-        let by_path: HashMap<&Path, usize> = files.iter().enumerate().map(|(i, f)| (f.path.as_path(), i)).collect();
+        // avoid a path → string conversion per import. Keyed by `OsStr`,
+        // which hashes much faster than `Path` (a miss just interns by id).
+        let by_path: HashMap<&OsStr, usize> = files.iter().enumerate().map(|(i, f)| (f.path.as_os_str(), i)).collect();
         let mut pkgs = PackageJsons::default();
         // Target → edge, for deduplicating imports within the current file.
         let mut seen: HashMap<usize, usize> = HashMap::default();
@@ -165,7 +180,7 @@ impl Graph {
                     }
                 }
                 let (to, base) = match &imp.target {
-                    Target::Local(p) => match by_path.get(p.as_path()) {
+                    Target::Local(p) => match by_path.get(p.as_os_str()) {
                         Some(&i) => (i, vec!["local"]),
                         None => (g.intern(ModuleKind::Local, g.rel(p)), vec!["local"]),
                     },
@@ -542,32 +557,45 @@ impl Graph {
         edge_ok: impl Fn(&Edge) -> bool,
         node_ok: impl Fn(usize) -> bool,
     ) -> Option<Vec<usize>> {
-        let mut prev: HashMap<usize, usize> = HashMap::default();
-        prev.insert(from, from);
-        let mut q = VecDeque::from([from]);
-        while let Some(m) = q.pop_front() {
-            if m == to {
-                let mut path = vec![to];
-                let mut cur = to;
-                while cur != from {
-                    cur = prev[&cur];
-                    path.push(cur);
-                }
-                path.reverse();
-                return Some(path);
+        BFS.with(|b| {
+            let mut b = b.borrow_mut();
+            let Bfs { epoch, seen, prev, queue } = &mut *b;
+            // Stamping visits with an epoch avoids clearing the arrays per
+            // search (rules run one per circular edge).
+            *epoch = epoch.wrapping_add(1);
+            if *epoch == 0 || seen.len() < self.modules.len() {
+                seen.clear();
+                seen.resize(self.modules.len(), 0);
+                prev.resize(self.modules.len(), 0);
+                *epoch = 1;
             }
-            for &e in &self.out[m] {
-                let edge = &self.edges[e];
-                if !edge_ok(edge) || !node_ok(edge.to) {
-                    continue;
+            let epoch = *epoch;
+            queue.clear();
+            seen[from] = epoch;
+            queue.push_back(from);
+            while let Some(m) = queue.pop_front() {
+                if m == to {
+                    let mut path = vec![to];
+                    let mut cur = to;
+                    while cur != from {
+                        cur = prev[cur];
+                        path.push(cur);
+                    }
+                    path.reverse();
+                    return Some(path);
                 }
-                if let std::collections::hash_map::Entry::Vacant(v) = prev.entry(edge.to) {
-                    v.insert(m);
-                    q.push_back(edge.to);
+                for &e in &self.out[m] {
+                    let edge = &self.edges[e];
+                    if seen[edge.to] == epoch || !edge_ok(edge) || !node_ok(edge.to) {
+                        continue;
+                    }
+                    seen[edge.to] = epoch;
+                    prev[edge.to] = m;
+                    queue.push_back(edge.to);
                 }
             }
-        }
-        None
+            None
+        })
     }
 
     /// Every module reachable from `starts` following dependencies (`forward`)
@@ -756,7 +784,7 @@ impl PackageDeps {
 /// Caches parsed package.json files by directory.
 #[derive(Default)]
 struct PackageJsons {
-    by_dir: HashMap<PathBuf, Option<PackageDeps>>,
+    by_dir: HashMap<OsString, Option<PackageDeps>>,
 }
 
 impl PackageJsons {
@@ -770,10 +798,11 @@ impl PackageJsons {
             None => format!("@types/{pkg}"),
         };
         for dir in file.ancestors().skip(1) {
-            if !self.by_dir.contains_key(dir) {
-                self.by_dir.insert(dir.to_path_buf(), PackageDeps::read(&dir.join("package.json")));
+            let key = dir.as_os_str();
+            if !self.by_dir.contains_key(key) {
+                self.by_dir.insert(key.to_os_string(), PackageDeps::read(&dir.join("package.json")));
             }
-            let deps = &self.by_dir[dir];
+            let deps = &self.by_dir[key];
             if let Some(d) = deps {
                 let kinds = d.kinds_of(pkg);
                 let kinds = if kinds.is_empty() { d.kinds_of(&types_pkg) } else { kinds };
