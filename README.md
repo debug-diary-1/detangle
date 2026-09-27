@@ -2,12 +2,14 @@
 
 Fast dependency analysis and architecture rules for JavaScript and TypeScript: find import cycles, enforce boundaries between parts of your code, and explore the dependency graph. Works with React, Vue, Svelte and Angular. Written in Rust on top of the [oxc](https://oxc.rs) parser and resolver.
 
-**[Website](https://debug-diary-1.github.io/detangle/)** · **[Full reference](https://github.com/debug-diary-1/detangle/blob/main/docs/reference.md)** · **[Releases](https://github.com/debug-diary-1/detangle/releases)**
+**[Website](https://debug-diary-1.github.io/detangle/)** · **[Benchmarks](https://debug-diary-1.github.io/detangle/#benchmarks)** · **[Full reference](https://github.com/debug-diary-1/detangle/blob/main/docs/reference.md)** · **[Releases](https://github.com/debug-diary-1/detangle/releases)**
 
-| VS Code `src/` (10k modules, 113k imports) | Time | Memory |
+| Checking VS Code `src/` (10k modules, 113k imports) | Time | Memory |
 |---|---|---|
-| detangle | 0.2 s | 160 MB |
-| the JavaScript rules tool | 40 s | 3.7 GB |
+| detangle | 0.19 s | 164 MB |
+| the JavaScript rules tool | 41 s | 3.5 GB |
+| madge `--circular` | 35 s | 0.9 GB |
+| ESLint `import/no-cycle` | 291 s | 2.4 GB |
 
 ## Install
 

@@ -9,14 +9,14 @@
   :root {
     --bg: #fbfaf8; --fg: #1d1c1a; --muted: #625f59; --line: #e4e1db;
     --card: #ffffff; --code-bg: #f2f0ec; --accent: #2d6a4f; --accent-fg: #ffffff;
-    --bar: #2d6a4f; --bar-slow: #c9c4bb;
+    --bar: #2d6a4f; --bar-slow: #a39d92;
     color-scheme: light;
   }
   @media (prefers-color-scheme: dark) {
     :root {
       --bg: #141413; --fg: #ecebe8; --muted: #a29f98; --line: #2c2b28;
       --card: #1b1b19; --code-bg: #22221f; --accent: #6fcf97; --accent-fg: #0f1a14;
-      --bar: #6fcf97; --bar-slow: #4a4843;
+      --bar: #4aa874; --bar-slow: #6e6b64;
       color-scheme: dark;
     }
   }
@@ -70,6 +70,39 @@
   .card { border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; background: var(--card); }
   .card b { display: block; margin-bottom: 4px; }
   .card span { color: var(--muted); font-size: 15px; }
+  .controls { display: flex; flex-wrap: wrap; gap: 8px 20px; align-items: center; margin: 14px 0 6px; }
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+  .seg button {
+    appearance: none; border: 0; background: var(--card); color: var(--muted); font: inherit; font-size: 14px;
+    padding: 6px 12px; cursor: pointer; border-left: 1px solid var(--line);
+  }
+  .seg button:first-child { border-left: 0; }
+  .seg button[aria-pressed="true"] { background: var(--code-bg); color: var(--fg); font-weight: 600; }
+  .chart { border: 1px solid var(--line); border-radius: 10px; background: var(--card); padding: 16px 18px 12px; margin-top: 10px; position: relative; }
+  .chart-title { font-size: 14px; color: var(--muted); margin-bottom: 10px; }
+  .brow { display: grid; grid-template-columns: 190px 1fr 130px; align-items: center; gap: 12px; padding: 5px 0; font-size: 14px; }
+  .brow .name { color: var(--fg); }
+  .brow .name small { color: var(--muted); }
+  .brow .track { height: 14px; }
+  .brow .fill { height: 100%; border-radius: 0 4px 4px 0; background: var(--bar-slow); min-width: 2px; }
+  .brow.me .fill { background: var(--bar); }
+  .brow .val { text-align: right; font-variant-numeric: tabular-nums; }
+  .brow .val small { color: var(--muted); display: block; font-size: 12px; }
+  .tip {
+    position: absolute; pointer-events: none; background: var(--fg); color: var(--bg); font-size: 13px; line-height: 1.45;
+    padding: 8px 10px; border-radius: 6px; white-space: nowrap; z-index: 2;
+  }
+  .table-wrap { overflow-x: auto; margin-top: 14px; }
+  table { border-collapse: collapse; width: 100%; font-size: 14px; font-variant-numeric: tabular-nums; }
+  th, td { text-align: right; padding: 7px 10px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  th:first-child, td:first-child { text-align: left; }
+  th { color: var(--muted); font-weight: 600; }
+  tr.me td { font-weight: 600; }
+  .method { font-size: 14px; color: var(--muted); }
+  @media (max-width: 620px) {
+    .brow { grid-template-columns: 1fr auto; }
+    .brow .track { grid-column: 1 / -1; order: 3; }
+  }
   footer { border-top: 1px solid var(--line); margin-top: 64px; }
   footer .wrap { padding-block: 22px 32px; color: var(--muted); font-size: 14px; display: flex; gap: 16px; flex-wrap: wrap; justify-content: space-between; }
   @media (max-width: 520px) {
@@ -86,6 +119,7 @@
       <a href="#install">Install</a>
       <a href="#start">Quick start</a>
       <a href="#rules">Rules</a>
+      <a href="#benchmarks">Benchmarks</a>
       <a href="https://github.com/debug-diary-1/detangle/blob/main/docs/reference.md">Reference</a>
       <a href="https://github.com/debug-diary-1/detangle">GitHub</a>
     </nav>
@@ -101,7 +135,7 @@
       <div class="bench-title">Checking VS Code's <code>src/</code> (10,000 modules, 113,000 imports)</div>
       <div class="row"><span><b>detangle</b></span><div class="track"><div class="fill fast" style="width:0.5%"></div></div><span class="t"><b>0.2 s</b></span></div>
       <div class="row"><span>JavaScript rules tool</span><div class="track"><div class="fill" style="width:100%"></div></div><span class="t">40 s</span></div>
-      <div class="bench-note">Same machine, same rules. detangle also uses 160 MB of memory against 3.7 GB.</div>
+      <div class="bench-note">Same machine, same rules. detangle also uses 164 MB of memory against 3.5 GB. <a href="#benchmarks">All benchmarks</a></div>
     </div>
   </section>
 
@@ -168,6 +202,22 @@ to = { path = '^src/features/', path_not = '^src/features/$1/' }</pre></div>
     <p>Adopting rules on an existing codebase? <code>detangle check --write-baseline</code> records today's violations, so CI fails only on new ones.</p>
   </section>
 
+  <section id="benchmarks">
+    <h2>Benchmarks</h2>
+    <p>Each tool checks the same repository for the problems it's built to find. detangle always runs its full default rule set: cycles, unresolvable imports, undeclared packages and orphans.</p>
+    <div class="controls" role="group" aria-label="Benchmark view">
+      <div class="seg" id="repo-seg" aria-label="Repository"></div>
+      <div class="seg" id="metric-seg" aria-label="Metric"></div>
+    </div>
+    <div class="chart" id="chart" aria-live="polite">
+      <div class="chart-title" id="chart-title"></div>
+      <div id="bars"></div>
+      <div class="tip" id="tip" hidden></div>
+    </div>
+    <div class="table-wrap"><table id="bench-table"></table></div>
+    <p class="method" id="method"></p>
+  </section>
+
   <section id="migrate">
     <h2>Coming from another tool</h2>
     <p><code>detangle migrate</code> converts your existing setup into a <code>detangle.toml</code>: JavaScript rules configs, ESLint import rules, Nx module boundaries, eslint-plugin-boundaries and madge.</p>
@@ -183,7 +233,64 @@ detangle migrate             <span class="c"># write detangle.toml</span></pre><
   </div>
 </footer>
 
+<script id="bench-data" type="application/json">{"repos":{"vscode":{"label":"VS Code","size":"10,100 modules, 113,000 imports","tools":[{"name":"detangle","wall":0.1892,"cpu":1.74,"cycles":5546132271.0,"rss_mb":164.1},{"name":"detangle (cached)","wall":0.0845,"cpu":0.51,"cycles":1656502358.0,"rss_mb":126.7},{"name":"JavaScript rules tool","wall":40.81,"cpu":46.51,"cycles":170313718078.0,"rss_mb":3608.9},{"name":"JavaScript rules tool (cached)","wall":0.88,"cpu":1.3,"cycles":3574784041.0,"rss_mb":584.6},{"name":"madge --circular","wall":34.7,"cpu":47.35,"cycles":172613847140.0,"rss_mb":918.9},{"name":"ESLint import/no-cycle","wall":291.26,"cpu":334.54,"cycles":1251025465247.0,"rss_mb":2500.1}]},"excalidraw":{"label":"Excalidraw","size":"1,000 modules, 4,500 imports","tools":[{"name":"detangle","wall":0.0209,"cpu":0.11,"cycles":399565797.5,"rss_mb":41.2},{"name":"detangle (cached)","wall":0.0155,"cpu":0.04,"cycles":179129002.5,"rss_mb":26.4},{"name":"JavaScript rules tool","wall":1.56,"cpu":2.3,"cycles":8701243180.0,"rss_mb":510.0},{"name":"JavaScript rules tool (cached)","wall":0.42,"cpu":0.54,"cycles":1961434289.0,"rss_mb":237.2},{"name":"madge --circular","wall":2.33,"cpu":4.28,"cycles":15798361255.0,"rss_mb":549.8},{"name":"ESLint import/no-cycle","wall":7.72,"cpu":11.79,"cycles":44042223362.0,"rss_mb":691.2}]}},"method":"Measured September 2026 on an Apple M3 Pro (12 cores, 36 GB, macOS), Node.js 24. detangle 0.1.0 \u00b7 the JavaScript rules tool 18.4 with cycle, orphan and unresolvable-import rules \u00b7 madge 8 <code>--circular<\/code> \u00b7 ESLint 9 with eslint-plugin-import 2.32 <code>import/no-cycle<\/code> (TypeScript resolver). Medians of 30 runs for detangle's wall time and 3\u201310 runs otherwise (one ESLint run on VS Code); CPU time, cycles and peak memory from <code>/usr/bin/time -l<\/code>. \"Cached\" rows are repeat runs with each tool's cache and nothing changed."}</script>
 <script>
+  // Benchmarks: bars for one repository and metric, plus the full table.
+  (() => {
+    const data = JSON.parse(document.getElementById('bench-data').textContent);
+    const metrics = {
+      wall: { word: 'slower', label: 'Wall time', title: 'Time to finish (lower is better)', fmt: (v) => v < 1 ? `${Math.round(v * 1000)} ms` : `${v.toFixed(v < 10 ? 2 : 1)} s` },
+      cpu: { word: 'more CPU time', label: 'CPU time', title: 'CPU time across all cores (lower is better)', fmt: (v) => v < 1 ? `${Math.round(v * 1000)} ms` : `${v.toFixed(v < 10 ? 2 : 1)} s` },
+      cycles: { word: 'more cycles', label: 'CPU cycles', title: 'CPU cycles used (lower is better)', fmt: (v) => v >= 1e9 ? `${(v / 1e9).toFixed(v < 1e10 ? 2 : 1)} B` : `${Math.round(v / 1e6)} M` },
+      rss_mb: { word: 'more memory', label: 'Memory', title: 'Peak memory (lower is better)', fmt: (v) => v >= 1024 ? `${(v / 1024).toFixed(1)} GB` : `${Math.round(v)} MB` },
+    };
+    const repos = Object.keys(data.repos);
+    let repo = repos[0], metric = 'wall';
+    const seg = (el, items, current, onPick) => {
+      el.replaceChildren(...items.map(([key, label]) => {
+        const b = document.createElement('button');
+        b.type = 'button'; b.textContent = label; b.setAttribute('aria-pressed', String(key === current));
+        b.addEventListener('click', () => onPick(key));
+        return b;
+      }));
+    };
+    const tip = document.getElementById('tip'), chart = document.getElementById('chart');
+    const times = (v, base, word) => { const x = v / base; return x < 1.05 ? '' : `${x < 10 ? x.toFixed(1) : Math.round(x)}× ${word}`; };
+    function render() {
+      seg(document.getElementById('repo-seg'), repos.map((r) => [r, data.repos[r].label]), repo, (r) => { repo = r; render(); });
+      seg(document.getElementById('metric-seg'), Object.entries(metrics).map(([k, m]) => [k, m.label]), metric, (m) => { metric = m; render(); });
+      const r = data.repos[repo], m = metrics[metric];
+      const rows = r.tools.filter((t) => t[metric] != null);
+      // Cached runs compare with detangle's cached run.
+      const baseOf = (t) => rows.find((x) => x.name === (t.name.endsWith('(cached)') ? 'detangle (cached)' : 'detangle'))[metric];
+      const max = Math.max(...rows.map((t) => t[metric]));
+      document.getElementById('chart-title').textContent = `${m.title} · ${r.label} (${r.size})`;
+      document.getElementById('bars').replaceChildren(...rows.map((t) => {
+        const row = document.createElement('div');
+        row.className = 'brow' + (t.name.startsWith('detangle') ? ' me' : '');
+        const more = t.name.startsWith('detangle') ? '' : times(t[metric], baseOf(t), m.word);
+        row.innerHTML = `<span class="name"></span><div class="track"><div class="fill"></div></div><span class="val"></span>`;
+        row.querySelector('.name').innerHTML = t.name.replace(/ \((.*)\)$/, ' <small>($1)</small>');
+        row.querySelector('.fill').style.width = `${Math.max(0.4, (t[metric] / max) * 100)}%`;
+        row.querySelector('.val').innerHTML = `${m.fmt(t[metric])}${more ? `<small>${more}</small>` : ''}`;
+        row.addEventListener('mousemove', (e) => {
+          const box = chart.getBoundingClientRect();
+          tip.innerHTML = `<b>${t.name}</b><br>Wall ${metrics.wall.fmt(t.wall)} · CPU ${metrics.cpu.fmt(t.cpu)}<br>${metrics.cycles.fmt(t.cycles)} cycles · ${metrics.rss_mb.fmt(t.rss_mb)}`;
+          tip.hidden = false;
+          tip.style.left = `${Math.min(e.clientX - box.left + 12, box.width - tip.offsetWidth - 8)}px`;
+          tip.style.top = `${e.clientY - box.top + 14}px`;
+        });
+        row.addEventListener('mouseleave', () => (tip.hidden = true));
+        return row;
+      }));
+      const head = `<tr><th>Tool</th>${Object.values(metrics).map((x) => `<th>${x.label}</th>`).join('')}</tr>`;
+      const body = r.tools.map((t) => `<tr class="${t.name.startsWith('detangle') ? 'me' : ''}"><td>${t.name}</td>${Object.entries(metrics).map(([k, x]) => `<td>${t[k] == null ? '—' : x.fmt(t[k])}</td>`).join('')}</tr>`).join('');
+      document.getElementById('bench-table').innerHTML = `<caption class="method" style="text-align:left;caption-side:bottom;padding-top:8px">${r.label}: medians of repeated runs.</caption>${head}${body}`;
+    }
+    document.getElementById('method').innerHTML = data.method;
+    render();
+  })();
+
   // Install tabs.
   const tabs = [...document.querySelectorAll('.tab')];
   tabs.forEach((tab) => tab.addEventListener('click', () => {
