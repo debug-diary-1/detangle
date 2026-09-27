@@ -11,7 +11,7 @@ if (!bin) {
   console.error(
     p
       ? `detangle: the ${p.package} package is missing. Reinstall without --no-optional / --omit=optional.`
-      : `detangle: no prebuilt binary for ${process.platform}-${process.arch}. Install with \`cargo install detangle\` and set DETANGLE_BIN, or use a supported platform.`,
+      : `detangle: no prebuilt binary for ${process.platform}-${process.arch}. Install with \`cargo install --locked detangle\` and set DETANGLE_BIN, or use a supported platform.`,
   );
   process.exit(2);
 }

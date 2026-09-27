@@ -16,7 +16,7 @@ Fast dependency analysis and architecture rules for JavaScript and TypeScript: f
 ```sh
 npm install --save-dev detangle          # or run once: npx detangle check
 brew install debug-diary-1/tap/detangle
-cargo install detangle
+cargo install --locked detangle
 ```
 
 Prebuilt binaries for macOS, Linux and Windows (x64 and arm64) are on the [releases page](https://github.com/debug-diary-1/detangle/releases).

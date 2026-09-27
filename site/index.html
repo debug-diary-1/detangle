@@ -156,8 +156,8 @@
       <p>For macOS and Linux.</p>
     </div>
     <div class="panel" role="tabpanel" id="p-cargo" aria-labelledby="t-cargo" hidden>
-      <div class="code"><pre>cargo install detangle</pre></div>
-      <p>Builds from source; needs Rust 1.88 or later.</p>
+      <div class="code"><pre>cargo install --locked detangle</pre></div>
+      <p>Builds from source; needs Rust 1.94 or later. <code>--locked</code> uses the exact dependency versions each release was tested with.</p>
     </div>
     <div class="panel" role="tabpanel" id="p-bin" aria-labelledby="t-bin" hidden>
       <p>Download the archive for your platform from the <a href="https://github.com/debug-diary-1/detangle/releases/latest">latest release</a>, unpack it and put <code>detangle</code> on your <code>PATH</code>. Builds are available for macOS, Linux (glibc and musl) and Windows, on x64 and arm64.</p>

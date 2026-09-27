@@ -29,6 +29,15 @@ jobs:
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked --no-fail-fast
 
+  msrv:
+    name: minimum Rust (Cargo.toml rust-version)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --locked --all-targets
+
   npm-packaging:
     name: npm packaging
     runs-on: ubuntu-latest

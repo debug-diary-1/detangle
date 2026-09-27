@@ -2,7 +2,7 @@
 name = "detangle"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.94"
 description = "Fast dependency analysis and architecture rules for JavaScript and TypeScript"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/debug-diary-1/detangle"
