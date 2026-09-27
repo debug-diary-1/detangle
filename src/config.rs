@@ -164,6 +164,54 @@ pub struct Options {
     /// config (.babelrc, babel.config.js or package.json).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub babel_config: Option<String>,
+    /// How Vite / webpack / Babel configs are evaluated.
+    #[serde(default, skip_serializing_if = "ConfigEnv::is_default")]
+    pub config_env: ConfigEnv,
+}
+
+/// What JS build configs see when tangle evaluates them.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ConfigEnv {
+    /// Vite `mode` and webpack `argv.mode` (default "development").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    /// Vite `command`: "serve" (default) or "build". Also sets webpack-cli's
+    /// `env.WEBPACK_SERVE` / `env.WEBPACK_BUILD`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// webpack's `env` argument, as with `webpack --env production`.
+    #[serde(skip_serializing_if = "serde_json::Map::is_empty")]
+    pub webpack_env: serde_json::Map<String, serde_json::Value>,
+    /// Environment variables while the configs are evaluated.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub vars: std::collections::BTreeMap<String, String>,
+}
+
+impl ConfigEnv {
+    fn is_default(&self) -> bool {
+        *self == ConfigEnv::default()
+    }
+
+    pub fn mode(&self) -> &str {
+        self.mode.as_deref().unwrap_or("development")
+    }
+
+    pub fn command(&self) -> &str {
+        self.command.as_deref().unwrap_or("serve")
+    }
+
+    /// `NODE_ENV` unless set explicitly: "production" for a production mode
+    /// or a build, else "development" (as Vite does).
+    pub fn node_env(&self) -> String {
+        if let Some(v) = self.vars.get("NODE_ENV") {
+            return v.clone();
+        }
+        if let Ok(v) = std::env::var("NODE_ENV") {
+            return v;
+        }
+        if self.mode() == "production" || self.command() == "build" { "production" } else { "development" }.into()
+    }
 }
 
 impl Default for Options {
@@ -179,6 +227,7 @@ impl Default for Options {
             aliases: Default::default(),
             webpack_config: None,
             vite_config: None,
+            config_env: ConfigEnv::default(),
             babel_config: None,
         }
     }

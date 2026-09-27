@@ -10,7 +10,7 @@ use anyhow::{Context, Result, bail};
 use fancy_regex::Regex;
 use serde::Deserialize;
 
-use crate::config::Options;
+use crate::config::{ConfigEnv, Options};
 
 #[derive(Debug)]
 enum Key {
@@ -65,13 +65,13 @@ impl Aliases {
             a.rules.push(Rule { key: key_for(k)?, targets: vec![Some(v.clone())], base: Some(root.to_path_buf()), url_root: None });
         }
         if let Some(file) = &opts.webpack_config {
-            a.add_webpack(&root.join(file)).with_context(|| format!("loading webpack config {file}"))?;
+            a.add_webpack(&root.join(file), &opts.config_env).with_context(|| format!("loading webpack config {file}"))?;
         }
         if let Some(file) = &opts.vite_config {
-            a.add_vite(&root.join(file)).with_context(|| format!("loading vite config {file}"))?;
+            a.add_vite(&root.join(file), &opts.config_env).with_context(|| format!("loading vite config {file}"))?;
         }
         if let Some(file) = &opts.babel_config {
-            a.add_babel(&root.join(file)).with_context(|| format!("loading babel config {file}"))?;
+            a.add_babel(&root.join(file), &opts.config_env).with_context(|| format!("loading babel config {file}"))?;
         }
         Ok(a)
     }
@@ -135,7 +135,7 @@ impl Aliases {
         None
     }
 
-    fn add_webpack(&mut self, file: &Path) -> Result<()> {
+    fn add_webpack(&mut self, file: &Path, env: &ConfigEnv) -> Result<()> {
         #[derive(Deserialize)]
         struct Entry {
             name: String,
@@ -159,7 +159,7 @@ impl Aliases {
             extensions: Vec<String>,
         }
         let base = file.parent().unwrap_or(Path::new(".")).to_path_buf();
-        let r: Resolve = serde_json::from_str(&run_node(WEBPACK_LOADER, file)?)?;
+        let r: Resolve = serde_json::from_str(&run_node(WEBPACK_LOADER, file, env)?)?;
         fn flatten(v: Value, out: &mut Vec<Option<String>>) {
             match v {
                 Value::Path(p) => out.push(Some(p)),
@@ -187,7 +187,7 @@ impl Aliases {
         Ok(())
     }
 
-    fn add_vite(&mut self, file: &Path) -> Result<()> {
+    fn add_vite(&mut self, file: &Path, env: &ConfigEnv) -> Result<()> {
         #[derive(Deserialize)]
         #[serde(untagged)]
         enum Find {
@@ -205,7 +205,7 @@ impl Aliases {
             extensions: Vec<String>,
             root: String,
         }
-        let r: Resolve = serde_json::from_str(&run_node(VITE_LOADER, file)?)?;
+        let r: Resolve = serde_json::from_str(&run_node(VITE_LOADER, file, env)?)?;
         let root = PathBuf::from(r.root);
         for e in r.alias {
             let key = match e.find {
@@ -226,7 +226,7 @@ impl Aliases {
         Ok(())
     }
 
-    fn add_babel(&mut self, file: &Path) -> Result<()> {
+    fn add_babel(&mut self, file: &Path, env: &ConfigEnv) -> Result<()> {
         #[derive(Deserialize, Default)]
         #[serde(default)]
         struct Resolver {
@@ -234,7 +234,7 @@ impl Aliases {
             alias: Vec<(String, String)>,
             cwd: Option<String>,
         }
-        let found: Option<Resolver> = serde_json::from_str(&run_node(BABEL_LOADER, file)?)?;
+        let found: Option<Resolver> = serde_json::from_str(&run_node(BABEL_LOADER, file, env)?)?;
         let Some(r) = found else {
             bail!("no babel-plugin-module-resolver entry in {}", file.display());
         };
@@ -276,10 +276,25 @@ fn key_for(k: &str) -> Result<Key> {
     })
 }
 
-fn run_node(script: &str, file: &Path) -> Result<String> {
+fn run_node(script: &str, file: &Path, env: &ConfigEnv) -> Result<String> {
     let abs = std::fs::canonicalize(file).with_context(|| format!("{} not found", file.display()))?;
+    let command = env.command();
+    if command != "serve" && command != "build" {
+        bail!("config_env.command must be \"serve\" or \"build\", not {command:?}");
+    }
+    // webpack-cli adds these flags to `env`; explicit webpack_env wins.
+    let mut webpack_env = serde_json::Map::new();
+    webpack_env.insert(if command == "build" { "WEBPACK_BUILD" } else { "WEBPACK_SERVE" }.into(), true.into());
+    if command == "build" {
+        webpack_env.insert("WEBPACK_BUNDLE".into(), true.into());
+    }
+    webpack_env.extend(env.webpack_env.clone());
+    let args = serde_json::json!({ "mode": env.mode(), "command": command, "webpackEnv": webpack_env });
     let out = Command::new("node")
         .args(["-e", script])
+        .envs(&env.vars)
+        .env("NODE_ENV", env.node_env())
+        .env("TANGLE_CONFIG_ARGS", args.to_string())
         .env("TANGLE_CONFIG_FILE", &abs)
         .current_dir(abs.parent().unwrap_or(Path::new(".")))
         .output()
@@ -305,7 +320,8 @@ const { pathToFileURL } = require('url');
   const file = process.env.TANGLE_CONFIG_FILE;
   const m = await import(pathToFileURL(file).href);
   let c = m.default ?? m;
-  if (typeof c === 'function') c = await c({}, { mode: 'development', env: {} });
+  const args = JSON.parse(process.env.TANGLE_CONFIG_ARGS);
+  if (typeof c === 'function') c = await c(args.webpackEnv, { mode: args.mode, env: args.webpackEnv });
   const configs = Array.isArray(c) ? c : [c];
   const out = { alias: [], modules: [], extensions: [] };
   for (const cfg of configs) {
@@ -330,7 +346,8 @@ const path = require('path'), { pathToFileURL } = require('url');
   const file = process.env.TANGLE_CONFIG_FILE;
   const m = await import(pathToFileURL(file).href);
   let c = m.default ?? m;
-  if (typeof c === 'function') c = await c({ command: 'serve', mode: 'development', isSsrBuild: false, isPreview: false });
+  const args = JSON.parse(process.env.TANGLE_CONFIG_ARGS);
+  if (typeof c === 'function') c = await c({ command: args.command, mode: args.mode, isSsrBuild: false, isPreview: false });
   c = (await c) || {};
   const r = c.resolve || {};
   const raw = Array.isArray(r.alias) ? r.alias : Object.entries(r.alias || {}).map(([find, replacement]) => ({ find, replacement }));
@@ -361,7 +378,8 @@ const fs = require('fs'), path = require('path'), { pathToFileURL } = require('u
   }
   if (typeof c === 'function') {
     const cache = Object.assign(() => {}, { forever() {}, never() {}, using: (f) => f(), invalidate: (f) => f() });
-    c = c({ cache, env: (x) => (x === undefined ? 'development' : typeof x === 'function' ? x('development') : [].concat(x).includes('development')),
+    const envName = process.env.BABEL_ENV || process.env.NODE_ENV || 'development';
+    c = c({ cache, env: (x) => (x === undefined ? envName : typeof x === 'function' ? x(envName) : [].concat(x).includes(envName)),
             caller: () => undefined, version: '7.0.0', assertVersion() {} });
   }
   let found = null;

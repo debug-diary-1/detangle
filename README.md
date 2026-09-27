@@ -139,7 +139,20 @@ babel_config = "babel.config.js"       # or .babelrc / package.json
 aliases = { "@" = "./src", "@lib" = "./packages/lib/src" }
 ```
 
-Vite, webpack and Babel configs are evaluated with Node, so their dependencies must be installed. Vite and webpack configs are called in development mode. They only run when named here, never by auto-detection. Aliases rewrite the import before resolution, so tsconfig `paths`, package `exports` and the other resolution rules still apply to the result. Editing any of these config files triggers a full rebuild in watch mode.
+Vite, webpack and Babel configs are evaluated with Node, so their dependencies must be installed. By default they're evaluated as a development server would evaluate them. To choose what they see:
+
+```toml
+[options.config_env]
+mode = "production"                  # Vite `mode`, webpack `argv.mode` (default "development")
+command = "build"                    # Vite `command`: "serve" (default) or "build"
+webpack_env = { production = true }  # webpack `env`, as with `webpack --env production`
+vars = { API_TARGET = "staging" }    # environment variables while evaluating configs
+```
+
+- **`--mode`:** `tangle check --mode staging` (and every other command) overrides `mode` for one run.
+- **`NODE_ENV`:** defaults to `production` for a production mode or a `build`, otherwise `development`, as in Vite. A value in `vars` or your shell wins.
+- **webpack:** as with webpack-cli, `env` also gets `WEBPACK_SERVE`, or `WEBPACK_BUILD` and `WEBPACK_BUNDLE`.
+- **Babel:** `api.env()` follows `BABEL_ENV`, then `NODE_ENV`. They only run when named here, never by auto-detection. Aliases rewrite the import before resolution, so tsconfig `paths`, package `exports` and the other resolution rules still apply to the result. Editing any of these config files triggers a full rebuild in watch mode.
 
 ### Folder scope
 
@@ -204,7 +217,7 @@ tangle check -c rules.config.js                   # run it as is
 tangle init --from rules.config.js                # convert it to tangle.toml
 ```
 
-Rule names, severities, regexes (including `$1` groups and lookarounds), `allowed`, `allowedSeverity`, `required`, module rules, `via`/`viaOnly`, licenses, dependency types and the `exclude`/`includeOnly`/`tsConfig`/`tsPreCompilationDeps` options all carry over. A rule that uses something tangle can't honour exactly (for example `scope: "folder"` or the `npm-bundled` type) is skipped with a warning rather than silently loosened. A skipped `allowed` rule gets a louder warning, because dropping it adds violations.
+Rule names, severities, regexes (including `$1` groups and lookarounds), `allowed`, `allowedSeverity`, `required`, module rules, `via`/`viaOnly`, licenses, dependency types and the `exclude`, `includeOnly`, `tsConfig`, `tsPreCompilationDeps`, `webpackConfig` (with its `env` and `arguments.mode`) and `babelConfig` options all carry over. A rule that uses something tangle can't honour exactly (for example `scope: "folder"` or the `npm-bundled` type) is skipped with a warning rather than silently loosened. A skipped `allowed` rule gets a louder warning, because dropping it adds violations.
 
 ## Cycle detection
 

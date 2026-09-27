@@ -5,6 +5,9 @@ fn tangle(args: &[&str]) -> (String, i32) {
         .args(args)
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .env("NO_COLOR", "1")
+        // Configs see NODE_ENV/BABEL_ENV; keep the caller's shell out of it.
+        .env_remove("NODE_ENV")
+        .env_remove("BABEL_ENV")
         .output()
         .unwrap();
     (String::from_utf8(out.stdout).unwrap(), out.status.code().unwrap())
@@ -287,4 +290,66 @@ fn vite_aliases() {
             "src/main.ts: ~/theme -> src/shared/theme.ts",                   // RegExp find with $1
         ]
     );
+}
+
+/// What each alias in tests/fixtures/config-env resolved to, e.g. "mode/production".
+fn config_env_targets(extra: &[&str]) -> Vec<String> {
+    let mut args = vec!["graph", "tests/fixtures/config-env", "-f", "json"];
+    args.extend(extra);
+    let (out, code) = tangle(&args);
+    assert_eq!(code, 0, "{out}");
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let index = v["modules"].as_array().unwrap().iter().find(|m| m["id"] == "src/index.js").unwrap();
+    index["dependencies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| {
+            let m = d["module"].as_str().unwrap();
+            m.trim_start_matches("src/").trim_end_matches("/index.js").to_string()
+        })
+        .collect()
+}
+
+#[test]
+fn config_env_defaults() {
+    assert_eq!(
+        config_env_targets(&[]),
+        ["api/dev", "mode/development", "node-env/development", "var/none", "cli/serve", "cmd/serve", "vmode/development", "benv/development"]
+    );
+}
+
+#[test]
+fn config_env_from_tangle_toml() {
+    let cfg = std::env::temp_dir().join(format!("tangle-config-env-{}.toml", std::process::id()));
+    std::fs::write(
+        &cfg,
+        r#"
+[options]
+webpack_config = "webpack.config.js"
+vite_config = "vite.config.mjs"
+babel_config = "babel.config.js"
+
+[options.config_env]
+mode = "production"
+command = "build"
+webpack_env = { production = true }
+vars = { API_TARGET = "staging" }
+"#,
+    )
+    .unwrap();
+    let got = config_env_targets(&["-c", cfg.to_str().unwrap()]);
+    std::fs::remove_file(&cfg).unwrap();
+    assert_eq!(
+        got,
+        // NODE_ENV follows mode/command; Babel's api.env() follows NODE_ENV.
+        ["api/prod", "mode/production", "node-env/production", "var/staging", "cli/build", "cmd/build", "vmode/production", "benv/production"]
+    );
+}
+
+#[test]
+fn config_env_mode_flag() {
+    let got = config_env_targets(&["--mode", "staging"]);
+    assert_eq!(got[1], "mode/staging");
+    assert_eq!(got[6], "vmode/staging");
 }

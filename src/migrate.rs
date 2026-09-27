@@ -278,8 +278,16 @@ pub fn convert(v: &Value) -> Imported {
                 "tsConfig" => opts.tsconfig = val.get("fileName").and_then(Value::as_str).map(String::from),
                 "webpackConfig" => {
                     opts.webpack_config = val.get("fileName").and_then(Value::as_str).map(String::from);
-                    if val.get("env").is_some() || val.get("arguments").is_some() {
-                        warnings.push("options.webpackConfig env/arguments aren't passed on (the config is called with an empty env in development mode)".into());
+                    // `env` may be an object or a single flag name (`--env production`).
+                    match val.get("env") {
+                        Some(Value::Object(o)) => opts.config_env.webpack_env = o.clone(),
+                        Some(Value::String(flag)) => {
+                            opts.config_env.webpack_env.insert(flag.clone(), json!(true));
+                        }
+                        _ => {}
+                    }
+                    if let Some(mode) = val.pointer("/arguments/mode").and_then(Value::as_str) {
+                        opts.config_env.mode = Some(mode.to_string());
                     }
                 }
                 "babelConfig" => opts.babel_config = val.get("fileName").and_then(Value::as_str).map(String::from),
@@ -380,7 +388,7 @@ mod tests {
                 "tsConfig": { "fileName": "tsconfig.json" },
                 "tsPreCompilationDeps": true,
                 "reporterOptions": { "dot": {} },
-                "webpackConfig": { "fileName": "webpack.config.js" },
+                "webpackConfig": { "fileName": "webpack.config.js", "env": { "production": true }, "arguments": { "mode": "production" } },
                 "babelConfig": { "fileName": ".babelrc" },
                 "exoticRequireStrings": ["want"]
             }
@@ -403,6 +411,8 @@ mod tests {
         assert!(w.contains("'fancy' skipped: to.exoticallyRequired"), "{w}");
         assert!(w.contains("'bundled' skipped: dependency type \"npm-bundled\""), "{w}");
         assert_eq!(o.webpack_config.as_deref(), Some("webpack.config.js"));
+        assert_eq!(o.config_env.webpack_env.get("production"), Some(&json!(true)));
+        assert_eq!(o.config_env.mode.as_deref(), Some("production"));
         assert_eq!(o.babel_config.as_deref(), Some(".babelrc"));
         assert!(!w.contains("webpackConfig") && !w.contains("babelConfig"), "{w}");
         assert!(w.contains("options.exoticRequireStrings"), "{w}");

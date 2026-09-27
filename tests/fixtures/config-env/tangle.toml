@@ -1,0 +1,4 @@
+[options]
+webpack_config = "webpack.config.js"
+vite_config = "vite.config.mjs"
+babel_config = "babel.config.js"

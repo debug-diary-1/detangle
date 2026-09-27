@@ -43,6 +43,9 @@ struct Target {
     /// Config file (default: <root>/tangle.toml, else built-in rules)
     #[arg(short, long)]
     config: Option<PathBuf>,
+    /// Mode for evaluating Vite / webpack configs (overrides config_env.mode)
+    #[arg(long)]
+    mode: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -106,6 +109,9 @@ enum Cmd {
         dir: PathBuf,
         #[arg(short, long)]
         config: Option<PathBuf>,
+        /// Mode for evaluating Vite / webpack configs
+        #[arg(long)]
+        mode: Option<String>,
     },
     /// List modules affected by changes to the given files (transitive dependents)
     Affected {
@@ -117,6 +123,9 @@ enum Cmd {
         dir: PathBuf,
         #[arg(short, long)]
         config: Option<PathBuf>,
+        /// Mode for evaluating Vite / webpack configs
+        #[arg(long)]
+        mode: Option<String>,
         /// Only print affected modules matching this regex (e.g. '\.test\.ts$')
         #[arg(long)]
         filter: Option<String>,
@@ -176,6 +185,7 @@ pub struct Project {
     dir: PathBuf,
     root: PathBuf,
     config_arg: Option<PathBuf>,
+    mode_arg: Option<String>,
     cfg: Config,
     config_path: Option<PathBuf>,
     /// Notes from loading the config (e.g. JavaScript config import warnings).
@@ -184,14 +194,17 @@ pub struct Project {
 }
 
 impl Project {
-    fn open(path: &Path, config: Option<&Path>) -> Result<Self> {
+    fn open(path: &Path, config: Option<&Path>, mode: Option<&str>) -> Result<Self> {
         let dir = std::fs::canonicalize(path).with_context(|| format!("{} not found", path.display()))?;
         if !dir.is_dir() {
             bail!("{} is not a directory", path.display());
         }
         let root = config::find_root(&dir);
         let loaded = config::load(&root, config)?;
-        let cfg: Config = loaded.config;
+        let mut cfg: Config = loaded.config;
+        if let Some(m) = mode {
+            cfg.options.config_env.mode = Some(m.to_string());
+        }
         rules::validate(&cfg).with_context(|| match &loaded.path {
             Some(p) => format!("in {}", p.display()),
             None => "in the built-in rules".into(),
@@ -201,6 +214,7 @@ impl Project {
             dir,
             root,
             config_arg: config.map(Path::to_path_buf),
+            mode_arg: mode.map(String::from),
             cfg,
             config_path: loaded.path,
             notes: loaded.notes,
@@ -220,7 +234,7 @@ impl Project {
     fn rebuild(&mut self, changes: &watch::Changes) -> Result<(Analysis, String)> {
         let t = std::time::Instant::now();
         if changes.config {
-            *self = Project::open(&self.dir, self.config_arg.as_deref())?;
+            *self = Project::open(&self.dir, self.config_arg.as_deref(), self.mode_arg.as_deref())?;
         } else {
             self.session.update(&changes.paths.iter().cloned().collect::<Vec<_>>())?;
         }
@@ -239,8 +253,8 @@ impl Project {
     }
 }
 
-fn analyze(path: &Path, config: Option<&Path>) -> Result<Analysis> {
-    Project::open(path, config)?.announce().analyze()
+fn analyze(path: &Path, config: Option<&Path>, mode: Option<&str>) -> Result<Analysis> {
+    Project::open(path, config, mode)?.announce().analyze()
 }
 
 impl Project {
@@ -272,7 +286,7 @@ fn run() -> Result<ExitCode> {
             if !std::io::stdout().is_terminal() {
                 bail!("the explorer needs a terminal; try `tangle check` or `tangle stats`");
             }
-            let mut project = Project::open(&t.path, t.config.as_deref())?.announce();
+            let mut project = Project::open(&t.path, t.config.as_deref(), t.mode.as_deref())?.announce();
             let a = project.analyze()?;
             let watcher = if no_watch { None } else { watch::Watcher::new(&project.root).ok() };
             tui::run(a, |changes| project.rebuild(changes), watcher)?;
@@ -288,7 +302,7 @@ fn run() -> Result<ExitCode> {
                 // after a config error) try a full open.
                 let result = match project.as_mut() {
                     Some(p) => p.rebuild(&changes).map(|(a, s)| (a, Some(s))),
-                    None => Project::open(&t.path, t.config.as_deref()).and_then(|p| {
+                    None => Project::open(&t.path, t.config.as_deref(), t.mode.as_deref()).and_then(|p| {
                         let a = p.analyze()?;
                         project = Some(p);
                         Ok((a, None))
@@ -309,7 +323,7 @@ fn run() -> Result<ExitCode> {
             }
         }
         Cmd::Check { target, format, strict, baseline, write_baseline } => {
-            let mut a = analyze(&target.path, target.config.as_deref())?;
+            let mut a = analyze(&target.path, target.config.as_deref(), target.mode.as_deref())?;
             if let Some(path) = write_baseline {
                 rules::write_baseline(&a.graph, &a.violations, &path)?;
                 eprintln!("wrote {} violations to {}", a.violations.len(), path.display());
@@ -336,7 +350,7 @@ fn run() -> Result<ExitCode> {
             return Ok(if failing { ExitCode::FAILURE } else { ExitCode::SUCCESS });
         }
         Cmd::Graph { target, format, collapse, focus, externals, no_types, output } => {
-            let a = analyze(&target.path, target.config.as_deref())?;
+            let a = analyze(&target.path, target.config.as_deref(), target.mode.as_deref())?;
             let view = report::GraphView {
                 collapse,
                 focus: focus.map(|f| regex::Regex::new(&f)).transpose()?,
@@ -355,8 +369,8 @@ fn run() -> Result<ExitCode> {
                 None => print!("{text}"),
             }
         }
-        Cmd::Why { from, to, dir, config } => {
-            let a = analyze(&dir, config.as_deref())?;
+        Cmd::Why { from, to, dir, config, mode } => {
+            let a = analyze(&dir, config.as_deref(), mode.as_deref())?;
             let g = &a.graph;
             let (f, t) = (g.lookup(&from).map_err(anyhow::Error::msg)?, g.lookup(&to).map_err(anyhow::Error::msg)?);
             match g.path_between(f, t, false) {
@@ -381,8 +395,8 @@ fn run() -> Result<ExitCode> {
                 }
             }
         }
-        Cmd::Affected { files, since, dir, config, filter } => {
-            let a = analyze(&dir, config.as_deref())?;
+        Cmd::Affected { files, since, dir, config, mode, filter } => {
+            let a = analyze(&dir, config.as_deref(), mode.as_deref())?;
             let g = &a.graph;
             let mut changed = files;
             if let Some(r) = since {
@@ -415,7 +429,7 @@ fn run() -> Result<ExitCode> {
             eprintln!("{}", p.dim(&format!("{} changed → {} affected", starts.len(), hit.len())));
         }
         Cmd::Report { target, output, open } => {
-            let a = analyze(&target.path, target.config.as_deref())?;
+            let a = analyze(&target.path, target.config.as_deref(), target.mode.as_deref())?;
             let html = report::html(&a.graph, &a.violations, a.config_path.as_deref());
             std::fs::write(&output, &html).with_context(|| format!("writing {}", output.display()))?;
             let (e, w, i) = report::counts(&a.violations);
@@ -432,7 +446,7 @@ fn run() -> Result<ExitCode> {
             }
         }
         Cmd::Stats { target, top } => {
-            let a = analyze(&target.path, target.config.as_deref())?;
+            let a = analyze(&target.path, target.config.as_deref(), target.mode.as_deref())?;
             print!("{}", report::stats(&a.graph, &a.violations, top));
         }
         Cmd::Init { path, from, force } => {
