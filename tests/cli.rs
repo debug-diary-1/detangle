@@ -736,7 +736,7 @@ fn ci_formats_and_baseline_maintenance() {
 fn graph_filters_select_like_the_js_rules_tool() {
     // Module sets the JavaScript rules tool selects on this fixture.
     let ids = |args: &[&str]| -> Vec<String> {
-        let mut all = vec!["graph", "tests/fixtures/conditions", "-c", "/dev/null", "-f", "json"];
+        let mut all = vec!["graph", "tests/fixtures/conditions", "-c", "tests/fixtures/empty.toml", "-f", "json"];
         all.extend(args);
         let (out, _) = detangle(&all);
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -749,11 +749,11 @@ fn graph_filters_select_like_the_js_rules_tool() {
     assert_eq!(ids(&["--focus", "mid"]), ["src/a/b/deep.ts", "src/a/mid.ts"]);
     assert_eq!(ids(&["--reaches", "top"]), ["src/a/b/deep.ts", "src/top.ts"]);
     assert_eq!(ids(&["--focus", "c6", "--reaches", "c7"]), ["src/c6.ts", "src/c7.ts"]);
-    let (json, _) = detangle(&["graph", "tests/fixtures/conditions", "-c", "/dev/null", "-f", "json", "--highlight", "c[12]"]);
+    let (json, _) = detangle(&["graph", "tests/fixtures/conditions", "-c", "tests/fixtures/empty.toml", "-f", "json", "--highlight", "c[12]"]);
     let v: serde_json::Value = serde_json::from_str(&json).unwrap();
     let lit: Vec<&str> = v["modules"].as_array().unwrap().iter().filter(|m| m["highlighted"] == true).filter_map(|m| m["id"].as_str()).collect();
     assert_eq!(lit, ["src/c1.ts", "src/c2.ts"]);
-    let (mmd, _) = detangle(&["graph", "tests/fixtures/conditions", "-c", "/dev/null", "-f", "mermaid", "--collapse", "^src/[^/]+/", "--highlight", "deep"]);
+    let (mmd, _) = detangle(&["graph", "tests/fixtures/conditions", "-c", "tests/fixtures/empty.toml", "-f", "mermaid", "--collapse", "^src/[^/]+/", "--highlight", "deep"]);
     // src/a/ collapses a/mid.ts and a/b/*; it's highlighted because deep.ts is in it.
     assert!(mmd.contains("[\"src/a/\"]:::highlight"), "{mmd}");
     assert!(!mmd.contains("src/a/mid.ts"), "{mmd}");
@@ -761,13 +761,13 @@ fn graph_filters_select_like_the_js_rules_tool() {
 
 #[test]
 fn graph_csv_matrix_and_d2() {
-    let (csv, _) = detangle(&["graph", "tests/fixtures/conditions", "-c", "/dev/null", "-f", "csv", "--focus", "c6"]);
+    let (csv, _) = detangle(&["graph", "tests/fixtures/conditions", "-c", "tests/fixtures/empty.toml", "-f", "csv", "--focus", "c6"]);
     // Same matrix layout as the JavaScript rules tool: header, "true"/"false" cells, trailing empty column.
     assert_eq!(
         csv,
         "\"\",\"src/c6.ts\",\"src/c7.ts\",\"\"\n\"src/c6.ts\",\"false\",\"true\",\"\"\n\"src/c7.ts\",\"true\",\"false\",\"\"\n"
     );
-    let (d2, _) = detangle(&["graph", "tests/fixtures/conditions", "-c", "/dev/null", "-f", "d2", "--focus", "c6"]);
+    let (d2, _) = detangle(&["graph", "tests/fixtures/conditions", "-c", "tests/fixtures/empty.toml", "-f", "d2", "--focus", "c6"]);
     assert!(d2.contains("\"src\".\"c6.ts\": {class: cycle; link: \"src/c6.ts\"}"), "{d2}");
     assert!(d2.contains("\"src\".\"c6.ts\" -> \"src\".\"c7.ts\": {style.stroke: \"#dd3333\"; style.stroke-dash: 3}"), "{d2}");
 }

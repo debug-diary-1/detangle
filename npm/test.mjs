@@ -8,6 +8,7 @@ import detangle, { analyze, check, report, graph, migrate } from "./index.mjs";
 const fixtures = fileURLToPath(new URL("../tests/fixtures/", import.meta.url));
 const conditions = fixtures + "conditions";
 const rules = conditions + "/rules.config.cjs";
+const empty = fixtures + "empty.toml";
 
 test("ESM and CommonJS entry points expose the same API", () => {
   const cjs = createRequire(import.meta.url)("./index.js");
@@ -25,7 +26,7 @@ test("analyze returns modules, cycles and violations", async () => {
 });
 
 test("analyze applies graph filters", async () => {
-  const a = await analyze(conditions, { config: "/dev/null", focus: /src\/c4/ });
+  const a = await analyze(conditions, { config: empty, focus: /src\/c4/ });
   assert.deepEqual(a.modules.map((m) => m.id).sort(), ["src/c3.ts", "src/c4.ts", "src/c5.ts"]);
 });
 
@@ -43,11 +44,11 @@ test("report renders the CLI formats", async () => {
 });
 
 test("graph returns text formats and JSON", async () => {
-  const csv = await graph(conditions, { config: "/dev/null", format: "csv", focus: "c6" });
+  const csv = await graph(conditions, { config: empty, format: "csv", focus: "c6" });
   assert.equal(csv.split("\n")[0], '"","src/c6.ts","src/c7.ts",""');
-  const mmd = await graph(conditions, { config: "/dev/null", format: "mermaid", collapse: /^src\/[^/]+\//, highlight: "deep" });
+  const mmd = await graph(conditions, { config: empty, format: "mermaid", collapse: /^src\/[^/]+\//, highlight: "deep" });
   assert.match(mmd, /\["src\/a\/"\]:::highlight/);
-  const json = await graph(conditions, { config: "/dev/null", format: "json", from: /deep/, maxDepth: 1 });
+  const json = await graph(conditions, { config: empty, format: "json", from: /deep/, maxDepth: 1 });
   assert.ok(json.modules.length > 0);
 });
 
