@@ -1,6 +1,6 @@
 //! Import aliases from webpack (`resolve.alias`, `resolve.modules`,
-//! `resolve.extensions`), Babel (`babel-plugin-module-resolver`) and tangle's
-//! own `[options.aliases]`. They rewrite a specifier *before* resolution, so
+//! `resolve.extensions`), Vite (`resolve.alias`, `resolve.extensions`), Babel
+//! (`babel-plugin-module-resolver`) and tangle's own `[options.aliases]`. They rewrite a specifier *before* resolution, so
 //! the rest of the pipeline (tsconfig paths, package exports, …) still applies.
 
 use std::path::{Path, PathBuf};
@@ -18,7 +18,9 @@ enum Key {
     Prefix(String),
     /// Webpack's `name$`: only the exact specifier.
     Exact(String),
-    /// Babel's `^regex` keys; the value may use `\1` (or `$1`).
+    /// A regex (Babel `^…` keys, Vite RegExp `find`). Like JS
+    /// `String.replace`, only the matched part is replaced; the value may use
+    /// `$1` or `\1`.
     Regex(Regex),
 }
 
@@ -28,8 +30,11 @@ struct Rule {
     /// Candidate replacements, tried in order. `None` = ignore the import
     /// (webpack's `false`).
     targets: Vec<Option<String>>,
-    /// Directory that relative targets are relative to.
-    base: PathBuf,
+    /// Directory that `./` targets are relative to. `None` (Vite) leaves
+    /// them relative to the importing file.
+    base: Option<PathBuf>,
+    /// Vite: `/src/...` targets are relative to the project root.
+    url_root: Option<PathBuf>,
 }
 
 /// What an alias turned a specifier into.
@@ -57,10 +62,13 @@ impl Aliases {
         let mut native: Vec<(&String, &String)> = opts.aliases.iter().collect();
         native.sort_by_key(|(k, _)| std::cmp::Reverse(k.len()));
         for (k, v) in native {
-            a.rules.push(Rule { key: key_for(k)?, targets: vec![Some(v.clone())], base: root.to_path_buf() });
+            a.rules.push(Rule { key: key_for(k)?, targets: vec![Some(v.clone())], base: Some(root.to_path_buf()), url_root: None });
         }
         if let Some(file) = &opts.webpack_config {
             a.add_webpack(&root.join(file)).with_context(|| format!("loading webpack config {file}"))?;
+        }
+        if let Some(file) = &opts.vite_config {
+            a.add_vite(&root.join(file)).with_context(|| format!("loading vite config {file}"))?;
         }
         if let Some(file) = &opts.babel_config {
             a.add_babel(&root.join(file)).with_context(|| format!("loading babel config {file}"))?;
@@ -79,20 +87,23 @@ impl Aliases {
                     rule.targets.iter().map(|t| t.as_ref().map(|t| format!("{}{rest}", t.trim_end_matches('/')))).collect()
                 }
                 Key::Regex(re) => match re.captures(spec).ok().flatten() {
-                    Some(caps) => rule
-                        .targets
-                        .iter()
-                        .map(|t| {
-                            t.as_ref().map(|t| {
-                                let mut out = t.clone();
-                                for i in (1..caps.len()).rev() {
-                                    let v = caps.get(i).map_or("", |m| m.as_str());
-                                    out = out.replace(&format!("\\{i}"), v).replace(&format!("${i}"), v);
-                                }
-                                out
+                    Some(caps) => {
+                        let whole = caps.get(0).expect("group 0 always matches");
+                        let (before, after) = (&spec[..whole.start()], &spec[whole.end()..]);
+                        rule.targets
+                            .iter()
+                            .map(|t| {
+                                t.as_ref().map(|t| {
+                                    let mut out = t.replace("$&", whole.as_str());
+                                    for i in (1..caps.len()).rev() {
+                                        let v = caps.get(i).map_or("", |m| m.as_str());
+                                        out = out.replace(&format!("\\{i}"), v).replace(&format!("${i}"), v);
+                                    }
+                                    format!("{before}{out}{after}")
+                                })
                             })
-                        })
-                        .collect(),
+                            .collect()
+                    }
                     None => continue,
                 },
                 _ => continue,
@@ -100,17 +111,25 @@ impl Aliases {
             if replaced.iter().all(Option::is_none) {
                 return Some(Rewrite::Ignore);
             }
-            let candidates = replaced
-                .into_iter()
-                .flatten()
-                .map(|t| {
-                    if t.starts_with("./") || t.starts_with("../") || t == "." {
-                        normalize(&rule.base.join(&t)).to_string_lossy().into_owned()
-                    } else {
-                        t
+            let mut candidates = vec![];
+            for t in replaced.into_iter().flatten() {
+                let relative = t.starts_with("./") || t.starts_with("../") || t == ".";
+                match &rule.base {
+                    Some(base) if relative => candidates.push(normalize(&base.join(&t)).to_string_lossy().into_owned()),
+                    _ => {
+                        // Vite: "/src/x" is a real absolute path if it exists,
+                        // else relative to the project root.
+                        if let Some(root) = &rule.url_root
+                            && let Some(rest) = t.strip_prefix('/')
+                            && !Path::new(&t).exists()
+                            && !Path::new(&t).parent().is_some_and(Path::exists)
+                        {
+                            candidates.push(root.join(rest).to_string_lossy().into_owned());
+                        }
+                        candidates.push(t);
                     }
-                })
-                .collect();
+                }
+            }
             return Some(Rewrite::Candidates(candidates));
         }
         None
@@ -156,7 +175,7 @@ impl Aliases {
                 None if e.only_module => Key::Exact(e.name),
                 None => Key::Prefix(e.name),
             };
-            self.rules.push(Rule { key, targets, base: base.clone() });
+            self.rules.push(Rule { key, targets, base: Some(base.clone()), url_root: None });
         }
         for m in r.modules {
             let m = if Path::new(&m).is_absolute() || !m.contains('/') { m } else { normalize(&base.join(&m)).to_string_lossy().into_owned() };
@@ -165,6 +184,45 @@ impl Aliases {
             }
         }
         self.extensions.extend(r.extensions);
+        Ok(())
+    }
+
+    fn add_vite(&mut self, file: &Path) -> Result<()> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Find {
+            Regex { re: String, flags: String },
+            Str(String),
+        }
+        #[derive(Deserialize)]
+        struct Entry {
+            find: Find,
+            replacement: String,
+        }
+        #[derive(Deserialize)]
+        struct Resolve {
+            alias: Vec<Entry>,
+            extensions: Vec<String>,
+            root: String,
+        }
+        let r: Resolve = serde_json::from_str(&run_node(VITE_LOADER, file)?)?;
+        let root = PathBuf::from(r.root);
+        for e in r.alias {
+            let key = match e.find {
+                Find::Str(s) => Key::Prefix(s),
+                Find::Regex { re, flags } => {
+                    let inline: String = flags.chars().filter(|c| matches!(c, 'i' | 'm' | 's')).collect();
+                    let src = if inline.is_empty() { re } else { format!("(?{inline}){re}") };
+                    Key::Regex(Regex::new(&src).with_context(|| format!("vite alias /{src}/ isn't supported"))?)
+                }
+            };
+            self.rules.push(Rule { key, targets: vec![Some(e.replacement)], base: None, url_root: Some(root.clone()) });
+        }
+        for x in r.extensions {
+            if !self.extensions.contains(&x) {
+                self.extensions.push(x);
+            }
+        }
         Ok(())
     }
 
@@ -187,7 +245,7 @@ impl Aliases {
             _ => dir,
         };
         for (k, v) in r.alias {
-            self.rules.push(Rule { key: key_for(&k)?, targets: vec![Some(v)], base: base.clone() });
+            self.rules.push(Rule { key: key_for(&k)?, targets: vec![Some(v)], base: Some(base.clone()), url_root: None });
         }
         self.roots.extend(r.root.into_iter().map(|p| base.join(p)));
         Ok(())
@@ -262,6 +320,28 @@ const { pathToFileURL } = require('url');
 })().catch((e) => { console.error((e && e.message) || String(e)); process.exit(1); });
 "#;
 
+/// Evaluates a Vite config (object, `defineConfig(...)`, function of
+/// `{ command, mode }`, or promise) and prints `resolve.alias` in
+/// @rollup/plugin-alias's array form (RegExps as `{ re, flags }`),
+/// `resolve.extensions` and the project root.
+const VITE_LOADER: &str = r#"
+const path = require('path'), { pathToFileURL } = require('url');
+(async () => {
+  const file = process.env.TANGLE_CONFIG_FILE;
+  const m = await import(pathToFileURL(file).href);
+  let c = m.default ?? m;
+  if (typeof c === 'function') c = await c({ command: 'serve', mode: 'development', isSsrBuild: false, isPreview: false });
+  c = (await c) || {};
+  const r = c.resolve || {};
+  const raw = Array.isArray(r.alias) ? r.alias : Object.entries(r.alias || {}).map(([find, replacement]) => ({ find, replacement }));
+  const alias = raw
+    .filter((a) => a && typeof a.replacement === 'string')
+    .map(({ find, replacement }) => ({ find: find instanceof RegExp ? { re: find.source, flags: find.flags } : String(find), replacement }));
+  const root = c.root ? path.resolve(path.dirname(file), c.root) : path.dirname(file);
+  process.stdout.write(JSON.stringify({ alias, extensions: r.extensions || [], root }));
+})().catch((e) => { console.error((e && e.message) || String(e)); process.exit(1); });
+"#;
+
 /// Evaluates a Babel config (.babelrc / babel.config.js / package.json) with
 /// a stub `api`, and prints babel-plugin-module-resolver's options (alias
 /// keys in order, as [key, value] pairs), or null.
@@ -308,7 +388,8 @@ mod tests {
                         _ => key_for(k).unwrap(),
                     },
                     targets: t.iter().map(|x| x.map(String::from)).collect(),
-                    base: PathBuf::from("/p"),
+                    base: Some(PathBuf::from("/p")),
+                    url_root: None,
                 })
                 .collect(),
             ..Default::default()
@@ -339,5 +420,13 @@ mod tests {
         assert_eq!(cands(&a, "@feature/cart").unwrap(), ["/p/src/features/cart"]);
         assert_eq!(cands(&a, "~/a/b").unwrap(), ["/p/src/a/b"]);
         assert_eq!(cands(&a, "react"), None);
+    }
+
+    #[test]
+    fn regex_aliases_replace_only_the_match() {
+        // Like JS `"~/a/b".replace(/^~/, "src")`.
+        let a = rules(&[("^~", &[Some("/p/src")]), ("^@x/(\\w+)/", &[Some("./lib/$1-impl/")])]);
+        assert_eq!(cands(&a, "~/a/b").unwrap(), ["/p/src/a/b"]);
+        assert_eq!(cands(&a, "@x/ui/button").unwrap(), ["/p/lib/ui-impl/button"]);
     }
 }

@@ -265,3 +265,26 @@ fn webpack_babel_and_native_aliases() {
         ]
     );
 }
+
+#[test]
+fn vite_aliases() {
+    let (out, _) = tangle(&["graph", "tests/fixtures/vite", "-f", "json"]);
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let mut got: Vec<String> = vec![];
+    for m in v["modules"].as_array().unwrap().iter().filter(|m| m["id"].as_str().unwrap().starts_with("src/")) {
+        for d in m["dependencies"].as_array().unwrap() {
+            got.push(format!("{}: {} -> {}", m["id"].as_str().unwrap(), d["specifier"].as_str().unwrap(), d["module"].as_str().unwrap()));
+        }
+    }
+    got.sort();
+    assert_eq!(
+        got,
+        [
+            "src/App.vue: @/components/Card.vue -> src/components/Card.vue", // inside <script setup>
+            "src/main.ts: #utils/format -> src/utils/format.ts",             // root-relative "/src/utils"
+            "src/main.ts: @/App.vue -> src/App.vue",                         // fileURLToPath(new URL(...))
+            "src/main.ts: rel/thing -> src/local/thing.ts",                  // relative: from the importer
+            "src/main.ts: ~/theme -> src/shared/theme.ts",                   // RegExp find with $1
+        ]
+    );
+}

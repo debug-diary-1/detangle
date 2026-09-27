@@ -63,7 +63,7 @@ tangle checks the filesystem itself to decide whether files were added or remove
 - **Angular**: `templateUrl`, `styleUrl` and `styleUrls` in decorators become dependencies of type `resource`, so a missing template or stylesheet is reported. Lazy `loadComponent` and `loadChildren` routes are picked up as dynamic imports.
 - If a tsconfig can't be loaded (for example, it `extends` a package that isn't installed), tangle falls back to resolving without it, so a single broken tsconfig doesn't make every import unresolvable.
 - Every import form: `import`, `import type`, `export … from`, `import()`, `require()`, `import x = require()`, `import("x").T`
-- **Aliases** from webpack (`resolve.alias`, including `name$` and `false`, plus `resolve.modules` and `resolve.extensions`), from Babel's `babel-plugin-module-resolver` (`alias`, including `^regex` keys with `\1`, and `root`), or declared directly in `tangle.toml` (see below)
+- **Aliases** from Vite (`resolve.alias` in object or array form, including RegExp `find` and `/src`-style root-relative replacements), from webpack (`resolve.alias`, including `name$` and `false`, plus `resolve.modules` and `resolve.extensions`), from Babel's `babel-plugin-module-resolver` (`alias`, including `^regex` keys with `\1`, and `root`), or declared directly in `tangle.toml` (see below)
 - tsconfig `paths` (per-file discovery or an explicit tsconfig), `package.json` `exports` and `imports`, and `.js`→`.ts` extension aliasing
 - Type-only and dynamic imports. By default type-only imports don't count toward cycles, because they're erased at runtime.
 - npm dependency classification by walking every enclosing `package.json`, so monorepo roots work: `npm`, `npm-dev`, `npm-peer`, `npm-optional`, `npm-undeclared`. `@types/*` packages count as declared for type-only packages.
@@ -133,12 +133,13 @@ to = { path = 'base-controller' }
 
 ```toml
 [options]
+vite_config = "vite.config.ts"         # or .js / .mjs / .mts; defineConfig and functions work
 webpack_config = "webpack.config.js"   # or .ts; functions and arrays of configs work
 babel_config = "babel.config.js"       # or .babelrc / package.json
 aliases = { "@" = "./src", "@lib" = "./packages/lib/src" }
 ```
 
-Webpack and Babel configs are evaluated with Node, so their dependencies must be installed. They only run when named here, never by auto-detection. Aliases rewrite the import before resolution, so tsconfig `paths`, package `exports` and the other resolution rules still apply to the result. Editing any of these config files triggers a full rebuild in watch mode.
+Vite, webpack and Babel configs are evaluated with Node, so their dependencies must be installed. Vite and webpack configs are called in development mode. They only run when named here, never by auto-detection. Aliases rewrite the import before resolution, so tsconfig `paths`, package `exports` and the other resolution rules still apply to the result. Editing any of these config files triggers a full rebuild in watch mode.
 
 ### Folder scope
 

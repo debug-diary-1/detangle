@@ -52,6 +52,7 @@ fn is_config(name: &str) -> bool {
         || name == "package.json"
         || (name.starts_with("tsconfig") && name.ends_with(".json"))
         || name.starts_with("webpack.config.")
+        || name.starts_with("vite.config.")
         || name.starts_with("babel.config.")
         || name.starts_with(".babelrc")
 }

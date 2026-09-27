@@ -156,6 +156,10 @@ pub struct Options {
     /// this webpack config (evaluated with Node).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub webpack_config: Option<String>,
+    /// Take `resolve.alias` / `resolve.extensions` from this Vite config
+    /// (evaluated with Node).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vite_config: Option<String>,
     /// Take babel-plugin-module-resolver's `alias` / `root` from this Babel
     /// config (.babelrc, babel.config.js or package.json).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -174,6 +178,7 @@ impl Default for Options {
             tsconfig: None,
             aliases: Default::default(),
             webpack_config: None,
+            vite_config: None,
             babel_config: None,
         }
     }
