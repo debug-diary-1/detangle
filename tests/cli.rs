@@ -214,9 +214,8 @@ fn init_converts_javascript_rule_configs() {
     let toml = std::fs::read_to_string(dir.join("tangle.toml")).unwrap();
     std::fs::remove_dir_all(&dir).unwrap();
     assert!(out.status.success(), "{stdout}");
-    assert!(stdout.contains("5 forbidden, 0 allowed, 1 required"), "{stdout}");
-    assert!(stdout.contains("'bundled' skipped"), "{stdout}");
-    assert!(toml.contains("#   - forbidden rule 'bundled' skipped"), "{toml}");
+    assert!(stdout.contains("6 forbidden, 0 allowed, 1 required"), "{stdout}");
+    assert!(toml.contains("\"npm-bundled\""), "{toml}");
     assert!(toml.contains("path_not = \"^src/features/$1/\""), "{toml}");
 }
 
@@ -652,4 +651,41 @@ fn boundaries_legacy_syntax_matches_eslint_plugin_boundaries() {
         ("src/shared/util/index.js", "../../domains/shop/features/cart/index.js"),
     ]);
     assert_eq!(migrated_flagged_imports("boundaries-legacy"), expected);
+}
+
+#[test]
+fn rule_conditions_match_the_js_rules_tool() {
+    // What the JavaScript rules tool flags per dependency with these rules:
+    // ancestor (true/false), exoticallyRequired / exoticRequire(Not),
+    // npm-bundled, and viaOnly / via with dependency types (a type-only
+    // cycle is left out, the cycle through import() is caught).
+    let (out, _) = tangle(&["check", "tests/fixtures/conditions", "-c", "tests/fixtures/conditions/rules.config.cjs", "-f", "json"]);
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let got: std::collections::BTreeSet<String> =
+        v.as_array().unwrap().iter().map(|x| format!("{} {} -> {}", x["rule"].as_str().unwrap(), x["from"].as_str().unwrap(), x["to"].as_str().unwrap())).collect();
+    let want: std::collections::BTreeSet<String> = [
+        "bundled src/a/b/deep.ts -> lodash",
+        "exotic src/a/b/deep.ts -> src/a/b/ex1.ts",
+        "exotic src/a/b/deep.ts -> src/a/b/ex2.ts",
+        "lazy-cycles src/c6.ts -> src/c7.ts",
+        "lazy-cycles src/c7.ts -> src/c6.ts",
+        "need src/a/b/deep.ts -> src/a/b/ex2.ts",
+        "not-need src/a/b/deep.ts -> src/a/b/ex1.ts",
+        "not-up src/a/b/deep.ts -> left",
+        "not-up src/a/b/deep.ts -> lodash",
+        "not-up src/a/b/deep.ts -> src/a/b/ex1.ts",
+        "not-up src/a/b/deep.ts -> src/a/b/ex2.ts",
+        "not-up src/a/b/deep.ts -> src/a/b/sib.ts",
+        "up src/a/b/deep.ts -> src/a/mid.ts",
+        "up src/a/b/deep.ts -> src/top.ts",
+        "value-cycles src/c3.ts -> src/c4.ts",
+        "value-cycles src/c4.ts -> src/c5.ts",
+        "value-cycles src/c5.ts -> src/c3.ts",
+        "value-cycles src/c6.ts -> src/c7.ts",
+        "value-cycles src/c7.ts -> src/c6.ts",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+    assert_eq!(got, want);
 }

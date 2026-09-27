@@ -201,7 +201,8 @@ impl Graph {
             }
         }
         for (e, base) in g.edges.iter_mut().zip(bases) {
-            e.multi_type = base.len() > 1;
+            // Bundling isn't a section of its own.
+            e.multi_type = base.iter().filter(|t| **t != "npm-bundled").count() > 1;
             e.types = edge_types(base, e.flags);
         }
 
@@ -692,7 +693,7 @@ fn edge_types(base: Vec<&'static str>, f: ImportFlags) -> Vec<&'static str> {
     if f.triple_slash {
         t.push("triple-slash");
     }
-    if f.exotic {
+    if f.exotic != 0 {
         t.push("exotic-require");
     }
     if f.builtin_call {
@@ -711,6 +712,8 @@ struct PackageDeps {
     dev: HashSet<String>,
     peer: HashSet<String>,
     optional: HashSet<String>,
+    /// `bundledDependencies` / `bundleDependencies`.
+    bundled: HashSet<String>,
 }
 
 impl PackageDeps {
@@ -727,6 +730,11 @@ impl PackageDeps {
             dev: keys("devDependencies"),
             peer: keys("peerDependencies"),
             optional: keys("optionalDependencies"),
+            bundled: ["bundledDependencies", "bundleDependencies"]
+                .iter()
+                .find_map(|k| v.get(*k).and_then(|b| b.as_array()))
+                .map(|a| a.iter().filter_map(|n| n.as_str().map(String::from)).collect())
+                .unwrap_or_default(),
         })
     }
 
@@ -736,6 +744,7 @@ impl PackageDeps {
             .into_iter()
             .filter(|(set, _)| set.contains(name))
             .map(|(_, kind)| kind)
+            .chain(self.bundled.contains(name).then_some("npm-bundled"))
             .collect()
     }
 }

@@ -484,14 +484,19 @@ impl FromSpec {
     }
 }
 
-/// `path` / `path_not`, used for `via` and `via_only`. Also accepts a bare
-/// string or list, meaning `path`.
+/// `path` / `path_not` on the modules of a cycle, and `dependency_types` /
+/// `dependency_types_not` on its dependencies; used for `via` and
+/// `via_only`. Also accepts a bare string or list, meaning `path`.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct PathSpec {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<Pat>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path_not: Option<Pat>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dependency_types: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dependency_types_not: Option<Vec<String>>,
 }
 
 impl<'de> Deserialize<'de> for PathSpec {
@@ -501,6 +506,8 @@ impl<'de> Deserialize<'de> for PathSpec {
         struct Full {
             path: Option<Pat>,
             path_not: Option<Pat>,
+            dependency_types: Option<Vec<String>>,
+            dependency_types_not: Option<Vec<String>>,
         }
         #[derive(Deserialize)]
         #[serde(untagged)]
@@ -509,8 +516,13 @@ impl<'de> Deserialize<'de> for PathSpec {
             Short(Pat),
         }
         Ok(match Either::deserialize(d)? {
-            Either::Full(f) => PathSpec { path: f.path, path_not: f.path_not },
-            Either::Short(p) => PathSpec { path: Some(p), path_not: None },
+            Either::Full(f) => PathSpec {
+                path: f.path,
+                path_not: f.path_not,
+                dependency_types: f.dependency_types,
+                dependency_types_not: f.dependency_types_not,
+            },
+            Either::Short(p) => PathSpec { path: Some(p), ..Default::default() },
         })
     }
 }
@@ -577,6 +589,17 @@ pub struct ToSpec {
     /// one of these tags.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reaches_tags: Option<Vec<String>>,
+    /// The target's folder contains the source's folder (a strict ancestor).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ancestor: Option<bool>,
+    /// Imported through one of `options.exotic_require`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exotically_required: Option<bool>,
+    /// Regex on the `options.exotic_require` function used.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exotic_require: Option<Pat>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exotic_require_not: Option<Pat>,
     /// The source also loads the target lazily: a chain of dynamic imports
     /// leads from the source to it.
     #[serde(skip_serializing_if = "Option::is_none")]

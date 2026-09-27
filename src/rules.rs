@@ -69,6 +69,7 @@ pub fn canonical_type(name: &str) -> Option<&'static str> {
         "dynamic" | "dynamic-import" => "dynamic",
         "require" | "import-equals" => "require",
         "exotic-require" => "exotic-require",
+        "npm-bundled" => "npm-bundled",
         "amd" | "amd-define" | "amd-require" | "amd-exotic-require" => "amd",
         "jsdoc" | "jsdoc-bracket-import" | "jsdoc-import-tag" => "jsdoc",
         "triple-slash" | "triple-slash-directive" | "triple-slash-file-reference" | "triple-slash-type-reference"
@@ -80,7 +81,7 @@ pub fn canonical_type(name: &str) -> Option<&'static str> {
         "import" => "import",
         "deprecated" => "deprecated",
         "aliased" | "aliased-tsconfig" | "aliased-tsconfig-paths" | "aliased-tsconfig-base-url"
-        | "aliased-subpath-import" | "aliased-workspace" | "aliased-webpack" => "aliased",
+        | "aliased-subpath-import" | "aliased-workspace" | "aliased-webpack" | "localmodule" => "aliased",
         _ => return None,
     })
 }
@@ -200,6 +201,8 @@ fn types(list: &Option<Vec<String>>, rule: &str) -> Result<Option<Vec<&'static s
         .transpose()
 }
 
+type ViaTypes = Option<(Option<Vec<&'static str>>, Option<Vec<&'static str>>)>;
+
 /// A matching dependency: its cycle witness (circular rules) and, at group
 /// scope, the module imports that satisfy the rule.
 struct Match {
@@ -222,6 +225,14 @@ struct Compiled<'r> {
     license_not: Option<Regex>,
     specifier: Option<Regex>,
     specifier_not: Option<Regex>,
+    exotic: Option<Regex>,
+    exotic_not: Option<Regex>,
+    /// `via` / `via_only` dependency types: (any of, none of).
+    via_types: ViaTypes,
+    via_only_types: ViaTypes,
+    /// Circular edges (from, to) satisfying `via_types` / `via_only_types`.
+    via_edges: std::cell::OnceCell<HashSet<(usize, usize)>>,
+    via_only_edges: std::cell::OnceCell<HashSet<(usize, usize)>>,
     /// `reaches_tags`: modules that are, or depend on, a tagged module.
     reaching: std::cell::OnceCell<HashSet<usize>>,
     /// `lazy_loaded`: modules reachable from each source through dynamic imports.
@@ -236,6 +247,14 @@ fn compile<'r>(name: &str, from: &'r FromSpec, to: &'r ToSpec) -> Result<Compile
         bail!("rule '{name}': `to.max_cycle_length` can't be combined with `via` / `via_only`");
     }
     let via = |v: &Option<PathSpec>| v.as_ref().map(|v| Target::new(&v.path, &v.path_not, name)).transpose();
+    let via_types = |v: &Option<PathSpec>| -> Result<ViaTypes> {
+        Ok(match v {
+            Some(v) if v.dependency_types.is_some() || v.dependency_types_not.is_some() => {
+                Some((types(&v.dependency_types, name)?, types(&v.dependency_types_not, name)?))
+            }
+            _ => None,
+        })
+    };
     Ok(Compiled {
         from,
         to,
@@ -250,6 +269,12 @@ fn compile<'r>(name: &str, from: &'r FromSpec, to: &'r ToSpec) -> Result<Compile
         license_not: to.license_not.as_ref().map(|p| regex(p, name)).transpose()?,
         specifier: to.specifier.as_ref().map(|p| regex(p, name)).transpose()?,
         specifier_not: to.specifier_not.as_ref().map(|p| regex(p, name)).transpose()?,
+        exotic: to.exotic_require.as_ref().map(|p| regex(p, name)).transpose()?,
+        exotic_not: to.exotic_require_not.as_ref().map(|p| regex(p, name)).transpose()?,
+        via_types: via_types(&to.via)?,
+        via_only_types: via_types(&to.via_only)?,
+        via_edges: Default::default(),
+        via_only_edges: Default::default(),
         reaching: Default::default(),
         lazy: Default::default(),
     })
@@ -299,6 +324,8 @@ struct Ctx<'g> {
     g: &'g Graph,
     /// Group scope: the module graph, for conditions on individual imports.
     parent: Option<Box<Ctx<'g>>>,
+    /// `options.exotic_require`, for `exotic_require` conditions.
+    exotic: Vec<String>,
     /// npm packages also answer to `node_modules/<pkg>/`, so path rules
     /// written against installed files keep working.
     alt: Vec<Option<String>>,
@@ -313,12 +340,37 @@ impl<'g> Ctx<'g> {
             .iter()
             .map(|m| (m.kind == ModuleKind::Npm).then(|| format!("node_modules/{}/", m.id)))
             .collect();
-        Ctx { g, parent: None, alt, cache: HashMap::default(), meta: HashMap::default() }
+        Ctx { g, parent: None, exotic: vec![], alt, cache: HashMap::default(), meta: HashMap::default() }
+    }
+
+    fn with_exotic(mut self, names: &[String]) -> Self {
+        self.exotic = names.to_vec();
+        if let Some(p) = self.parent.take() {
+            self.parent = Some(Box::new(p.with_exotic(names)));
+        }
+        self
     }
 
     /// A context for the group graph of `g`.
     fn groups(g: &'g Graph) -> Self {
         Ctx { parent: Some(Box::new(Ctx::new(g))), ..Ctx::new(g.groups()) }
+    }
+
+    /// Does some import behind `e` have one of `types`?
+    fn edge_has_any(&mut self, e: &Edge, types: &[&str]) -> bool {
+        e.imports().into_iter().any(|(s, f)| types.iter().any(|t| self.import_has_type(e, s, f, t)))
+    }
+
+    /// Circular edges whose dependency types satisfy `(any of, none of)`.
+    fn typed_cycle_edges(&mut self, want: &(Option<Vec<&'static str>>, Option<Vec<&'static str>>)) -> HashSet<(usize, usize)> {
+        let g = self.g;
+        let mut out = HashSet::new();
+        for e in g.edges.iter().filter(|e| e.circular) {
+            if want.0.as_ref().is_none_or(|l| self.edge_has_any(e, l)) && !want.1.as_ref().is_some_and(|l| self.edge_has_any(e, l)) {
+                out.insert((e.from, e.to));
+            }
+        }
+        out
     }
 
     /// The names module `m` can be matched by.
@@ -378,7 +430,7 @@ impl<'g> Ctx<'g> {
             "amd" => flags.amd,
             "jsdoc" => flags.jsdoc,
             "triple-slash" => flags.triple_slash,
-            "exotic-require" => flags.exotic,
+            "exotic-require" => flags.exotic != 0,
             "process-get-builtin-module" => flags.builtin_call,
             "import" => flags.is_import(),
             "relative" => spec.starts_with('.') || spec.starts_with('/'),
@@ -412,10 +464,24 @@ impl Compiled<'_> {
     /// Conditions on single imports (specifier and dependency types): some
     /// import behind the dependency must satisfy them all.
     fn import_ok(&self, cx: &mut Ctx, e: &Edge) -> bool {
-        if self.types.is_none() && self.types_not.is_none() && self.specifier.is_none() && self.specifier_not.is_none() {
+        let t = self.to;
+        if self.types.is_none()
+            && self.types_not.is_none()
+            && self.specifier.is_none()
+            && self.specifier_not.is_none()
+            && t.exotically_required.is_none()
+            && self.exotic.is_none()
+            && self.exotic_not.is_none()
+        {
             return true;
         }
         e.imports().into_iter().any(|(spec, flags)| {
+            let exotic = (flags.exotic as usize).checked_sub(1).and_then(|i| cx.exotic.get(i)).cloned();
+            // Like `license`, the exotic_require patterns need an exotic import.
+            let exotic_ok = t.exotically_required.is_none_or(|w| (flags.exotic != 0) == w)
+                && self.exotic.as_ref().is_none_or(|r| exotic.as_deref().is_some_and(|n| matches(r, n)))
+                && self.exotic_not.as_ref().is_none_or(|r| exotic.as_deref().is_some_and(|n| !matches(r, n)));
+            exotic_ok &&
             self.types.as_ref().is_none_or(|l| l.iter().any(|x| cx.import_has_type(e, spec, flags, x)))
                 && !self.types_not.as_ref().is_some_and(|l| l.iter().any(|x| cx.import_has_type(e, spec, flags, x)))
                 && self.specifier.as_ref().is_none_or(|r| matches(r, spec))
@@ -494,6 +560,18 @@ impl Compiled<'_> {
                 return None;
             }
         }
+        if let Some(want) = t.ancestor {
+            if matches!(to.kind, ModuleKind::Builtin | ModuleKind::Unresolved) {
+                return None;
+            }
+            let dir = |id: &str| id.rsplit_once('/').map_or(String::new(), |(d, _)| format!("{d}/"));
+            let (fd, td) = (dir(&g.modules[e.from].id), dir(&to.id));
+            // npm packages live outside the project's folders.
+            let ancestor = to.kind == ModuleKind::Local && fd.starts_with(&td) && fd.len() > td.len();
+            if ancestor != want {
+                return None;
+            }
+        }
         if let Some(want) = t.cross_group {
             let cross = match (g.group_of.get(e.from).copied().flatten(), g.group_of.get(e.to).copied().flatten()) {
                 (Some(a), Some(b)) => Some(a != b),
@@ -527,14 +605,54 @@ impl Compiled<'_> {
         // Circular: find a witness cycle, honouring `via` / `via_only`. Unlike
         // checking one arbitrary cycle, these consider *every* cycle through
         // the dependency.
+        if let Some(want) = &self.via_only_types
+            && self.via_only_edges.get().is_none()
+        {
+            let set = cx.typed_cycle_edges(want);
+            let _ = self.via_only_edges.set(set);
+        }
+        if let Some(want) = &self.via_types
+            && self.via_edges.get().is_none()
+        {
+            let set = cx.typed_cycle_edges(want);
+            let _ = self.via_edges.set(set);
+        }
         if let Some(spec) = &self.via_only {
             let scc = &g.cycles[g.cycle_of[e.from]?];
             let ok: HashSet<usize> = scc.iter().copied().filter(|&m| cx.target_matches(spec, m, caps)).collect();
             if !ok.contains(&e.from) || !ok.contains(&e.to) {
                 return None;
             }
-            let back = g.path_where(e.to, e.from, |x| x.circular, |m| ok.contains(&m))?;
+            // Every dependency of the cycle must have the wanted types too.
+            let typed = self.via_only_edges.get();
+            let edge_ok = |x: &Edge| x.circular && typed.is_none_or(|t| t.contains(&(x.from, x.to)));
+            if !edge_ok(e) {
+                return None;
+            }
+            let back = g.path_where(e.to, e.from, edge_ok, |m| ok.contains(&m))?;
             return found(std::iter::once(e.from).chain(back).collect());
+        }
+        if let (Some(typed), None) = (self.via_edges.get(), self.via.as_ref().filter(|v| v.path.is_some() || v.not.is_some())) {
+            // Some dependency of a simple cycle through this one has the types.
+            if typed.contains(&(e.from, e.to)) {
+                return found(g.cycle_path(i));
+            }
+            let mut hits: Vec<&(usize, usize)> = typed.iter().collect();
+            hits.sort_unstable();
+            for &(a, b) in hits {
+                // A simple cycle through `e` leaves e.from and enters e.to only through `e`.
+                if a == e.from || b == e.to {
+                    continue;
+                }
+                let Some(leg1) = g.path_where(e.to, a, |x| x.circular, |m| m != e.from) else { continue };
+                let used: HashSet<usize> = leg1.iter().copied().collect();
+                if used.contains(&b) {
+                    continue;
+                }
+                let Some(leg2) = g.path_where(b, e.from, |x| x.circular, |m| !used.contains(&m)) else { continue };
+                return found(std::iter::once(e.from).chain(leg1).chain(leg2).collect());
+            }
+            return None;
         }
         if let Some(spec) = &self.via {
             // A *simple* cycle from → to ⇝ hit ⇝ from through a matching
@@ -554,7 +672,14 @@ impl Compiled<'_> {
                 };
                 let used: HashSet<usize> = a.iter().copied().filter(|&m| m != hit).collect();
                 let Some(b) = g.path_where(hit, e.from, |x| x.circular, |m| !used.contains(&m)) else { continue };
-                return found(std::iter::once(e.from).chain(a).chain(b.into_iter().skip(1)).collect());
+                let cycle: Vec<usize> = std::iter::once(e.from).chain(a).chain(b.into_iter().skip(1)).collect();
+                // With dependency types too, this cycle must also have such a dependency.
+                if let Some(typed) = self.via_edges.get()
+                    && !cycle.windows(2).any(|w| typed.contains(&(w[0], w[1])))
+                {
+                    continue;
+                }
+                return found(cycle);
             }
             return None;
         }
@@ -654,7 +779,8 @@ fn eval_forbidden(cx: &mut Ctx, rule: &Rule, out: &mut Vec<Violation>) -> Result
 
 pub fn evaluate(g: &Graph, cfg: &Config) -> Result<Vec<Violation>> {
     let mut out = vec![];
-    let mut cx = Ctx::new(g);
+    let exotic = &cfg.options.exotic_require;
+    let mut cx = Ctx::new(g).with_exotic(exotic);
     let n = g.modules.len();
     let mut folder_cx: Option<Ctx> = None;
     let mut group_cx: Option<Ctx> = None;
@@ -666,7 +792,7 @@ pub fn evaluate(g: &Graph, cfg: &Config) -> Result<Vec<Violation>> {
                 eval_forbidden(fcx, rule, &mut out)?;
             }
             Scope::Group => {
-                let gcx = group_cx.get_or_insert_with(|| Ctx::groups(g));
+                let gcx = group_cx.get_or_insert_with(|| Ctx::groups(g).with_exotic(exotic));
                 eval_forbidden(gcx, rule, &mut out)?;
             }
         }

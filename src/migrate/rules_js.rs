@@ -150,6 +150,9 @@ fn via(v: &Value, what: &str) -> Result<Value, Skip> {
                     "path" | "pathNot" => {
                         out.insert(camel_to_snake(k), pattern(val, what)?);
                     }
+                    "dependencyTypes" | "dependencyTypesNot" => {
+                        out.insert(camel_to_snake(k), dep_types(val, &format!("{what}.{k}"))?);
+                    }
                     other => return Err(format!("{what}.{other} isn't supported")),
                 }
             }
@@ -180,9 +183,11 @@ fn convert_to(v: &Value) -> Result<Value, Skip> {
     for (k, val) in v.as_object().ok_or("`to` must be an object")? {
         let what = format!("to.{k}");
         let (key, value) = match k.as_str() {
-            "path" | "pathNot" | "license" | "licenseNot" => (camel_to_snake(k), pattern(val, &what)?),
-            "circular" | "couldNotResolve" | "dynamic" | "reachable" | "moreUnstable"
-            | "moreThanOneDependencyType" => (camel_to_snake(k), val.clone()),
+            "path" | "pathNot" | "license" | "licenseNot" | "exoticRequire" | "exoticRequireNot" => {
+                (camel_to_snake(k), pattern(val, &what)?)
+            }
+            "circular" | "couldNotResolve" | "dynamic" | "reachable" | "moreUnstable" | "moreThanOneDependencyType"
+            | "ancestor" | "exoticallyRequired" => (camel_to_snake(k), val.clone()),
             "preCompilationOnly" => ("type_only".into(), val.clone()),
             "dependencyTypes" | "dependencyTypesNot" => (camel_to_snake(k), dep_types(val, &what)?),
             "via" => ("via".into(), via(val, &what)?),
@@ -190,7 +195,6 @@ fn convert_to(v: &Value) -> Result<Value, Skip> {
             // Deprecated forms with exact equivalents.
             "viaNot" => ("via_only".into(), json!({ "path_not": pattern(val, &what)? })),
             "viaSomeNot" => ("via".into(), json!({ "path_not": pattern(val, &what)? })),
-            "exoticallyRequired" if val == &json!(false) => continue,
             other => return Err(format!("to.{other} isn't supported")),
         };
         out.insert(key, value);
@@ -392,9 +396,11 @@ mod tests {
                   "from": { "path": ["^src", "^lib"] },
                   "to": { "dependencyTypes": ["npm-dev"], "dependencyTypesNot": ["type-only"], "pathNot": ["node_modules/@types/"] } },
                 { "name": "no-deprecated", "severity": "ignore", "to": { "dependencyTypes": ["deprecated"] } },
-                { "name": "fancy", "severity": "error", "from": {}, "to": { "path": "x", "exoticallyRequired": true } },
+                { "name": "fancy", "severity": "error", "from": {}, "to": { "path": "x", "exoticallyRequired": true, "exoticRequireNot": "^want$", "ancestor": false } },
+                { "name": "typed-cycles", "to": { "circular": true, "viaOnly": { "dependencyTypesNot": ["type-only"] } } },
+                { "name": "odd", "to": { "dependencyTypes": ["npm-no-such"] } },
                 { "name": "folders", "severity": "warn", "scope": "folder", "from": {}, "to": { "circular": true } },
-                { "name": "bundled", "to": { "dependencyTypes": ["npm-bundled"] } },
+                { "name": "bundled", "to": { "dependencyTypes": ["npm-bundled", "localmodule"] } },
                 { "name": "utils-shared", "module": { "path": "^src/utils", "numberOfDependentsLessThan": 2 } },
             ],
             "allowed": [{ "from": { "path": "^src" }, "to": { "path": "^src" } }],
@@ -415,8 +421,11 @@ mod tests {
         });
         let imp = convert(&v);
         let names: Vec<_> = imp.config.forbidden.iter().map(|r| r.name.as_str()).collect();
-        assert_eq!(names, ["no-circular", "not-to-dev-dep", "no-deprecated", "folders", "utils-shared"]);
-        assert_eq!(imp.config.forbidden[3].scope, crate::config::Scope::Folder);
+        assert_eq!(names, ["no-circular", "not-to-dev-dep", "no-deprecated", "fancy", "typed-cycles", "folders", "bundled", "utils-shared"]);
+        assert_eq!(imp.config.forbidden[5].scope, crate::config::Scope::Folder);
+        assert_eq!(imp.config.forbidden[3].to.exotic_require_not.as_ref().unwrap().0, "^want$");
+        assert_eq!(imp.config.forbidden[4].to.via_only.as_ref().unwrap().dependency_types_not.as_deref(), Some(&["type-only".to_string()][..]));
+        assert_eq!(imp.config.forbidden[6].to.dependency_types.as_deref(), Some(&["npm-bundled".to_string(), "aliased".to_string()][..]));
         assert_eq!(imp.config.forbidden[0].to.via_only.as_ref().unwrap().path_not.as_ref().unwrap().0, "^src/types");
         assert_eq!(imp.config.forbidden[1].from.path.as_ref().unwrap().0, "(?:^src)|(?:^lib)");
         assert_eq!(imp.config.forbidden[2].severity, crate::config::Severity::Off);
@@ -428,8 +437,7 @@ mod tests {
         assert_eq!(o.tsconfig.as_deref(), Some("tsconfig.json"));
         assert!(!o.ignore_type_only && !o.cycles_ignore_type_only);
         let w = imp.warnings.join("\n");
-        assert!(w.contains("'fancy' skipped: to.exoticallyRequired"), "{w}");
-        assert!(w.contains("'bundled' skipped: dependency type \"npm-bundled\""), "{w}");
+        assert!(w.contains("'odd' skipped: dependency type \"npm-no-such\""), "{w}");
         assert_eq!(o.webpack_config.as_deref(), Some("webpack.config.js"));
         assert_eq!(o.config_env.webpack_env.get("production"), Some(&json!(true)));
         assert_eq!(o.config_env.mode.as_deref(), Some("production"));
@@ -441,7 +449,7 @@ mod tests {
         // Round-trips through TOML.
         let text = to_toml(&imp, Path::new("rules.config.js")).unwrap();
         let back: Config = toml::from_str(&text).unwrap();
-        assert_eq!(back.forbidden.len(), 5);
+        assert_eq!(back.forbidden.len(), 8);
         crate::rules::validate(&back).unwrap();
     }
 }

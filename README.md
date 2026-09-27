@@ -93,6 +93,11 @@ to = { circular = true }
 name = "no-cycles-via-shared"
 to = { circular = true, via = '^src/shared/' }
 
+# cycles made of runtime imports only (via / via_only also take dependency_types(_not))
+[[forbidden]]
+name = "no-runtime-cycles"
+to = { circular = true, via_only = { dependency_types_not = ["type-only"] } }
+
 # only tight loops: the shortest cycle through the dependency has at most 3 modules
 [[forbidden]]
 name = "no-short-cycles"
@@ -241,10 +246,10 @@ At folder scope, a module edge `a → b` makes every folder containing `a` but n
 | | conditions |
 |---|---|
 | `from` | `path`, `path_not`, `orphan`, `tags`, `tags_not`, `tags_all` |
-| `to` | `path`, `path_not`, `specifier`, `specifier_not`, `circular`, `via`, `via_only`, `max_cycle_length`, `tags`, `tags_not`, `reaches_tags`, `cross_group`, `lazy_loaded`, `dependency_types`, `dependency_types_not`, `could_not_resolve`, `type_only`, `dynamic`, `reachable`, `more_unstable`, `more_than_one_dependency_type`, `license`, `license_not` |
+| `to` | `path`, `path_not`, `specifier`, `specifier_not`, `circular`, `via`, `via_only`, `max_cycle_length`, `tags`, `tags_not`, `reaches_tags`, `cross_group`, `lazy_loaded`, `ancestor`, `exotically_required`, `exotic_require`, `exotic_require_not`, `dependency_types`, `dependency_types_not`, `could_not_resolve`, `type_only`, `dynamic`, `reachable`, `more_unstable`, `more_than_one_dependency_type`, `license`, `license_not` |
 | `module` | `path`, `path_not`, `number_of_dependents_less_than`, `number_of_dependents_more_than` (with `from` restricting which dependents count) |
 
-Dependency types: `local`, `npm`, `npm-dev`, `npm-peer`, `npm-optional`, `npm-undeclared`, `core`, `unresolvable`, `type-only`, `dynamic`, `require`, `reexport`, `resource`, `amd`, `triple-slash`, `jsdoc`, `exotic-require`, `process-get-builtin-module`, `import` (a plain `import`/`export`), `aliased` (a tsconfig-paths, `#imports` or workspace import of a local file), `deprecated` (the installed package is marked deprecated). A package declared in several `package.json` sections has all of the matching types, for example `npm` and `npm-dev`. npm packages can also be matched as `node_modules/<name>/`.
+Dependency types: `local`, `npm`, `npm-dev`, `npm-peer`, `npm-optional`, `npm-undeclared`, `npm-bundled`, `core`, `unresolvable`, `type-only`, `dynamic`, `require`, `reexport`, `resource`, `amd`, `triple-slash`, `jsdoc`, `exotic-require`, `process-get-builtin-module`, `import` (a plain `import`/`export`), `aliased` (a tsconfig-paths, `#imports` or workspace import of a local file), `deprecated` (the installed package is marked deprecated). A package declared in several `package.json` sections has all of the matching types, for example `npm` and `npm-dev`. npm packages can also be matched as `node_modules/<name>/`.
 
 ## HTML report
 

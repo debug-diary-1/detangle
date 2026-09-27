@@ -53,8 +53,9 @@ pub struct ImportFlags {
     pub jsdoc: bool,
     /// A `/// <reference path|types="…" />` directive.
     pub triple_slash: bool,
-    /// A call to one of `options.exotic_require` (`module.require`, …).
-    pub exotic: bool,
+    /// A call to one of `options.exotic_require` (`module.require`, …): its
+    /// position in that list, plus one (0 = not exotic).
+    pub exotic: u8,
     /// `process.getBuiltinModule("fs")` (with `options.builtin_module_calls`).
     pub builtin_call: bool,
 }
@@ -72,14 +73,14 @@ impl ImportFlags {
             amd: self.amd || o.amd,
             jsdoc: self.jsdoc && o.jsdoc,
             triple_slash: self.triple_slash || o.triple_slash,
-            exotic: self.exotic || o.exotic,
+            exotic: self.exotic.max(o.exotic),
             builtin_call: self.builtin_call || o.builtin_call,
         }
     }
 
     /// A plain `import`/`export` (not require, dynamic, AMD, a directive…).
     pub fn is_import(self) -> bool {
-        !(self.require || self.dynamic || self.amd || self.triple_slash || self.exotic || self.builtin_call)
+        !(self.require || self.dynamic || self.amd || self.triple_slash || self.exotic != 0 || self.builtin_call)
     }
 }
 
@@ -677,6 +678,7 @@ impl<'a> Visit<'a> for Collector<'_> {
     fn visit_call_expression(&mut self, it: &CallExpression<'a>) {
         let single = (it.arguments.len() == 1).then(|| it.arguments[0].as_expression().and_then(static_string)).flatten();
         let callee = callee_name(&it.callee);
+        let exotic = callee.as_deref().and_then(|c| self.detect.exotic.iter().position(|x| x == c));
         let plain = |f: fn(&mut ImportFlags)| {
             let mut flags = ImportFlags::default();
             f(&mut flags);
@@ -686,7 +688,9 @@ impl<'a> Visit<'a> for Collector<'_> {
             (Some("require"), Some(s)) => self.push(s, plain(|f| f.require = true)),
             (Some("require" | "define"), _) => self.amd(&it.arguments),
             (Some("process.getBuiltinModule"), Some(s)) if self.detect.builtin_calls => self.push(s, plain(|f| f.builtin_call = true)),
-            (Some(name), Some(s)) if self.detect.exotic.iter().any(|x| x == name) => self.push(s, plain(|f| f.exotic = true)),
+            (Some(_), Some(s)) if exotic.is_some() => {
+                self.push(s, ImportFlags { exotic: exotic.map_or(0, |i| (i + 1).min(255) as u8), ..Default::default() })
+            }
             _ => {}
         }
         walk::walk_call_expression(self, it);
@@ -787,7 +791,7 @@ export const f = (x) => [module.require("./g"), process.getBuiltinModule("fs"), 
         let names: Vec<&str> = got.iter().map(|(s, _)| s.as_str()).collect();
         assert_eq!(names, ["./a", "./b", "./g", "fs", "./e.d.ts", "node", "./legacy", "./c.js", "./d.js"]);
         let f = |i: usize| got[i].1;
-        assert!(f(0).amd && f(1).amd && f(2).exotic && f(3).builtin_call);
+        assert!(f(0).amd && f(1).amd && f(2).exotic == 1 && f(3).builtin_call);
         assert!(f(4).triple_slash && f(6).triple_slash && f(6).amd);
         assert!(f(7).jsdoc && f(7).type_only && f(8).jsdoc);
         assert!(!f(0).is_import() && ImportFlags::default().is_import());
