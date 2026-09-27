@@ -3,3 +3,5 @@
 /dist
 /bins
 /npm-dist
+# Fixture .env files are test data (a global gitignore may exclude .env).
+!tests/fixtures/**/.env
