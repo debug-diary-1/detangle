@@ -1,14 +1,14 @@
 export type Severity = "error" | "warn" | "info" | "off";
 
 export interface CommonOptions {
-  /** Config file (default: <root>/tangle.toml, else the built-in rules). A JavaScript rules config works too. */
+  /** Config file (default: <root>/detangle.toml, else the built-in rules). A JavaScript rules config works too. */
   config?: string;
   /** Mode for evaluating Vite / webpack configs. */
   mode?: string;
   /** Reuse parse results between runs: true, or a cache directory. */
   cache?: boolean | string;
   cacheStrategy?: "metadata" | "content";
-  /** The tangle binary (default: $TANGLE_BIN, else `tangle` on PATH). */
+  /** The detangle binary (default: $DETANGLE_BIN, else `detangle` on PATH). */
   bin?: string;
   /** Working directory for relative paths. */
   cwd?: string;

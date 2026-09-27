@@ -38,7 +38,7 @@ impl ModuleKind {
 pub struct Module {
     pub id: String,
     pub kind: ModuleKind,
-    /// Parsed by tangle (as opposed to e.g. a .css/.json file that was only imported).
+    /// Parsed by detangle (as opposed to e.g. a .css/.json file that was only imported).
     pub scanned: bool,
     pub parse_errors: usize,
     /// Tags from the module's group (or the group's own, on the group graph).

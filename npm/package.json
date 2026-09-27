@@ -1,7 +1,7 @@
 {
-  "name": "tangle-deps",
+  "name": "detangle-deps",
   "version": "0.1.0",
-  "description": "Node.js API for tangle: dependency analysis and architecture rules for JS/TS",
+  "description": "Node.js API for detangle: dependency analysis and architecture rules for JS/TS",
   "private": true,
   "main": "index.js",
   "types": "index.d.ts",

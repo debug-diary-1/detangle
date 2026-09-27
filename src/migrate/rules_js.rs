@@ -3,7 +3,7 @@
 //!
 //! JS configs are evaluated with Node — the only faithful way to load them,
 //! including `extends` chains that point at preset packages. The result is
-//! converted rule by rule; anything tangle can't honour exactly makes that
+//! converted rule by rule; anything detangle can't honour exactly makes that
 //! rule be skipped with a warning rather than silently loosened.
 
 use std::path::Path;
@@ -16,7 +16,7 @@ use super::Imported;
 use crate::config::{Config, Options, Pat};
 use crate::rules::canonical_type;
 
-/// A config in JavaScript format (anything but tangle's own TOML).
+/// A config in JavaScript format (anything but detangle's own TOML).
 pub fn is_js_config(path: &Path) -> bool {
     path.extension().and_then(|e| e.to_str()).is_some_and(|e| matches!(e, "js" | "cjs" | "mjs" | "json"))
 }
@@ -68,7 +68,7 @@ function merge(a, b) {
     required: byName(a.required, b.required),
     options: { ...(a.options || {}), ...(b.options || {}) } };
 }
-load(process.env.TANGLE_DC_CONFIG).then(
+load(process.env.DETANGLE_DC_CONFIG).then(
   (c) => process.stdout.write(JSON.stringify(c, (k, v) => (v instanceof RegExp ? v.source : v))),
   (e) => { console.error((e && e.message) || String(e)); process.exit(1); });
 "#;
@@ -85,7 +85,7 @@ fn load_json(path: &Path) -> Result<Value> {
     let abs = std::fs::canonicalize(path).with_context(|| format!("{} not found", path.display()))?;
     let out = Command::new("node")
         .args(["-e", LOADER])
-        .env("TANGLE_DC_CONFIG", &abs)
+        .env("DETANGLE_DC_CONFIG", &abs)
         .current_dir(abs.parent().unwrap_or(Path::new(".")))
         .output()
         .context("running `node` to load the JavaScript config (is Node.js installed?)")?;
@@ -279,7 +279,7 @@ pub fn convert(v: &Value) -> Imported {
                 }
                 "includeOnly" => opts.include_only = regex_option(val, k, &mut warnings),
                 "doNotFollow" => {
-                    // tangle never descends into packages, so only other paths matter.
+                    // detangle never descends into packages, so only other paths matter.
                     let path = match val {
                         Value::Object(o) => o.get("path").cloned().unwrap_or(Value::Null),
                         other => other.clone(),
@@ -291,7 +291,7 @@ pub fn convert(v: &Value) -> Imported {
                     }
                 }
                 "maxDepth" => warnings.push(
-                    "options.maxDepth limits crawling from entry files; tangle checks the whole project (use `tangle graph --from … --max-depth N` to view a depth-limited graph)".into(),
+                    "options.maxDepth limits crawling from entry files; detangle checks the whole project (use `detangle graph --from … --max-depth N` to view a depth-limited graph)".into(),
                 ),
                 "tsConfig" => opts.tsconfig = val.get("fileName").and_then(Value::as_str).map(String::from),
                 "webpackConfig" => {
@@ -322,11 +322,11 @@ pub fn convert(v: &Value) -> Imported {
                     opts.exotic_require = val.as_array().into_iter().flatten().filter_map(|s| s.as_str().map(String::from)).collect()
                 }
                 "moduleSystems" => {
-                    // tangle always reads ES modules, CommonJS, AMD and TypeScript directives.
+                    // detangle always reads ES modules, CommonJS, AMD and TypeScript directives.
                     let listed: Vec<&str> = val.as_array().into_iter().flatten().filter_map(Value::as_str).collect();
                     let off: Vec<&str> = ["amd", "tsd"].into_iter().filter(|m| !listed.contains(m)).collect();
                     if !off.is_empty() {
-                        warnings.push(format!("options.moduleSystems leaves out {off:?}, but tangle always reads those imports"));
+                        warnings.push(format!("options.moduleSystems leaves out {off:?}, but detangle always reads those imports"));
                     }
                 }
                 "builtInModules" => {
@@ -365,7 +365,7 @@ pub fn convert(v: &Value) -> Imported {
                         }
                     }
                 }
-                // Converted to a tangle baseline by `tangle migrate`.
+                // Converted to a detangle baseline by `detangle migrate`.
                 "knownViolations" => known_violations = val.as_str().map(String::from),
                 k if HARMLESS_OPTIONS.contains(&k) => {}
                 other => warnings.push(format!("options.{other} isn't supported (ignored)")),
@@ -417,10 +417,10 @@ pub fn convert(v: &Value) -> Imported {
     Imported { config, warnings, summary, known_violations }
 }
 
-/// Renders an imported config as a commented `tangle.toml`.
+/// Renders an imported config as a commented `detangle.toml`.
 pub fn to_toml(imported: &Imported, source: &Path) -> Result<String> {
     let mut out = format!(
-        "# tangle.toml — converted from {} by `tangle init --from`.\n",
+        "# detangle.toml — converted from {} by `detangle init --from`.\n",
         source.file_name().unwrap_or_default().to_string_lossy()
     );
     if !imported.warnings.is_empty() {

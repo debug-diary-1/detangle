@@ -30,7 +30,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[derive(Parser)]
 #[command(
-    name = "tangle",
+    name = "detangle",
     version,
     about = "Blazing-fast dependency analysis and architecture rules for JS/TS projects",
     args_conflicts_with_subcommands = true
@@ -40,7 +40,7 @@ struct Cli {
     cmd: Option<Cmd>,
     #[command(flatten)]
     target: Target,
-    /// Keep parse results between runs (default dir: node_modules/.cache/tangle)
+    /// Keep parse results between runs (default dir: node_modules/.cache/detangle)
     #[arg(long, global = true, num_args = 0..=1, value_name = "DIR")]
     cache: Option<Option<PathBuf>>,
     /// How the cache detects changed files
@@ -53,10 +53,10 @@ static CACHE_ARGS: std::sync::OnceLock<(Option<Option<PathBuf>>, Option<config::
 
 #[derive(Args, Clone)]
 struct Target {
-    /// Directory to analyse (the project root is found by walking up to tangle.toml / package.json)
+    /// Directory to analyse (the project root is found by walking up to detangle.toml / package.json)
     #[arg(default_value = ".")]
     path: PathBuf,
-    /// Config file (default: <root>/tangle.toml, else built-in rules)
+    /// Config file (default: <root>/detangle.toml, else built-in rules)
     #[arg(short, long)]
     config: Option<PathBuf>,
     /// Mode for evaluating Vite / webpack configs (overrides config_env.mode)
@@ -92,7 +92,7 @@ enum Cmd {
         #[arg(long)]
         baseline: Option<PathBuf>,
         /// Record all current violations as the baseline and exit 0 (default
-        /// file: options.baseline, else .tangle-baseline.json)
+        /// file: options.baseline, else .detangle-baseline.json)
         #[arg(long, num_args = 0..=1, value_name = "FILE")]
         write_baseline: Option<Option<PathBuf>>,
         /// How --write-baseline updates an existing baseline
@@ -171,7 +171,7 @@ enum Cmd {
         #[command(flatten)]
         target: Target,
         /// Output file
-        #[arg(short, long, default_value = "tangle-report.html")]
+        #[arg(short, long, default_value = "detangle-report.html")]
         output: PathBuf,
         /// Open it in the browser afterwards
         #[arg(long)]
@@ -185,22 +185,22 @@ enum Cmd {
         top: usize,
     },
     /// Convert existing dependency rules (JS rules configs, ESLint import
-    /// rules, madge) and known-violation files into tangle.toml
+    /// rules, madge) and known-violation files into detangle.toml
     Migrate {
         #[arg(default_value = ".")]
         path: PathBuf,
-        /// Print the tangle.toml instead of writing it
+        /// Print the detangle.toml instead of writing it
         #[arg(long)]
         dry_run: bool,
-        /// Overwrite an existing tangle.toml
+        /// Overwrite an existing detangle.toml
         #[arg(long)]
         force: bool,
     },
-    /// Write a starter tangle.toml
+    /// Write a starter detangle.toml
     Init {
         #[arg(default_value = ".")]
         path: PathBuf,
-        /// Convert a JavaScript rules config (.js/.cjs/.mjs/.json) to tangle.toml
+        /// Convert a JavaScript rules config (.js/.cjs/.mjs/.json) to detangle.toml
         #[arg(long, value_name = "FILE")]
         from: Option<PathBuf>,
         #[arg(long)]
@@ -339,7 +339,7 @@ impl Project {
 
     /// Applies filesystem changes and re-analyses. Returns the new analysis
     /// and a one-line description of the work done. On error (e.g. a
-    /// half-edited tangle.toml) the previous state is kept.
+    /// half-edited detangle.toml) the previous state is kept.
     /// Returns `None` for the analysis when it can't have changed: the edited
     /// files still import exactly what they did (the common case of editing
     /// code rather than imports).
@@ -392,9 +392,9 @@ impl Project {
     }
 }
 
-/// With `TANGLE_TIMINGS` set, prints how long a phase took to stderr.
+/// With `DETANGLE_TIMINGS` set, prints how long a phase took to stderr.
 pub fn timing(phase: &str, t: std::time::Instant) {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var_os("TANGLE_TIMINGS").is_some());
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var_os("DETANGLE_TIMINGS").is_some());
     if *ON {
         eprintln!("{phase:>8} {:7.1}ms", t.elapsed().as_secs_f64() * 1000.0);
     }
@@ -424,7 +424,7 @@ fn run() -> Result<ExitCode> {
     match cli.cmd.unwrap_or(Cmd::Tui { target: cli.target, no_watch: false }) {
         Cmd::Tui { target: t, no_watch } => {
             if !std::io::stdout().is_terminal() {
-                bail!("the explorer needs a terminal; try `tangle check` or `tangle stats`");
+                bail!("the explorer needs a terminal; try `detangle check` or `detangle stats`");
             }
             let mut project = Project::open(&t.path, t.config.as_deref(), t.mode.as_deref())?.announce();
             let a = project.analyze()?;
@@ -472,7 +472,7 @@ fn run() -> Result<ExitCode> {
         Cmd::Check { target, format, strict, baseline, write_baseline, baseline_mode } => {
             let project = one_shot(Project::open(&target.path, target.config.as_deref(), target.mode.as_deref())?.announce());
             if let Some(path) = write_baseline {
-                let path = path.or_else(|| project.baseline_path()).unwrap_or_else(|| PathBuf::from(".tangle-baseline.json"));
+                let path = path.or_else(|| project.baseline_path()).unwrap_or_else(|| PathBuf::from(".detangle-baseline.json"));
                 let a = one_shot(project.analyze_with(false)?);
                 let n = rules::write_baseline(&a.graph, &a.violations, &path, baseline_mode == BaselineMode::ShrinkOnly)?;
                 eprintln!("wrote {n} violations to {}", path.display());
@@ -630,16 +630,16 @@ fn run() -> Result<ExitCode> {
             if sources.is_empty() {
                 println!("No existing dependency rules found in {}.", root.display());
                 println!("Looked for: JS/JSON rules configs (forbidden/allowed/required), ESLint import rules, madge.");
-                println!("Start from tangle's defaults with `tangle init`, or pass a config: `tangle init --from FILE`.");
+                println!("Start from detangle's defaults with `detangle init`, or pass a config: `detangle init --from FILE`.");
                 return Ok(ExitCode::SUCCESS);
             }
             let m = migrate::migrate(&root, &sources)?;
-            const BASELINE: &str = ".tangle-baseline.json";
+            const BASELINE: &str = ".detangle-baseline.json";
             // Always reference the baseline file (ignored while it doesn't exist),
-            // so `tangle check --write-baseline` works straight away.
+            // so `detangle check --write-baseline` works straight away.
             let text = migrate::render(&m, Some(BASELINE))?;
-            // Never write a config tangle can't load.
-            let parsed: Config = toml::from_str(&text).context("internal error: generated tangle.toml doesn't parse")?;
+            // Never write a config detangle can't load.
+            let parsed: Config = toml::from_str(&text).context("internal error: generated detangle.toml doesn't parse")?;
             rules::validate(&parsed).context("internal error: generated rules are invalid")?;
 
             let out = root.join(config::CONFIG_FILE);
@@ -666,7 +666,7 @@ fn run() -> Result<ExitCode> {
                 }
             }
             if !m.warnings.is_empty() {
-                e(p.bold(&format!("Needs review ({}) — also noted at the top of tangle.toml", m.warnings.len())));
+                e(p.bold(&format!("Needs review ({}) — also noted at the top of detangle.toml", m.warnings.len())));
                 for w in &m.warnings {
                     e(format!("  {} {w}", p.yellow("!")));
                 }
@@ -675,7 +675,7 @@ fn run() -> Result<ExitCode> {
                 e(p.bold("Update these package.json scripts"));
                 for (name, cmd) in &m.scripts {
                     e(format!("  \"{name}\": {}", p.dim(&format!("{cmd:?}"))));
-                    e(format!("  {}  \"{name}\": \"tangle check\"", p.green("→")));
+                    e(format!("  {}  \"{name}\": \"detangle check\"", p.green("→")));
                 }
             }
             if dry_run {
@@ -690,7 +690,7 @@ fn run() -> Result<ExitCode> {
             let a = one_shot(one_shot(Project::open(&root, None, None)?).analyze()?);
             let (err, warn, info) = report::counts(&a.violations);
             println!(
-                "{} {err} errors, {warn} warnings, {info} info{} — see them with `tangle check` or `tangle report --open`",
+                "{} {err} errors, {warn} warnings, {info} info{} — see them with `detangle check` or `detangle report --open`",
                 p.bold("Now:"),
                 if a.suppressed > 0 { format!(" ({} baselined)", a.suppressed) } else { String::new() }
             );
@@ -698,7 +698,7 @@ fn run() -> Result<ExitCode> {
                 println!(
                     "{}",
                     p.dim(&format!(
-                        "To switch CI over without new failures, accept today's findings with `tangle check --write-baseline` (writes {BASELINE}); new violations will still fail."
+                        "To switch CI over without new failures, accept today's findings with `detangle check --write-baseline` (writes {BASELINE}); new violations will still fail."
                     ))
                 );
             }
@@ -731,7 +731,7 @@ fn run() -> Result<ExitCode> {
                     if !existing.is_empty() && !force {
                         let names: Vec<String> = existing.iter().map(|s| s.label(&path)).collect();
                         println!("Found existing dependency rules: {}", names.join(", "));
-                        println!("Run `tangle migrate` to convert them (or `tangle init --force` for the defaults).");
+                        println!("Run `detangle migrate` to convert them (or `detangle init --force` for the defaults).");
                         return Ok(ExitCode::SUCCESS);
                     }
                     std::fs::write(&file, config::DEFAULT_CONFIG)?;

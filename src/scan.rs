@@ -172,7 +172,7 @@ mod cache {
 
     /// A compact binary file: it loads several times faster than JSON.
     const FILE: &str = "parse-cache.bin";
-    const MAGIC: &[u8] = b"tangle-parse-cache-1\n";
+    const MAGIC: &[u8] = b"detangle-parse-cache-1\n";
 
     #[derive(Clone)]
     struct Entry {
@@ -857,7 +857,7 @@ fn package_from_path(p: &Path) -> Option<String> {
 }
 
 fn resolve(resolver: &Resolvers, from: &Path, spec: &str) -> Option<Target> {
-    // Aliases (webpack / babel / tangle.toml) replace the specifier outright.
+    // Aliases (webpack / babel / detangle.toml) replace the specifier outright.
     match resolver.aliases.rewrite(spec) {
         Some(Rewrite::Ignore) => return None,
         Some(Rewrite::Candidates(cands)) => {
@@ -1156,7 +1156,7 @@ export const f = (x) => [module.require("./g"), process.getBuiltinModule("fs"), 
 
     #[test]
     fn resolve_options_pick_conditions_fields_main_files_and_builtins() {
-        let root = std::env::temp_dir().join(format!("tangle-resolve-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("detangle-resolve-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let w = |p: &str, t: &str| {
             let p = root.join(p);
@@ -1249,7 +1249,7 @@ export const f = (x) => [module.require("./g"), process.getBuiltinModule("fs"), 
     /// Incremental updates must always agree with a fresh full scan.
     #[test]
     fn incremental_matches_full_scan() {
-        let tmp = std::env::temp_dir().join(format!("tangle-inc-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("detangle-inc-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(tmp.join("src/feat")).unwrap();
         let root = std::fs::canonicalize(&tmp).unwrap();

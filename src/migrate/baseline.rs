@@ -1,5 +1,5 @@
 //! Converts known-violation files (a JSON array of `{ type, from, to,
-//! rule: { name, severity } }` entries) into a tangle baseline.
+//! rule: { name, severity } }` entries) into a detangle baseline.
 
 use std::path::Path;
 
@@ -22,7 +22,7 @@ pub fn looks_like_known_violations(text: &str) -> bool {
     }
 }
 
-/// `node_modules/@scope/pkg/dist/x.js` → `@scope/pkg` (tangle names npm
+/// `node_modules/@scope/pkg/dist/x.js` → `@scope/pkg` (detangle names npm
 /// packages by package name).
 fn module_id(s: &str) -> String {
     let Some(rest) = s.rsplit_once("node_modules/").map(|(_, r)| r) else { return s.to_string() };
@@ -67,7 +67,7 @@ mod tests {
         assert!(looks_like_known_violations(text));
         assert!(!looks_like_known_violations(r#"{"forbidden": []}"#));
         assert!(!looks_like_known_violations(r#"[{"name": "x"}]"#));
-        let f = std::env::temp_dir().join(format!("tangle-kv-{}.json", std::process::id()));
+        let f = std::env::temp_dir().join(format!("detangle-kv-{}.json", std::process::id()));
         std::fs::write(&f, text).unwrap();
         let got = convert(&f).unwrap();
         std::fs::remove_file(&f).unwrap();

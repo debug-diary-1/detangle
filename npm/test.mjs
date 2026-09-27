@@ -1,9 +1,9 @@
-// Run with TANGLE_BIN pointing at a tangle binary: node --test npm/test.mjs
+// Run with DETANGLE_BIN pointing at a detangle binary: node --test npm/test.mjs
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
-import tangle, { analyze, check, report, graph, migrate } from "./index.mjs";
+import detangle, { analyze, check, report, graph, migrate } from "./index.mjs";
 
 const fixtures = fileURLToPath(new URL("../tests/fixtures/", import.meta.url));
 const conditions = fixtures + "conditions";
@@ -13,7 +13,7 @@ test("ESM and CommonJS entry points expose the same API", () => {
   const cjs = createRequire(import.meta.url)("./index.js");
   assert.deepEqual(Object.keys(cjs).sort(), ["analyze", "check", "default", "graph", "migrate", "report"]);
   assert.equal(cjs.default, cjs);
-  assert.equal(tangle.analyze, cjs.analyze);
+  assert.equal(detangle.analyze, cjs.analyze);
 });
 
 test("analyze returns modules, cycles and violations", async () => {
@@ -57,6 +57,6 @@ test("migrate previews the generated config", async () => {
 });
 
 test("errors from the binary are thrown", async () => {
-  await assert.rejects(analyze(conditions, { config: conditions + "/missing.toml" }), /tangle analyze failed/);
-  await assert.rejects(analyze(conditions, { bin: "/nonexistent/tangle" }), /couldn't run/);
+  await assert.rejects(analyze(conditions, { config: conditions + "/missing.toml" }), /detangle analyze failed/);
+  await assert.rejects(analyze(conditions, { bin: "/nonexistent/detangle" }), /couldn't run/);
 });

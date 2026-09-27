@@ -1,4 +1,4 @@
-//! Groups: named, tagged sets of modules (`[[groups]]` in tangle.toml, or Nx
+//! Groups: named, tagged sets of modules (`[[groups]]` in detangle.toml, or Nx
 //! projects discovered on every run).
 
 use std::collections::BTreeMap;

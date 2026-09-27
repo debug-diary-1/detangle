@@ -168,7 +168,7 @@ fn expand(value: &str, lookup: &dyn Fn(&str) -> Option<String>) -> String {
 
 /// Loads `files` (later files override earlier ones) from `dir`, then
 /// expands references. Missing files are skipped. References resolve with
-/// the same precedence the values themselves get: `overrides` (tangle.toml
+/// the same precedence the values themselves get: `overrides` (detangle.toml
 /// `vars`), then the shell environment, then the merged files.
 pub fn load(dir: &Path, files: &[String], overrides: &BTreeMap<String, String>) -> Result<BTreeMap<String, String>> {
     let mut merged: BTreeMap<String, Entry> = BTreeMap::new();
@@ -259,7 +259,7 @@ mod tests {
     use super::*;
 
     fn vars(tag: &str, files: &[(&str, &str)]) -> BTreeMap<String, String> {
-        let dir = std::env::temp_dir().join(format!("tangle-dotenv-{}-{tag}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("detangle-dotenv-{}-{tag}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         for (name, body) in files {
             std::fs::write(dir.join(name), body).unwrap();
@@ -298,7 +298,7 @@ mod tests {
     #[test]
     fn later_files_override_and_expansion_sees_the_merged_result() {
         let v = vars("merge", &[
-            (".env", "HOST=localhost\nURL=http://${HOST}:$PORT/api\nPORT=3000\nPRICE=\\$5\nFALLBACK=${UNSET_TANGLE_VAR:-dflt}\nLOOP=$LOOP-x"),
+            (".env", "HOST=localhost\nURL=http://${HOST}:$PORT/api\nPORT=3000\nPRICE=\\$5\nFALLBACK=${UNSET_DETANGLE_VAR:-dflt}\nLOOP=$LOOP-x"),
             (".env.production", "HOST=example.com"),
         ]);
         assert_eq!(v["URL"], "http://example.com:3000/api");

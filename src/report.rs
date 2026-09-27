@@ -155,7 +155,7 @@ pub struct Stale<'a> {
 
 pub const STALE_RULE: &str = "stale-baseline-entry";
 const STALE_COMMENT: &str =
-    "This baseline entry no longer occurs. Remove fixed entries with `tangle check --write-baseline --baseline-mode shrink-only`.";
+    "This baseline entry no longer occurs. Remove fixed entries with `detangle check --write-baseline --baseline-mode shrink-only`.";
 
 impl Stale<'_> {
     pub fn none() -> Stale<'static> {
@@ -264,7 +264,7 @@ pub fn teamcity(g: &Graph, vs: &[Violation], stale: &Stale) -> String {
         if seen.insert(&f.rule) {
             let _ = writeln!(
                 out,
-                "##teamcity[inspectionType id='{0}' name='{0}' description='{1}' category='tangle']",
+                "##teamcity[inspectionType id='{0}' name='{0}' description='{1}' category='detangle']",
                 esc(&f.rule),
                 esc(f.comment.as_deref().unwrap_or(&f.rule))
             );
@@ -667,7 +667,7 @@ fn project(g: &Graph, view: &GraphView) -> Projected {
 pub fn dot(g: &Graph, view: &GraphView) -> String {
     let p = project(g, view);
     let mut out = String::from(
-        "digraph tangle {\n  rankdir=LR;\n  splines=true;\n  node [shape=box, style=\"rounded,filled\", fontname=\"Helvetica\", fontsize=10, fillcolor=\"#ffffff\", color=\"#999999\"];\n  edge [color=\"#00000055\", arrowsize=0.6];\n",
+        "digraph detangle {\n  rankdir=LR;\n  splines=true;\n  node [shape=box, style=\"rounded,filled\", fontname=\"Helvetica\", fontsize=10, fillcolor=\"#ffffff\", color=\"#999999\"];\n  edge [color=\"#00000055\", arrowsize=0.6];\n",
     );
     for (i, (id, kind, cyclic, highlighted)) in p.nodes.iter().enumerate() {
         let (fill, border) = match kind {
@@ -899,5 +899,5 @@ pub fn html(g: &Graph, vs: &[Violation], config: Option<&std::path::Path>) -> St
     });
     // Keep `</script>` inside strings from closing the data block.
     let data = data.to_string().replace("</", "<\\/");
-    HTML_TEMPLATE.replacen("/*__TANGLE_DATA__*/", &data, 1)
+    HTML_TEMPLATE.replacen("/*__DETANGLE_DATA__*/", &data, 1)
 }

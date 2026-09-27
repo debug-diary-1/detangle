@@ -1,4 +1,4 @@
-//! Glob → regex, for converting other tools' path patterns into tangle's
+//! Glob → regex, for converting other tools' path patterns into detangle's
 //! regexes (matched against root-relative paths).
 
 /// How a pattern without glob characters is interpreted.

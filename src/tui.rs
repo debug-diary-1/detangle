@@ -679,7 +679,7 @@ impl<'a> App<'a> {
             format!("Cycles {}", g.cycles.len()),
             "Hotspots".to_string(),
         ];
-        let mut spans = vec![Span::styled(" ⧉ tangle ", Style::new().bg(ACCENT).fg(Color::Black).bold()), Span::raw(" ")];
+        let mut spans = vec![Span::styled(" ⧉ detangle ", Style::new().bg(ACCENT).fg(Color::Black).bold()), Span::raw(" ")];
         for (i, t) in titles.iter().enumerate() {
             let style = if TABS[i] == self.tab {
                 Style::new().fg(ACCENT).bold().underlined()
@@ -933,7 +933,7 @@ impl<'a> App<'a> {
             }
             if g.cycles[c].len() + 1 > path.len() {
                 lines.push(Line::raw(""));
-                lines.push(Line::styled(format!("All {} modules in this tangle", g.cycles[c].len()), Style::new().bold()));
+                lines.push(Line::styled(format!("All {} modules in this detangle", g.cycles[c].len()), Style::new().bold()));
                 for &m in &g.cycles[c] {
                     let mut l = vec![Span::raw("  ")];
                     l.extend(path_spans(&g.modules[m].id, ModuleKind::Local));

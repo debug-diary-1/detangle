@@ -1,6 +1,6 @@
 //! Import aliases from webpack (`resolve.alias`, `resolve.modules`,
 //! `resolve.extensions`), Vite (`resolve.alias`, `resolve.extensions`), Babel
-//! (`babel-plugin-module-resolver`) and tangle's own `[options.aliases]`. They rewrite a specifier *before* resolution, so
+//! (`babel-plugin-module-resolver`) and detangle's own `[options.aliases]`. They rewrite a specifier *before* resolution, so
 //! the rest of the pipeline (tsconfig paths, package exports, …) still applies.
 
 use std::path::{Path, PathBuf};
@@ -308,15 +308,15 @@ fn run_node(script: &str, file: &Path, eval: &EvalEnv) -> Result<String> {
     }
     webpack_env.extend(env.webpack_env.clone());
     let args = serde_json::json!({ "mode": env.mode(), "command": command, "webpackEnv": webpack_env });
-    // Precedence: tangle.toml `vars` > shell environment > `.env` files.
+    // Precedence: detangle.toml `vars` > shell environment > `.env` files.
     let from_files = eval.files.iter().filter(|(k, _)| std::env::var_os(k).is_none());
     let out = Command::new("node")
         .args(["-e", script])
         .envs(from_files)
         .envs(&env.vars)
         .env("NODE_ENV", env.node_env(&eval.files))
-        .env("TANGLE_CONFIG_ARGS", args.to_string())
-        .env("TANGLE_CONFIG_FILE", &abs)
+        .env("DETANGLE_CONFIG_ARGS", args.to_string())
+        .env("DETANGLE_CONFIG_FILE", &abs)
         .current_dir(abs.parent().unwrap_or(Path::new(".")))
         .output()
         .context("running `node` (is Node.js installed?)")?;
@@ -333,15 +333,15 @@ fn run_node(script: &str, file: &Path, eval: &EvalEnv) -> Result<String> {
 }
 
 /// Evaluates a webpack config (object, array, function or promise) and
-/// prints the parts of `resolve` tangle uses, with aliases normalised to
+/// prints the parts of `resolve` detangle uses, with aliases normalised to
 /// webpack's array form.
 const WEBPACK_LOADER: &str = r#"
 const { pathToFileURL } = require('url');
 (async () => {
-  const file = process.env.TANGLE_CONFIG_FILE;
+  const file = process.env.DETANGLE_CONFIG_FILE;
   const m = await import(pathToFileURL(file).href);
   let c = m.default ?? m;
-  const args = JSON.parse(process.env.TANGLE_CONFIG_ARGS);
+  const args = JSON.parse(process.env.DETANGLE_CONFIG_ARGS);
   if (typeof c === 'function') c = await c(args.webpackEnv, { mode: args.mode, env: args.webpackEnv });
   const configs = Array.isArray(c) ? c : [c];
   const out = { alias: [], modules: [], extensions: [] };
@@ -364,10 +364,10 @@ const { pathToFileURL } = require('url');
 const VITE_LOADER: &str = r#"
 const path = require('path'), { pathToFileURL } = require('url');
 (async () => {
-  const file = process.env.TANGLE_CONFIG_FILE;
+  const file = process.env.DETANGLE_CONFIG_FILE;
   const m = await import(pathToFileURL(file).href);
   let c = m.default ?? m;
-  const args = JSON.parse(process.env.TANGLE_CONFIG_ARGS);
+  const args = JSON.parse(process.env.DETANGLE_CONFIG_ARGS);
   if (typeof c === 'function') c = await c({ command: args.command, mode: args.mode, isSsrBuild: false, isPreview: false });
   c = (await c) || {};
   const r = c.resolve || {};
@@ -386,7 +386,7 @@ const path = require('path'), { pathToFileURL } = require('url');
 const BABEL_LOADER: &str = r#"
 const fs = require('fs'), path = require('path'), { pathToFileURL } = require('url');
 (async () => {
-  const file = process.env.TANGLE_CONFIG_FILE;
+  const file = process.env.DETANGLE_CONFIG_FILE;
   let c;
   if (/\.(c|m)?js$/.test(file)) {
     const m = await import(pathToFileURL(file).href);

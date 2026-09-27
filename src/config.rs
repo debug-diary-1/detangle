@@ -5,11 +5,11 @@ use anyhow::{Context, Result};
 use crate::migrate;
 use serde::{Deserialize, Serialize};
 
-pub const CONFIG_FILE: &str = "tangle.toml";
+pub const CONFIG_FILE: &str = "detangle.toml";
 
-/// The default configuration. `tangle init` writes this verbatim, and it is
-/// used as-is when a project has no `tangle.toml`.
-pub const DEFAULT_CONFIG: &str = r#"# tangle.toml — dependency rules for this project.
+/// The default configuration. `detangle init` writes this verbatim, and it is
+/// used as-is when a project has no `detangle.toml`.
+pub const DEFAULT_CONFIG: &str = r#"# detangle.toml — dependency rules for this project.
 #
 # Paths are relative to the project root and matched as regular expressions.
 # Inside `to.path` / `to.path_not`, $1..$9 refer to capture groups of `from.path`.
@@ -193,7 +193,7 @@ pub struct Options {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub babel_config: Option<String>,
     /// Known violations to ignore (a file written by `--write-baseline` or
-    /// `tangle migrate`), relative to the root.
+    /// `detangle migrate`), relative to the root.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub baseline: Option<String>,
     /// Report baseline entries that no longer occur, with this severity.
@@ -215,7 +215,7 @@ pub struct Options {
     /// Module resolution overrides (like webpack's / enhanced-resolve's).
     #[serde(skip_serializing_if = "ResolveConfig::is_default")]
     pub resolve: ResolveConfig,
-    /// Keep parse results between runs: `true` (in node_modules/.cache/tangle)
+    /// Keep parse results between runs: `true` (in node_modules/.cache/detangle)
     /// or a directory. Files are re-parsed only when they change.
     #[serde(skip_serializing_if = "CacheSetting::is_off")]
     pub cache: CacheSetting,
@@ -253,7 +253,7 @@ impl CacheSetting {
     pub fn dir(&self, root: &Path) -> Option<PathBuf> {
         match self {
             CacheSetting::Enabled(false) => None,
-            CacheSetting::Enabled(true) => Some(root.join("node_modules/.cache/tangle")),
+            CacheSetting::Enabled(true) => Some(root.join("node_modules/.cache/detangle")),
             CacheSetting::Dir(d) => Some(root.join(d)),
         }
     }
@@ -275,7 +275,7 @@ impl CacheStrategy {
     }
 }
 
-/// `[options.resolve]`: replaces tangle's resolution defaults where set.
+/// `[options.resolve]`: replaces detangle's resolution defaults where set.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ResolveConfig {
@@ -331,7 +331,7 @@ impl GroupMatch {
     }
 }
 
-/// What JS build configs see when tangle evaluates them.
+/// What JS build configs see when detangle evaluates them.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ConfigEnv {
@@ -401,7 +401,7 @@ impl ConfigEnv {
         names.into_iter().map(|n| n.replace("{mode}", self.mode())).collect()
     }
 
-    /// `NODE_ENV` unless set explicitly (tangle.toml `vars`, then the shell,
+    /// `NODE_ENV` unless set explicitly (detangle.toml `vars`, then the shell,
     /// then `.env` files): "production" for a production mode or a build,
     /// else "development" (as Vite does).
     pub fn node_env(&self, files: &std::collections::BTreeMap<String, String>) -> String {
@@ -742,7 +742,7 @@ pub struct ModuleSpec {
 }
 
 /// Finds the project root: the nearest ancestor of `start` holding a
-/// `tangle.toml`, else one holding a `package.json`, else `start` itself.
+/// `detangle.toml`, else one holding a `package.json`, else `start` itself.
 pub fn find_root(start: &Path) -> PathBuf {
     for marker in [CONFIG_FILE, "package.json"] {
         if let Some(dir) = start.ancestors().find(|d| d.join(marker).is_file()) {
@@ -760,7 +760,7 @@ pub struct Loaded {
 }
 
 /// Loads `explicit` (a JavaScript config is converted on the fly), else
-/// `<root>/tangle.toml`, else the built-in defaults.
+/// `<root>/detangle.toml`, else the built-in defaults.
 pub fn load(root: &Path, explicit: Option<&Path>) -> Result<Loaded> {
     let path = match explicit {
         Some(p) => Some(p.to_path_buf()),
@@ -772,7 +772,7 @@ pub fn load(root: &Path, explicit: Option<&Path>) -> Result<Loaded> {
     if migrate::is_js_config(&path) {
         let imported = migrate::import(&path)?;
         let mut notes = vec![format!(
-            "using {} ({} rules imported; run `tangle init --from {}` to convert it)",
+            "using {} ({} rules imported; run `detangle init --from {}` to convert it)",
             path.file_name().unwrap_or_default().to_string_lossy(),
             imported.config.forbidden.len() + imported.config.allowed.len() + imported.config.required.len(),
             path.file_name().unwrap_or_default().to_string_lossy(),

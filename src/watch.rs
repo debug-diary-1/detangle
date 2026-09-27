@@ -1,4 +1,4 @@
-//! Debounced filesystem watching for `tangle watch` and the live explorer.
+//! Debounced filesystem watching for `detangle watch` and the live explorer.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -19,7 +19,7 @@ const QUIET: Duration = Duration::from_millis(150);
 #[derive(Debug, Default)]
 pub struct Changes {
     pub paths: BTreeSet<PathBuf>,
-    /// tsconfig / package.json / tangle.toml changed: everything must be rebuilt.
+    /// tsconfig / package.json / detangle.toml changed: everything must be rebuilt.
     pub config: bool,
 }
 
@@ -48,7 +48,7 @@ pub struct Watcher {
 }
 
 fn is_config(name: &str) -> bool {
-    name == "tangle.toml"
+    name == "detangle.toml"
         || name == "package.json"
         || (name.starts_with("tsconfig") && name.ends_with(".json"))
         || name.starts_with("webpack.config.")

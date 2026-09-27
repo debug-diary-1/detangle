@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>tangle report</title>
+<title>detangle report</title>
 <style>
 :root {
   --bg: #f7f7f5; --panel: #ffffff; --ink: #1c1d1f; --muted: #6b6f76; --faint: #9aa0a6;
@@ -110,7 +110,7 @@ footer { color: var(--faint); font-size: 12px; padding: 0 clamp(16px, 3vw, 32px)
 </head>
 <body>
 <header>
-  <h1><span class="brand">tangle</span> report · <span id="project"></span></h1>
+  <h1><span class="brand">detangle</span> report · <span id="project"></span></h1>
   <div class="sub" id="meta"></div>
   <div class="cards" id="cards"></div>
 </header>
@@ -155,7 +155,7 @@ footer { color: var(--faint); font-size: 12px; padding: 0 clamp(16px, 3vw, 32px)
   </section>
 </main>
 <footer id="foot"></footer>
-<script id="data" type="application/json">/*__TANGLE_DATA__*/</script>
+<script id="data" type="application/json">/*__DETANGLE_DATA__*/</script>
 <script>
 "use strict";
 const D = JSON.parse(document.getElementById("data").textContent);
@@ -211,7 +211,7 @@ function tags(bits) {
 
 // ── header ──────────────────────────────────────────────────────────────
 $("#project").textContent = D.project;
-document.title = "tangle · " + D.project;
+document.title = "detangle · " + D.project;
 $("#meta").textContent = `${D.root} · generated ${new Date(D.generated).toLocaleString()} · analysed in ${Math.round(D.ms)} ms` + (D.config ? ` · rules from ${D.config}` : " · built-in rules");
 const counts = { error: 0, warn: 0, info: 0 };
 for (const v of D.v) counts[v.s]++;
@@ -223,7 +223,7 @@ $("#cards").append(
   card(fmt(counts.error), "errors", counts.error ? "error" : "ok"), card(fmt(counts.warn), "warnings", counts.warn ? "warn" : ""),
   card(fmt(counts.info), "info", counts.info ? "info" : ""),
   card(fmt(D.k.filter((k) => k === 1).length), "npm packages"));
-$("#foot").textContent = `tangle ${D.version}`;
+$("#foot").textContent = `detangle ${D.version}`;
 
 // ── tabs ────────────────────────────────────────────────────────────────
 const TABS = [["violations", "Violations", D.v.length], ["modules", "Modules", localCount], ["cycles", "Cycles", D.cycles.length], ["graph", "Folder graph", null]];

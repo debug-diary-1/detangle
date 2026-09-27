@@ -1,4 +1,4 @@
-# tangle
+# detangle
 
 Fast dependency analysis and architecture rules for JavaScript/TypeScript, React, Vue, Svelte and Angular, with a live-reloading terminal explorer. Written in Rust on top of the [oxc](https://oxc.rs) parser and resolver.
 
@@ -13,28 +13,28 @@ cargo install --path .
 ## Usage
 
 ```sh
-tangle                        # interactive explorer; rebuilds live as you edit
-tangle watch                  # re-run the rules on every change
-tangle check                  # run the rules; exit 1 on errors (CI)
-tangle check -f github        # GitHub Actions annotations on the PR
-tangle check -f markdown      # summary + details for a PR comment or job summary
-tangle check -f teamcity      # TeamCity inspections (also: -f azure for Azure DevOps)
-tangle check --strict         # also fail on warnings
-tangle report --open          # self-contained HTML report
-tangle stats                  # overview + hotspots
-tangle why src/app.ts lodash  # shortest import chain from A to B
-tangle affected --since origin/main --filter '\.test\.ts$'   # tests to run
-tangle graph -f mermaid --collapse 2 > deps.mmd               # architecture diagram
-tangle graph -f dot --focus 'features/cart' | dot -Tsvg > cart.svg
-tangle graph --focus 'cart' --focus-depth 2 --highlight 'api/'   # two steps out, api modules marked
-tangle graph --reaches 'src/db/' -f mermaid                       # everything that depends on db
-tangle graph --collapse '^packages/[^/]+/' -f mermaid             # one node per package
-tangle graph --from 'src/main\.ts$' --max-depth 2                 # what the entry imports, 2 steps deep
-tangle graph -f d2 > deps.d2; tangle graph -f csv > matrix.csv    # D2 diagram, adjacency matrix
-tangle init                   # write a starter tangle.toml
+detangle                        # interactive explorer; rebuilds live as you edit
+detangle watch                  # re-run the rules on every change
+detangle check                  # run the rules; exit 1 on errors (CI)
+detangle check -f github        # GitHub Actions annotations on the PR
+detangle check -f markdown      # summary + details for a PR comment or job summary
+detangle check -f teamcity      # TeamCity inspections (also: -f azure for Azure DevOps)
+detangle check --strict         # also fail on warnings
+detangle report --open          # self-contained HTML report
+detangle stats                  # overview + hotspots
+detangle why src/app.ts lodash  # shortest import chain from A to B
+detangle affected --since origin/main --filter '\.test\.ts$'   # tests to run
+detangle graph -f mermaid --collapse 2 > deps.mmd               # architecture diagram
+detangle graph -f dot --focus 'features/cart' | dot -Tsvg > cart.svg
+detangle graph --focus 'cart' --focus-depth 2 --highlight 'api/'   # two steps out, api modules marked
+detangle graph --reaches 'src/db/' -f mermaid                       # everything that depends on db
+detangle graph --collapse '^packages/[^/]+/' -f mermaid             # one node per package
+detangle graph --from 'src/main\.ts$' --max-depth 2                 # what the entry imports, 2 steps deep
+detangle graph -f d2 > deps.d2; detangle graph -f csv > matrix.csv    # D2 diagram, adjacency matrix
+detangle init                   # write a starter detangle.toml
 ```
 
-The project root is the nearest ancestor containing `tangle.toml`, or else `package.json`. Pointing tangle at a subdirectory scans only that subdirectory, and paths are still reported relative to the root.
+The project root is the nearest ancestor containing `detangle.toml`, or else `package.json`. Pointing detangle at a subdirectory scans only that subdirectory, and paths are still reported relative to the root.
 
 ### Explorer keys
 
@@ -53,38 +53,38 @@ The project root is the nearest ancestor containing `tangle.toml`, or else `pack
 
 ## Incremental rebuilds
 
-`tangle watch` and the explorer keep the parsed project in memory. What gets redone depends on the change:
+`detangle watch` and the explorer keep the parsed project in memory. What gets redone depends on the change:
 
 | Change | Work redone | VS Code `src/` |
 |---|---|---|
 | Edit a file without changing its imports | re-parse and re-resolve only that file; the analysis is kept, since the graph can't have changed | ~5 ms |
 | Edit a file's imports | re-parse and re-resolve only that file, then rebuild the graph and rerun the rules | ~50 ms |
 | Add, remove or rename a file or folder | walk the tree again and re-resolve every import (the new file can change what `./foo` points to); only new or changed files are re-parsed | ~170 ms |
-| Change `tsconfig`, `package.json` or `tangle.toml`, or press `r` | full rebuild | ~300 ms |
+| Change `tsconfig`, `package.json` or `detangle.toml`, or press `r` | full rebuild | ~300 ms |
 
-Set `TANGLE_TIMINGS=1` to print how long each phase (config, scan, graph, rules) took to stderr.
+Set `DETANGLE_TIMINGS=1` to print how long each phase (config, scan, graph, rules) took to stderr.
 
-tangle checks the filesystem itself to decide whether files were added or removed, because watchers (notably macOS FSEvents) often report an ordinary save as a new file. Atomic saves from editors like vim and JetBrains therefore count as plain edits.
+detangle checks the filesystem itself to decide whether files were added or removed, because watchers (notably macOS FSEvents) often report an ordinary save as a new file. Atomic saves from editors like vim and JetBrains therefore count as plain edits.
 
 ### Parse cache
 
-`--cache` (or `options.cache = true`) keeps each file's parsed imports in `node_modules/.cache/tangle` and re-parses only files that changed. On VS Code's `src/` a warm `check` takes about 110 ms instead of 205 ms. Resolution always runs fresh, so installing packages or adding files is never missed. By default, files count as changed when their modification time or size changes. With `--cache-strategy content` (`options.cache_strategy = "content"`), a file whose timestamp changed but whose contents didn't is still reused. That helps fresh CI checkouts once the cache is restored: the first run hashes and rewrites the cache, and later runs are fast again.
+`--cache` (or `options.cache = true`) keeps each file's parsed imports in `node_modules/.cache/detangle` and re-parses only files that changed. On VS Code's `src/` a warm `check` takes about 110 ms instead of 205 ms. Resolution always runs fresh, so installing packages or adding files is never missed. By default, files count as changed when their modification time or size changes. With `--cache-strategy content` (`options.cache_strategy = "content"`), a file whose timestamp changed but whose contents didn't is still reused. That helps fresh CI checkouts once the cache is restored: the first run hashes and rewrites the cache, and later runs are fast again.
 
 ## What it understands
 
 - **React**: JSX/TSX, including JSX in plain `.js` files as Create React App, Vite and Babel setups allow. `React.lazy(() => import(...))` shows up as a dynamic import.
 - **Vue and Svelte** single-file components. It reads the `<script>` and `<script setup>` blocks, uses the `lang="ts"` or `lang="tsx"` setting, and treats `<script src>` as an import. Template content and `<svelte:head>` browser scripts are ignored.
 - **Angular**: `templateUrl`, `styleUrl` and `styleUrls` in decorators become dependencies of type `resource`, so a missing template or stylesheet is reported. Lazy `loadComponent` and `loadChildren` routes are picked up as dynamic imports.
-- If a tsconfig can't be loaded (for example, it `extends` a package that isn't installed), tangle falls back to resolving without it, so a single broken tsconfig doesn't make every import unresolvable.
+- If a tsconfig can't be loaded (for example, it `extends` a package that isn't installed), detangle falls back to resolving without it, so a single broken tsconfig doesn't make every import unresolvable.
 - Every import form: `import`, `import type`, `export … from`, `import()`, `require()`, `import x = require()`, `import("x").T`, AMD `define([...])` / `require([...])`, and `/// <reference path|types>` and `/// <amd-dependency>` directives
 - Opt-in, as in other tools: JSDoc type imports (`@import … from "x"`, `{import("x").T}`) with `options.jsdoc_imports = true`, `process.getBuiltinModule("fs")` with `options.builtin_module_calls = true`, and require-like functions with `options.exotic_require = ["module.require"]`
-- **Aliases** from Vite (`resolve.alias` in object or array form, including RegExp `find` and `/src`-style root-relative replacements), from webpack (`resolve.alias`, including `name$` and `false`, plus `resolve.modules` and `resolve.extensions`), from Babel's `babel-plugin-module-resolver` (`alias`, including `^regex` keys with `\1`, and `root`), or declared directly in `tangle.toml` (see below)
+- **Aliases** from Vite (`resolve.alias` in object or array form, including RegExp `find` and `/src`-style root-relative replacements), from webpack (`resolve.alias`, including `name$` and `false`, plus `resolve.modules` and `resolve.extensions`), from Babel's `babel-plugin-module-resolver` (`alias`, including `^regex` keys with `\1`, and `root`), or declared directly in `detangle.toml` (see below)
 - tsconfig `paths` (per-file discovery or an explicit tsconfig), `package.json` `exports` and `imports`, and `.js`→`.ts` extension aliasing
 - Type-only and dynamic imports. By default type-only imports don't count toward cycles, because they're erased at runtime.
 - npm dependency classification by walking every enclosing `package.json`, so monorepo roots work: `npm`, `npm-dev`, `npm-peer`, `npm-optional`, `npm-undeclared`. `@types/*` packages count as declared for type-only packages.
 - `.gitignore` files are respected.
 - **Yarn Plug'n'Play**: when the root has a `.pnp.cjs`, packages resolve through it (from Yarn's zip cache), with PnP's strictness: undeclared transitive packages are unresolvable.
-- Resolution can be tuned in `[options.resolve]`, where each key replaces tangle's default:
+- Resolution can be tuned in `[options.resolve]`, where each key replaces detangle's default:
 
   ```toml
   [options.resolve]
@@ -101,7 +101,7 @@ tangle checks the filesystem itself to decide whether files were added or remove
 
 ## Rules
 
-`tangle.toml` (run `tangle init` for a commented starter). Paths are regular expressions matched against root-relative paths. Lookarounds work, and a list of patterns means "any of these".
+`detangle.toml` (run `detangle init` for a commented starter). Paths are regular expressions matched against root-relative paths. Lookarounds work, and a list of patterns means "any of these".
 
 ```toml
 allowed_severity = "error"    # for [[allowed]] below; top-level keys go before any table
@@ -200,7 +200,7 @@ env_dir = "config"                   # where .env files live (default: project r
 - **Expansion order:** expansion runs after merging, with the same precedence, so `.env.production` can change a value that `.env` builds on.
 - **Watch mode:** editing a `.env*` file triggers a rebuild.
 
-- **`--mode`:** `tangle check --mode staging` (and every other command) overrides `mode` for one run.
+- **`--mode`:** `detangle check --mode staging` (and every other command) overrides `mode` for one run.
 - **`NODE_ENV`:** defaults to `production` for a production mode or a `build`, otherwise `development`, as in Vite. A value in `vars` or your shell wins.
 - **webpack:** as with webpack-cli, `env` also gets `WEBPACK_SERVE`, or `WEBPACK_BUILD` and `WEBPACK_BUNDLE`.
 - **Babel:** `api.env()` follows `BABEL_ENV`, then `NODE_ENV`. They only run when named here, never by auto-detection. Aliases rewrite the import before resolution, so tsconfig `paths`, package `exports` and the other resolution rules still apply to the result. Editing any of these config files triggers a full rebuild in watch mode.
@@ -229,7 +229,7 @@ to = { tags_not = ["feature", "ui"] }
 
 With `options.nx_projects = true`, every Nx project is a group, rediscovered on each run with its `tags`. Projects are found the way Nx finds them without plugins: every `project.json`, and every `package.json` in the package manager's workspaces (`workspaces`, `pnpm-workspace.yaml`, `lerna.json`). Those also get Nx's `npm:public`/`npm:private` and keyword tags. Each project also gets `projectType:application` or `projectType:library` (inferred as Nx does when unset) and `target:<name>` for each of its targets. Nested projects take precedence over their parents. Tag conditions (`tags`, `tags_not`, `reaches_tags`, and `tags_all` on `from`) accept Nx patterns: exact tags, `*` globs and `/regex/`. On the module scope, `to.cross_group = true` / `false` matches dependencies between different groups / within one group. The `relative` dependency type matches imports written as a relative or absolute path.
 
-A group dependency stands for the imports behind it. At group scope, `specifier`, `specifier_not`, `dependency_types` and `dependency_types_not` are checked against those imports: the rule matches when at least one import satisfies them. The same goes for a module that imports one target several times (`import` and `export … from`, or `lodash` and `lodash/fp`). Violations list those imports, so `tangle check` shows the files to fix, and GitHub annotations land on them.
+A group dependency stands for the imports behind it. At group scope, `specifier`, `specifier_not`, `dependency_types` and `dependency_types_not` are checked against those imports: the rule matches when at least one import satisfies them. The same goes for a module that imports one target several times (`import` and `export … from`, or `lodash` and `lodash/fp`). Violations list those imports, so `detangle check` shows the files to fix, and GitHub annotations land on them.
 
 ```toml
 # no feature may pull in the server layer, even indirectly
@@ -284,21 +284,21 @@ Dependency types: `local`, `npm`, `npm-dev`, `npm-peer`, `npm-optional`, `npm-un
 
 ## Node.js API
 
-`npm/` is a small package (`tangle-deps`, not published yet) that runs the `tangle` binary and returns plain JavaScript values, with TypeScript types for both ESM and CommonJS. It uses `options.bin`, then `$TANGLE_BIN`, then `tangle` on `PATH`.
+`npm/` is a small package (`detangle-deps`, not published yet) that runs the `detangle` binary and returns plain JavaScript values, with TypeScript types for both ESM and CommonJS. It uses `options.bin`, then `$DETANGLE_BIN`, then `detangle` on `PATH`.
 
 ```js
-import { analyze, check, report, graph, migrate } from "tangle-deps";
+import { analyze, check, report, graph, migrate } from "detangle-deps";
 
 const { modules, cycles, violations } = await analyze("src", { cache: true });
 const { errors, exitCode } = await check(".", { strict: true });
 const { output } = await report(".", { format: "markdown" });        // text, markdown, github, teamcity, azure
 const svgSource = await graph(".", { format: "dot", focus: /cart/, focusDepth: 2 });
-const { config } = await migrate(".");                               // the tangle.toml migrate would write
+const { config } = await migrate(".");                               // the detangle.toml migrate would write
 ```
 
 ## HTML report
 
-`tangle report` writes one self-contained HTML file with no external requests, so it can be attached to CI runs or shared as a file. It has:
+`detangle report` writes one self-contained HTML file with no external requests, so it can be attached to CI runs or shared as a file. It has:
 
 - **Violations**, grouped by rule, with a filter, severity toggles and the cycle behind every circular dependency.
 - **Modules**, a sortable table (fan-in, fan-out, instability, cycle, violations). Selecting a module shows its imports, its importers, violations in both directions, and the shortest loop through it.
@@ -310,22 +310,22 @@ It follows the system light or dark theme. VS Code's 113k dependencies produce a
 ### Adopting rules in a legacy codebase
 
 ```sh
-tangle check --write-baseline .tangle-baseline.json   # record today's violations
-tangle check --baseline .tangle-baseline.json         # fail only on new ones
-tangle check --write-baseline --baseline-mode shrink-only   # drop fixed entries, never add new ones
+detangle check --write-baseline .detangle-baseline.json   # record today's violations
+detangle check --baseline .detangle-baseline.json         # fail only on new ones
+detangle check --write-baseline --baseline-mode shrink-only   # drop fixed entries, never add new ones
 ```
 
 With `options.baseline_stale = "warn"` (or `"info"`, `"error"`), entries that no longer occur are reported as `stale-baseline-entry`, so the baseline doesn't silently keep permission for violations that were fixed.
 
-## Migrating to tangle
+## Migrating to detangle
 
 ```sh
-tangle migrate --dry-run   # preview the generated tangle.toml
-tangle migrate             # write tangle.toml (+ .tangle-baseline.json)
-tangle check               # same checks as before, much faster
+detangle migrate --dry-run   # preview the generated detangle.toml
+detangle migrate             # write detangle.toml (+ .detangle-baseline.json)
+detangle check               # same checks as before, much faster
 ```
 
-`tangle migrate` looks at the project root, converts every dependency-rule setup it finds into one `tangle.toml`, and tells you what to change:
+`detangle migrate` looks at the project root, converts every dependency-rule setup it finds into one `detangle.toml`, and tells you what to change:
 
 | Source | What's converted |
 |---|---|
@@ -334,25 +334,25 @@ tangle check               # same checks as before, much faster
 | **Nx** (`@nx/enforce-module-boundaries` in an ESLint config) | Project discovery (`nx_projects`) and every depConstraint: `sourceTag` or `allSourceTags`, `onlyDependOnLibsWithTags` (including `[]`), `notDependOnLibsWithTags` (transitively, as Nx checks it), and `bannedExternalImports` / `allowedExternalImports` (matched against the import as Nx does). Options: `allow`, `enforceBuildableLibDependency` with `buildTargets`, `banTransitiveDependencies`, `allowCircularSelfDependency` and `checkDynamicDependenciesExceptions`. Nx's built-in checks: project cycles, imports of apps and e2e projects, relative imports across projects or outside every project, self-imports through the project's own alias, static imports of lazy-loaded libraries, and "a project without tags matching a constraint can't depend on libraries". Like Nx, `require()` calls aren't checked. |
 | **eslint-plugin-boundaries** (`boundaries/dependencies`, `element-types`, `entry-point`, `external`, `no-unknown`) | `boundaries/elements` become `[[groups]]`: folder, file and full modes, `partialMatch`, `basePattern`, and captures. As in the plugin, a file belongs to its innermost element. `boundaries/ignore`, `boundaries/include` and `boundaries/dependency-nodes` carry over. Policies are replayed with the plugin's semantics: the last match wins, `disallow` beats `allow` within a policy, and a missing `default` means disallow. This works in the v6+ `{ to: { element: { type, types, captured } } }` format and the legacy `["type", { captured }]` format. Captured-value conditions (literal, glob, or comparing with the source through `{{ from.element.captured.x }}` / `${from.x}` templates) become `$1`-style rules. `entry-point` (allowed file paths inside elements), `external` (module names and paths) and `no-unknown` convert too. Not converted, with a warning: `no-private`, `no-unknown-files`, file descriptors, and selectors on `parent`, `path` or imported names. |
 | **madge** (`.madgerc`, `package.json` `madge`, or `madge --circular` in a script) | A circular-dependency rule, `excludeRegExp`, `tsConfig`, `webpackConfig`, `skipTypeImports` |
-| **Known-violation files** (JSON arrays of `{ from, to, rule: { name } }`) | `.tangle-baseline.json`, applied automatically through `options.baseline` |
+| **Known-violation files** (JSON arrays of `{ from, to, rule: { name } }`) | `.detangle-baseline.json`, applied automatically through `options.baseline` |
 
-Rules found in several places (for example a madge cycle check and a cycle rule) are merged, keeping the stricter severity. Anything that can't be converted exactly is listed at the top of `tangle.toml` for review instead of being silently loosened. `package.json` scripts that ran the old tools get a suggested `tangle check` replacement.
+Rules found in several places (for example a madge cycle check and a cycle rule) are merged, keeping the stricter severity. Anything that can't be converted exactly is listed at the top of `detangle.toml` for review instead of being silently loosened. `package.json` scripts that ran the old tools get a suggested `detangle check` replacement.
 
-**Switching CI without surprises:** tangle finds cycles that other tools miss, so the first run may report more than before. `tangle check --write-baseline` records today's findings. From then on, `tangle check` fails only on new violations.
+**Switching CI without surprises:** detangle finds cycles that other tools miss, so the first run may report more than before. `detangle check --write-baseline` records today's findings. From then on, `detangle check` fails only on new violations.
 
-You can also run a JavaScript rules config directly without converting it: `tangle check -c rules.config.js`.
+You can also run a JavaScript rules config directly without converting it: `detangle check -c rules.config.js`.
 
 ### Verified against the tools themselves
 
-- **ESLint 9 + eslint-plugin-import 2.32**, on a project using all three rules with zones, `except`, file-scoped overrides and dev-dependency globs: tangle's migrated config reports **exactly the same 7 violations**, rule for rule, file for file, import for import.
-- **ESLint 9 legacy configs with `extends`**: a zone from a relative config, `no-cycle` with `maxDepth: 1` from a shareable config (kept when the root sets `"warn"`), and a directory the shared config turned off but the root re-enabled. Tangle reports **exactly the same 7 findings**. `maxDepth` 1, 2 and 3 on a project with cycles of 2, 3 and 4 modules match the plugin exactly.
-- **Nx 21** (`@nx/enforce-module-boundaries`), on a workspace with scope and type tags, an application, an untagged lib, a banned external, a relative cross-project import and project cycles: tangle flags **exactly the same 10 imports**. Adding a new tagged project afterwards is enforced without migrating again, because projects are rediscovered on every run.
-- **Nx 21 options**, on a second workspace with `allow`, buildable libraries (executor and command targets), `banTransitiveDependencies` (a package declared only by another project, one not installed), a transitive `notDependOnLibsWithTags`, an empty `onlyDependOnLibsWithTags`, a `workspaces` package without an `nx` section, a project typed only by its `tsconfig.app.json`, an e2e project, a self-import through the project's alias, a relative import outside every project, a lazy-loaded library also imported statically, and `require()` and `import()` calls: **exactly the same 13 imports**. (Nx 21's `checkNestedExternalImports` compares the imported project's name with the nested package's name, so it never reports anything; tangle converts it to nothing.)
+- **ESLint 9 + eslint-plugin-import 2.32**, on a project using all three rules with zones, `except`, file-scoped overrides and dev-dependency globs: detangle's migrated config reports **exactly the same 7 violations**, rule for rule, file for file, import for import.
+- **ESLint 9 legacy configs with `extends`**: a zone from a relative config, `no-cycle` with `maxDepth: 1` from a shareable config (kept when the root sets `"warn"`), and a directory the shared config turned off but the root re-enabled. Detangle reports **exactly the same 7 findings**. `maxDepth` 1, 2 and 3 on a project with cycles of 2, 3 and 4 modules match the plugin exactly.
+- **Nx 21** (`@nx/enforce-module-boundaries`), on a workspace with scope and type tags, an application, an untagged lib, a banned external, a relative cross-project import and project cycles: detangle flags **exactly the same 10 imports**. Adding a new tagged project afterwards is enforced without migrating again, because projects are rediscovered on every run.
+- **Nx 21 options**, on a second workspace with `allow`, buildable libraries (executor and command targets), `banTransitiveDependencies` (a package declared only by another project, one not installed), a transitive `notDependOnLibsWithTags`, an empty `onlyDependOnLibsWithTags`, a `workspaces` package without an `nx` section, a project typed only by its `tsconfig.app.json`, an e2e project, a self-import through the project's alias, a relative import outside every project, a lazy-loaded library also imported statically, and `require()` and `import()` calls: **exactly the same 13 imports**. (Nx 21's `checkNestedExternalImports` compares the imported project's name with the nested package's name, so it never reports anything; detangle converts it to nothing.)
 - **eslint-plugin-boundaries 7.2**, using both the legacy `rules` and v6+ `policies` formats, with a later `disallow` overriding an `allow` and a negated `!app` selector: **exactly the same 4 violations**.
 - **eslint-plugin-boundaries 7.2 with captures**: modules and nested components compared through captured values, a literal captured value in a later `disallow`, a policy set without `default`, an ignored test file, `entry-point`, `external` (including a banned subpath) and `no-unknown`: **exactly the same 10 imports**. The legacy format with `basePattern`/`baseCapture`, a literal source condition, `boundaries/include` and `dependency-nodes: ["import"]` also matches exactly.
-- **madge 8 on excalidraw** (873 modules): madge's own dependency graph puts 168 files on cycles. `madge --circular` lists 128 of them; tangle reports all 168, with no extras, in 0.03 s against madge's 2.5 s.
+- **madge 8 on excalidraw** (873 modules): madge's own dependency graph puts 168 files on cycles. `madge --circular` lists 128 of them; detangle reports all 168, with no extras, in 0.03 s against madge's 2.5 s.
 - **A JavaScript rules config with known violations:** all 14 known violations were carried into the baseline. The only findings left were genuine cycle dependencies the original setup never reported, each shown with its cycle.
 
 ## Cycle detection
 
-On VS Code, checked against an independently computed ground truth, tangle finds all 1,945 dependencies that sit on a cycle, with no false positives. Each one is reported with a concrete cycle as evidence. `via` and `viaOnly` consider every simple cycle through a dependency, not just one arbitrary cycle.
+On VS Code, checked against an independently computed ground truth, detangle finds all 1,945 dependencies that sit on a cycle, with no false positives. Each one is reported with a concrete cycle as evidence. `via` and `viaOnly` consider every simple cycle through a dependency, not just one arbitrary cycle.

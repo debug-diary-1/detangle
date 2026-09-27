@@ -479,6 +479,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "detangle"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "fancy-regex 0.19.2",
+ "globset",
+ "ignore",
+ "mimalloc",
+ "notify",
+ "oxc_allocator",
+ "oxc_ast",
+ "oxc_ast_visit",
+ "oxc_parser",
+ "oxc_resolver",
+ "oxc_span",
+ "petgraph",
+ "ratatui",
+ "rayon",
+ "regex",
+ "rustc-hash",
+ "serde",
+ "serde_json",
+ "toml",
+]
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2380,33 +2407,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.6",
-]
-
-[[package]]
-name = "tangle"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "fancy-regex 0.19.2",
- "globset",
- "ignore",
- "mimalloc",
- "notify",
- "oxc_allocator",
- "oxc_ast",
- "oxc_ast_visit",
- "oxc_parser",
- "oxc_resolver",
- "oxc_span",
- "petgraph",
- "ratatui",
- "rayon",
- "regex",
- "rustc-hash",
- "serde",
- "serde_json",
- "toml",
 ]
 
 [[package]]

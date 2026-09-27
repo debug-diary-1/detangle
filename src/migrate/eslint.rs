@@ -108,7 +108,7 @@ const expand = (c, file, crit, seen) => {
 };
 
 (async () => {
-  const file = process.env.TANGLE_CONFIG_FILE, base = path.basename(file);
+  const file = process.env.DETANGLE_CONFIG_FILE, base = path.basename(file);
   const flat = base.startsWith('eslint.config.');
   let c;
   if (/\.(c|m)?[jt]s$/.test(base)) { const m = await import(pathToFileURL(file).href); c = await (m.default ?? m); }
@@ -319,7 +319,7 @@ fn resolver_settings(r: &Value, prefix: &str, options: &mut Options, warnings: &
                 }
             }
             "node" | "exports" => {}
-            other => warnings.push(format!("import/resolver \"{other}\" isn't supported (tangle resolves like Node + TypeScript)")),
+            other => warnings.push(format!("import/resolver \"{other}\" isn't supported (detangle resolves like Node + TypeScript)")),
         }
     }
 }
@@ -505,7 +505,7 @@ fn convert_nx(full: &str, sev: Severity, o: &Value, warnings: &mut Vec<String>) 
                 sev,
                 &format!("A project {label} cannot depend on any libs with tags."),
                 from.clone(),
-                // Any tag of its own (not tangle's projectType: / target: facts).
+                // Any tag of its own (not detangle's projectType: / target: facts).
                 ToSpec { tags: Some(vec!["/^(?!projectType:|target:)/".into()]), ..Default::default() },
             )),
             Some(only) if !only.iter().any(|t| t == "*") => out.push(group_rule(
@@ -1253,7 +1253,7 @@ fn convert(full: &str, short: &str, sev: Severity, opts: &[Value], ctx: &Ctx, wa
             if o.get("allowUnsafeDynamicCyclicDependency") == Some(&json!(true)) {
                 warnings.push(format!("{full}: allowUnsafeDynamicCyclicDependency isn't supported — cycles through dynamic imports are reported"));
             }
-            // Like the plugin, `import type` doesn't count (tangle's default).
+            // Like the plugin, `import type` doesn't count (detangle's default).
             vec![rule(
                 full,
                 sev,
@@ -1305,7 +1305,7 @@ fn convert(full: &str, short: &str, sev: Severity, opts: &[Value], ctx: &Ctx, wa
         }
         "no-extraneous-dependencies" => {
             if o.get("packageDir").is_some() {
-                warnings.push(format!("{full}: packageDir is ignored — tangle checks every package.json above each file"));
+                warnings.push(format!("{full}: packageDir is ignored — detangle checks every package.json above each file"));
             }
             let include_types = o.get("includeTypes") == Some(&json!(true));
             let type_only = (!include_types).then_some(false);

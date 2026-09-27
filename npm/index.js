@@ -1,11 +1,11 @@
 "use strict";
-// Node.js API for tangle. Runs the `tangle` binary (from `options.bin`,
-// $TANGLE_BIN, or PATH) and returns its results as JavaScript values.
+// Node.js API for detangle. Runs the `detangle` binary (from `options.bin`,
+// $DETANGLE_BIN, or PATH) and returns its results as JavaScript values.
 
 const { execFile } = require("node:child_process");
 
 function run(args, options = {}) {
-  const bin = options.bin || process.env.TANGLE_BIN || "tangle";
+  const bin = options.bin || process.env.DETANGLE_BIN || "detangle";
   return new Promise((resolve, reject) => {
     execFile(bin, args, { maxBuffer: 1 << 30, cwd: options.cwd, env: { ...process.env, NO_COLOR: "1" } }, (error, stdout, stderr) => {
       if (error && typeof error.code !== "number") {
@@ -28,7 +28,7 @@ function common(dir, options) {
   return args;
 }
 
-/** Graph view options → `tangle graph` flags. */
+/** Graph view options → `detangle graph` flags. */
 function viewArgs(options) {
   const args = [];
   const flag = (name, value) => {
@@ -50,7 +50,7 @@ function parse(result, what) {
   try {
     return JSON.parse(result.stdout);
   } catch {
-    throw new Error(`tangle ${what} failed (exit ${result.exitCode}): ${result.stderr.trim()}`);
+    throw new Error(`detangle ${what} failed (exit ${result.exitCode}): ${result.stderr.trim()}`);
   }
 }
 
@@ -86,29 +86,29 @@ async function report(dir, options = {}) {
   if (options.strict) args.push("--strict");
   if (options.baseline) args.push("--baseline", options.baseline);
   const r = await run(args, options);
-  if (r.exitCode > 1) throw new Error(`tangle check failed: ${r.stderr.trim()}`);
+  if (r.exitCode > 1) throw new Error(`detangle check failed: ${r.stderr.trim()}`);
   return { output: r.stdout, exitCode: r.exitCode };
 }
 
 /**
  * The dependency graph as "dot", "mermaid", "d2", "csv" (strings) or "json"
- * (an object), with the same filters as `tangle graph`.
+ * (an object), with the same filters as `detangle graph`.
  */
 async function graph(dir, options = {}) {
   const format = options.format || "dot";
   const r = await run(["graph", ...common(dir, options), "-f", format, ...viewArgs(options)], options);
   if (format === "json") return parse(r, "graph");
-  if (r.exitCode !== 0) throw new Error(`tangle graph failed: ${r.stderr.trim()}`);
+  if (r.exitCode !== 0) throw new Error(`detangle graph failed: ${r.stderr.trim()}`);
   return r.stdout;
 }
 
-/** The tangle.toml `tangle migrate` would write, without writing it. */
+/** The detangle.toml `detangle migrate` would write, without writing it. */
 async function migrate(dir, options = {}) {
   const r = await run(["migrate", dir || ".", "--dry-run"], options);
-  if (r.exitCode !== 0) throw new Error(`tangle migrate failed: ${r.stderr.trim()}`);
+  if (r.exitCode !== 0) throw new Error(`detangle migrate failed: ${r.stderr.trim()}`);
   return { config: r.stdout, summary: r.stderr };
 }
 
 module.exports = { analyze, check, report, graph, migrate };
-// `import tangle from "tangle-deps"` and `require("tangle-deps").default` both work.
+// `import detangle from "detangle-deps"` and `require("detangle-deps").default` both work.
 module.exports.default = module.exports;

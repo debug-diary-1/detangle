@@ -36,7 +36,7 @@ pub fn from_rc(file: &Path) -> Result<Option<Imported>> {
     let skip = |lang: &str| v.pointer(&format!("/detectiveOptions/{lang}/skipTypeImports")) == Some(&Value::Bool(true));
     let mut warnings = vec![];
     if v.get("baseDir").is_some() {
-        warnings.push("madge baseDir is ignored — tangle analyses the directory you run it on".into());
+        warnings.push("madge baseDir is ignored — detangle analyses the directory you run it on".into());
     }
     Ok(Some(build(
         Opts {

@@ -6,5 +6,5 @@ import theme from "theme";                   // webpack resolve.modules → src/
 import Card from "~/components/Card";       // babel alias
 import cart from "@feature/cart";            // babel regex alias → src/features/cart/index.js
 import rootmod from "rootmod";               // babel root → src/roots/rootmod.js
-import lib from "@lib/strings";              // tangle.toml alias
+import lib from "@lib/strings";              // detangle.toml alias
 export default [Button, utils, other, legacy, theme, Card, cart, rootmod, lib];
