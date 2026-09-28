@@ -12,38 +12,45 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
-import { ESLint } from "eslint";
+import { ESLint as ESLint10 } from "eslint";
+import { ESLint as ESLint9 } from "eslint9";
 import tseslint from "typescript-eslint";
 import detangle from "./eslint.js";
 
+const native = createRequire(import.meta.url)("./native.js");
 const fixtures = fileURLToPath(new URL("../tests/fixtures/", import.meta.url));
 const conditions = path.join(fixtures, "conditions");
+const versions = { "ESLint 10": ESLint10, "ESLint 9": ESLint9 };
 
-/** Lints `files` in `cwd` with detangle's rules at the given options. */
-async function lint(cwd, files, rules) {
+/** Both rules at their `recommended` severities, with these options. */
+const recommended = (options) => [
+  detangle.configs.recommended,
+  { rules: { "detangle/errors": ["error", options], "detangle/warnings": ["warn", options] } },
+];
+
+/**
+ * Lints `files` in `cwd` with the given config entries (after one that
+ * parses TypeScript). Returns every message, with the file relative to `cwd`.
+ */
+async function lint(cwd, files, configs, ESLint = ESLint10) {
   const eslint = new ESLint({
     cwd,
     overrideConfigFile: true,
-    overrideConfig: [
-      {
-        files: ["**/*.ts"],
-        languageOptions: { parser: tseslint.parser },
-        plugins: { detangle },
-        rules,
-      },
-    ],
+    overrideConfig: [{ files: ["**/*.ts"], languageOptions: { parser: tseslint.parser } }, ...configs],
   });
   const results = await eslint.lintFiles(files);
   return results.flatMap((r) =>
     r.messages.map((m) => {
       assert.equal(m.fatal, undefined, `${r.filePath}: ${m.message}`);
-      return { file: path.relative(cwd, r.filePath).replaceAll("\\", "/"), line: m.line, column: m.column, rule: m.ruleId, message: m.message };
+      const file = path.relative(cwd, r.filePath).replaceAll("\\", "/");
+      return { file, line: m.line, column: m.column, rule: m.ruleId, severity: m.severity, message: m.message };
     }),
   );
 }
 
-const key = (m) => `${m.file}:${m.line}:${m.column} ${m.message}`;
+const key = (m) => `${m.file}:${m.line}:${m.column} ${m.rule} ${m.message}`;
 
 /** Runs the CLI for JSON output; `check` exits 1 when it finds errors. */
 function detangleJson(...args) {
@@ -53,20 +60,23 @@ function detangleJson(...args) {
 }
 
 /**
- * Where detangle/errors should report, worked out from the CLI's own
- * output: `check -f json` for the violations, `graph -f json --externals`
- * for each import's specifier, and the file text for where that specifier
- * is written. Covers module-scope `error` violations with a `to`, shown on
- * static `import`/`export … from` declarations; other import forms come
+ * Where the two rules should report, worked out from the CLI's own output:
+ * `check -f json` for the violations, `graph -f json --externals` for each
+ * import's specifier, and the file text for where that specifier is
+ * written. `error` violations belong to detangle/errors, `warn` and `info`
+ * to detangle/warnings. Covers module-scope violations with a `to`, shown
+ * on static `import`/`export … from` declarations; other import forms come
  * with the full placement table.
  */
 function oracle(dir, config) {
-  const violations = detangleJson("check", "-f", "json", "-c", config, dir);
-  const graph = detangleJson("graph", "-f", "json", "--externals", "-c", config, dir);
+  const flags = config ? ["-c", config] : [];
+  const violations = detangleJson("check", "-f", "json", ...flags, dir);
+  const graph = detangleJson("graph", "-f", "json", "--externals", ...flags, dir);
   const modules = new Map(graph.modules.map((m) => [m.id, m]));
   const out = [];
   for (const v of violations) {
-    if (v.severity !== "error" || v.scope !== "module" || v.to == null) continue;
+    if (v.scope !== "module" || v.to == null) continue;
+    const rule = v.severity === "error" ? "detangle/errors" : "detangle/warnings";
     let message = `${v.rule}: ${v.from} → ${v.to}`;
     if (v.cycle.length > 1) message += ` (cycle: ${v.cycle.join(" → ")})`;
     if (v.comment) message += ` — ${v.comment}`;
@@ -77,28 +87,122 @@ function oracle(dir, config) {
       for (const m of text.matchAll(quoted)) {
         const at = m.index + m[1].length;
         const before = text.slice(0, at).split("\n");
-        out.push({ file: v.from, line: before.length, column: before.at(-1).length + 1, message });
+        out.push({ file: v.from, line: before.length, column: before.at(-1).length + 1, rule, message });
       }
     }
   }
   return out;
 }
 
-test("detangle/errors reports what the CLI finds, on the imports behind it", async () => {
-  const config = path.join(conditions, "rules.config.cjs");
-  const got = await lint(conditions, ["src/**/*.ts"], { "detangle/errors": ["error", { config: "rules.config.cjs" }] });
-  const want = oracle(conditions, config);
-  assert.ok(want.length >= 10, `the oracle should find plenty to compare (found ${want.length})`);
-  assert.ok(got.every((m) => m.rule === "detangle/errors"));
-  assert.deepEqual(got.map(key).sort(), want.map(key).sort());
+for (const [name, config] of [
+  ["its rules config (errors)", "rules.config.cjs"],
+  ["the built-in rules (warnings)", undefined],
+]) {
+  test(`both rules report what the CLI finds, on the imports behind it: conditions with ${name}`, async () => {
+    const got = await lint(conditions, ["src/**/*.ts"], recommended(config ? { config } : {}));
+    const want = oracle(conditions, config && path.join(conditions, config));
+    assert.ok(want.length >= 4, `the oracle should find plenty to compare (found ${want.length})`);
+    assert.deepEqual(got.map(key).sort(), want.map(key).sort());
+    for (const m of got) assert.equal(m.severity, m.rule === "detangle/errors" ? 2 : 1);
+  });
+}
+
+test("configs.recommended registers the plugin and enables both rules, errors first", () => {
+  const r = detangle.configs.recommended;
+  assert.equal(r.name, "detangle/recommended");
+  assert.equal(r.plugins.detangle, detangle);
+  assert.deepEqual(Object.entries(r.rules), [
+    ["detangle/errors", "error"],
+    ["detangle/warnings", "warn"],
+  ]);
+  assert.equal(r.files, undefined);
 });
 
-test("a config that fails to load is reported at line 1 of every file", async () => {
-  const got = await lint(conditions, ["src/c1.ts", "src/c3.ts"], { "detangle/errors": ["error", { config: "missing.toml" }] });
-  assert.equal(got.length, 2);
-  for (const m of got) {
-    assert.equal(`${m.line}:${m.column}`, "1:1");
-    assert.match(m.message, /^detangle: reading .*missing\.toml/);
+test("the rules accept only dir, config and mode", async () => {
+  await assert.rejects(
+    lint(conditions, ["src/c1.ts"], [detangle.configs.recommended, { rules: { "detangle/errors": ["error", { confg: "x" }] } }]),
+    /should NOT have additional properties/,
+  );
+});
+
+for (const [name, ESLint] of Object.entries(versions)) {
+  test(`${name} shares one SourceCode between the rules of a pass`, async () => {
+    const seen = new Map();
+    const probe = (id) => ({
+      create(context) {
+        if (!seen.has(context.filename)) seen.set(context.filename, []);
+        seen.get(context.filename).push([id, context.sourceCode]);
+        return {};
+      },
+    });
+    const plugin = { rules: { a: probe("a"), b: probe("b") } };
+    await lint(conditions, ["src/c1.ts", "src/c3.ts"], [{ plugins: { probe: plugin }, rules: { "probe/a": "error", "probe/b": "error" } }], ESLint);
+    assert.equal(seen.size, 2);
+    for (const [[a, sa], [b, sb]] of seen.values()) {
+      assert.deepEqual([a, b], ["a", "b"]);
+      assert.equal(sa, sb);
+    }
+  });
+
+  test(`${name}: both rules share one add-on call per file`, async () => {
+    const files = ["src/c1.ts", "src/c3.ts", "src/c4.ts"];
+    const before = native.stats.calls;
+    await lint(conditions, files, recommended({}), ESLint);
+    assert.equal(native.stats.calls - before, files.length);
+
+    // Different options are a different project, so a call each.
+    const mixed = await lint(conditions, files, [
+      detangle.configs.recommended,
+      { rules: { "detangle/errors": ["error", { config: "rules.config.cjs" }], "detangle/warnings": "warn" } },
+    ], ESLint);
+    assert.equal(native.stats.calls - before, files.length * 3);
+    assert.ok(mixed.some((m) => m.rule === "detangle/errors") && mixed.some((m) => m.rule === "detangle/warnings"));
+  });
+
+  test(`${name}: problems are reported once per file, by the first detangle rule`, async () => {
+    const files = ["src/c1.ts", "src/c3.ts"];
+    const broken = { config: "missing.toml" };
+    const once = async (configs, rule, severity) => {
+      const got = await lint(conditions, files, configs, ESLint);
+      assert.deepEqual(
+        got.map((m) => [m.file, `${m.line}:${m.column}`, m.rule, m.severity]),
+        files.map((f) => [f, "1:1", rule, severity]),
+      );
+      for (const m of got) assert.match(m.message, /^detangle: reading .*missing\.toml/);
+    };
+    await once(recommended(broken), "detangle/errors", 2);
+    await once([{ plugins: { detangle }, rules: { "detangle/warnings": ["warn", broken], "detangle/errors": ["error", broken] } }], "detangle/warnings", 1);
+    await once([{ plugins: { detangle }, rules: { "detangle/warnings": ["warn", broken] } }], "detangle/warnings", 1);
+  });
+}
+
+test("an add-on that can't load gives one message at line 1 of each file", () => {
+  // In a child process: the add-on is loaded once per process.
+  const script = `
+    import { ESLint } from "eslint";
+    import tseslint from "typescript-eslint";
+    import detangle from "./eslint.js";
+    const eslint = new ESLint({
+      cwd: ${JSON.stringify(conditions)},
+      overrideConfigFile: true,
+      overrideConfig: [{ files: ["**/*.ts"], languageOptions: { parser: tseslint.parser } }, detangle.configs.recommended],
+    });
+    const results = await eslint.lintFiles(["src/c1.ts", "src/c3.ts"]);
+    console.log(JSON.stringify(results.map((r) => r.messages.map((m) => [m.line, m.column, m.ruleId, m.severity, m.message]))));
+  `;
+  const r = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
+    cwd: path.dirname(fileURLToPath(import.meta.url)),
+    env: { ...process.env, DETANGLE_ADDON: path.join(os.tmpdir(), "no-such-detangle.node") },
+    encoding: "utf8",
+  });
+  assert.equal(r.status, 0, r.stderr);
+  const files = JSON.parse(r.stdout);
+  assert.equal(files.length, 2);
+  for (const messages of files) {
+    assert.equal(messages.length, 1);
+    const [line, column, rule, severity, message] = messages[0];
+    assert.deepEqual([line, column, rule, severity], [1, 1, "detangle/errors", 2]);
+    assert.match(message, /^detangle add-on unavailable: .*; run `detangle check`$/);
   }
 });
 
@@ -106,9 +210,9 @@ test("a project reached through a symlink reports the same", async () => {
   const link = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "detangle-link-")), "conditions");
   fs.symlinkSync(conditions, link, "junction"); // a junction needs no admin rights on Windows
   try {
-    const rules = { "detangle/errors": ["error", { config: "rules.config.cjs" }] };
-    const direct = await lint(conditions, ["src/**/*.ts"], rules);
-    const linked = await lint(link, ["src/**/*.ts"], rules);
+    const configs = recommended({ config: "rules.config.cjs" });
+    const direct = await lint(conditions, ["src/**/*.ts"], configs);
+    const linked = await lint(link, ["src/**/*.ts"], configs);
     assert.ok(direct.length > 0);
     assert.deepEqual(linked.map(key).sort(), direct.map(key).sort());
   } finally {

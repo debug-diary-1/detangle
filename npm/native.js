@@ -34,21 +34,46 @@ function load() {
 const projects = new Map();
 
 /**
+ * Results of the current pass over each file, by key. ESLint makes one
+ * SourceCode per pass and gives it to every rule, so both rules share one
+ * add-on call per pass; a new pass (an edit, a --fix round) is a new
+ * SourceCode and a fresh call.
+ */
+const passes = new WeakMap();
+
+/** Add-on calls made, for tests. */
+const stats = { calls: 0 };
+
+/**
  * What to show in the file an ESLint rule is linting: `{ violations,
- * problems, exoticRequire }`. `options` are the rule's `{ dir, config, mode }`;
- * `dir` and `config` are relative to ESLint's working directory.
+ * problems, exoticRequire }`, plus `problemsReported`, which the first rule
+ * to report the problems sets so the other doesn't repeat them. `options`
+ * are the rule's `{ dir, config, mode }`; `dir` and `config` are relative
+ * to ESLint's working directory.
  */
 function violationsFor(context, options = {}) {
-  if (!load()) return { violations: [], problems: [unavailable], exoticRequire: [] };
   const dir = path.resolve(context.cwd, options.dir ?? ".");
   const config = options.config === undefined ? undefined : path.resolve(context.cwd, options.config);
   const key = [dir, config ?? "", options.mode ?? ""].join("\0");
+  let results = passes.get(context.sourceCode);
+  if (!results) passes.set(context.sourceCode, (results = new Map()));
+  let result = results.get(key);
+  if (!result) {
+    result = { ...call(key, dir, config, options.mode, context), problemsReported: false };
+    results.set(key, result);
+  }
+  return result;
+}
+
+function call(key, dir, config, mode, context) {
+  if (!load()) return { violations: [], problems: [unavailable], exoticRequire: [] };
   let project = projects.get(key);
   if (!project) {
-    project = addon.open(dir, { config, mode: options.mode });
+    project = addon.open(dir, { config, mode });
     projects.set(key, project);
   }
+  stats.calls++;
   return project.violationsFor(context.filename, context.sourceCode.text);
 }
 
-module.exports = { violationsFor };
+module.exports = { violationsFor, stats };
