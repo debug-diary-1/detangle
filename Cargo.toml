@@ -26,6 +26,11 @@ doc = false
 [workspace]
 members = ["napi"]
 
+[features]
+# Hidden hooks for the add-on's recovery tests (a text that panics); never
+# enabled in releases.
+test-hooks = []
+
 [dependencies]
 anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive"] }

@@ -224,6 +224,11 @@ impl Project {
         crate::stamps::Stamps::collect(&self.root, config, Some(&self.cfg.options))
     }
 
+    /// The scanned files' paths.
+    pub fn session_paths(&self) -> std::collections::HashSet<PathBuf> {
+        self.session.files().iter().map(|f| f.path.clone()).collect()
+    }
+
     /// The scan, for callers keeping it up to date themselves (`Live`).
     pub fn session_mut(&mut self) -> &mut scan::Session {
         &mut self.session
