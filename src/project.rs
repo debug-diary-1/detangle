@@ -217,6 +217,11 @@ impl Project {
         &self.notes
     }
 
+    /// The scan, for callers keeping it up to date themselves (`Live`).
+    pub fn session_mut(&mut self) -> &mut scan::Session {
+        &mut self.session
+    }
+
     pub fn analyze(&self) -> Result<Analysis> {
         self.analyze_with(true)
     }
