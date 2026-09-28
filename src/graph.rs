@@ -407,11 +407,7 @@ impl Graph {
                 if a.kind != ModuleKind::Local {
                     continue;
                 }
-                let (kind, target) = match b.kind {
-                    ModuleKind::Local => (ModuleKind::Local, match dir_of(&b.id) { "" => ".".to_string(), d => d.to_string() }),
-                    ModuleKind::Npm => (ModuleKind::Npm, format!("node_modules/{}", b.id)),
-                    k => (k, b.id.clone()),
-                };
+                let (kind, target) = folder_target(b);
                 let t = f.intern(kind, target);
                 for x in ancestors(dir_of(&a.id)) {
                     if b.kind == ModuleKind::Local && inside(&b.id, x) {
@@ -454,6 +450,24 @@ impl Graph {
             f.link();
             Box::new(f)
         })
+    }
+
+    /// The folder-graph edges that module edge `edge` contributes to, as
+    /// `(folder, target)` node indices in `folders()`: one per folder
+    /// containing the importing file but not the imported one.
+    pub fn folder_edges(&self, edge: usize) -> Vec<(usize, usize)> {
+        let e = &self.edges[edge];
+        let (a, b) = (&self.modules[e.from], &self.modules[e.to]);
+        if a.kind != ModuleKind::Local {
+            return Vec::new();
+        }
+        let f = self.folders();
+        let (kind, target) = folder_target(b);
+        let Some(&t) = f.index[kind as usize].get(&target) else { return Vec::new() };
+        ancestors(dir_of(&a.id))
+            .filter(|x| !(b.kind == ModuleKind::Local && inside(&b.id, x)))
+            .filter_map(|x| f.index[ModuleKind::Local as usize].get(x).map(|&x| (x, t)))
+            .collect()
     }
 
     fn rel(&self, p: &Path) -> String {
@@ -873,6 +887,16 @@ impl PathFilter {
 }
 
 /// `src/a/b.ts` → `src/a`; root-level → "".
+/// A module's node in the folder graph: its directory for a local file
+/// (`.` at the root), `node_modules/<name>` for a package, else its id.
+fn folder_target(m: &Module) -> (ModuleKind, String) {
+    match m.kind {
+        ModuleKind::Local => (ModuleKind::Local, match dir_of(&m.id) { "" => ".".to_string(), d => d.to_string() }),
+        ModuleKind::Npm => (ModuleKind::Npm, format!("node_modules/{}", m.id)),
+        k => (k, m.id.clone()),
+    }
+}
+
 fn dir_of(id: &str) -> &str {
     id.rfind('/').map_or("", |i| &id[..i])
 }
