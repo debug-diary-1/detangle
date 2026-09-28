@@ -24,6 +24,7 @@ doc = false
 # The root of a workspace, so the add-on can be a member. `cargo package`
 # drops this table, so the published crate builds on its own.
 [workspace]
+members = ["napi"]
 
 [dependencies]
 anyhow = "1.0.104"
