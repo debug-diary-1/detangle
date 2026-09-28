@@ -136,14 +136,14 @@ impl Project {
     /// code rather than imports).
     pub fn rebuild(&mut self, changes: &watch::Changes) -> Result<(Option<Analysis>, String)> {
         let t = std::time::Instant::now();
-        if changes.config {
+        if changes.needs_full() {
             *self = Project::open(&self.dir, self.config_arg.as_deref(), self.mode_arg.as_deref(), &self.cache_args)?;
         } else {
             self.session.update(&changes.paths.iter().cloned().collect::<Vec<_>>())?;
         }
         let w = self.session.work;
         let a = if w.graph_changed { Some(self.analyze()?) } else { None };
-        let work = if changes.config {
+        let work = if changes.needs_full() {
             format!("full rebuild of {} files", w.reparsed)
         } else if w.walked && w.reresolved > w.reparsed {
             format!("{} reparsed, all re-resolved", w.reparsed)
@@ -155,5 +155,35 @@ impl Project {
         let ms = t.elapsed().as_secs_f64() * 1000.0;
         let what = if changes.paths.is_empty() { String::new() } else { format!("{} · ", changes.describe(&self.root)) };
         Ok((a, format!("↻ {what}{work} · {ms:.0}ms")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// After lost events, rebuild re-opens the project, so it sees files
+    /// no event reported.
+    #[test]
+    fn rescan_reopens_the_project() {
+        let tmp = std::env::temp_dir().join(format!("detangle-rescan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("src")).unwrap();
+        std::fs::write(tmp.join("package.json"), "{}").unwrap();
+        std::fs::write(tmp.join("src/a.ts"), "import './b';").unwrap();
+        let mut p = Project::open(&tmp, None, None, &CacheArgs::default()).unwrap();
+        let local = |a: &Analysis| a.graph.local_count();
+        assert_eq!(local(&p.analyze().unwrap()), 1);
+
+        // Created without a watcher event reaching us.
+        std::fs::write(tmp.join("src/b.ts"), "").unwrap();
+        let (a, status) = p.rebuild(&watch::Changes::default()).unwrap();
+        assert!(a.is_none(), "{status}");
+
+        let lost = watch::Changes { rescan: true, ..Default::default() };
+        let (a, status) = p.rebuild(&lost).unwrap();
+        assert!(status.contains("full rebuild of 2 files"), "{status}");
+        assert_eq!(local(&a.unwrap()), 2);
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
