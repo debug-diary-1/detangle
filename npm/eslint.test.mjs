@@ -601,20 +601,20 @@ test("a worker's projects are torn down with it, and the process exits promptly"
     import { Worker } from "node:worker_threads";
     const started = Date.now();
     const worker = new Worker(\`
-      const { parentPort } = require("node:worker_threads");
+      const { parentPort, workerData } = require("node:worker_threads");
       const { ESLint } = require("eslint");
       const tseslint = require("typescript-eslint");
       const detangle = require("./eslint.js");
       (async () => {
         const eslint = new ESLint({
-          cwd: ${JSON.stringify(conditions)},
+          cwd: workerData,
           overrideConfigFile: true,
           overrideConfig: [{ files: ["**/*.ts"], languageOptions: { parser: tseslint.parser } }, detangle.configs.recommended],
         });
         const results = await eslint.lintFiles(["src/**/*.ts"]);
         parentPort.postMessage(results.reduce((n, r) => n + r.messages.length, 0));
       })();
-    \`, { eval: true, execArgv: [] });
+    \`, { eval: true, execArgv: [], workerData: ${JSON.stringify(conditions)} });
     const reports = await new Promise((resolve, reject) => { worker.once("message", resolve); worker.once("error", reject); });
     await worker.terminate();
     console.log(JSON.stringify({ reports, ms: Date.now() - started }));
