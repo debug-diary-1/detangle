@@ -9,9 +9,12 @@
 //! the backstop), so ESLint never sees a throw. That needs `panic = "unwind"`,
 //! the default, in every profile.
 
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
+use std::rc::{Rc, Weak};
 
 use detangle::live::Live;
+use napi::Env;
 use napi_derive::napi;
 
 // As in the CLI: parsing and graph building allocate heavily from many
@@ -26,6 +29,9 @@ pub struct OpenOptions {
     pub config: Option<String>,
     /// Mode for evaluating Vite / webpack configs (like `--mode`).
     pub mode: Option<String>,
+    /// The Node.js executable for evaluating JavaScript configs
+    /// (`process.execPath`); `node` from PATH if unset.
+    pub node: Option<String>,
 }
 
 #[napi(object)]
@@ -52,7 +58,51 @@ pub struct FileResult {
 /// It never throws: problems come back in `problems` (see `Live`).
 #[napi]
 pub struct Project {
-    live: Live,
+    /// `None` once closed. Shared with this thread's registry, so the env
+    /// cleanup hook can reach it.
+    live: Shared,
+}
+
+type Shared = Rc<RefCell<Option<Live>>>;
+
+thread_local! {
+    /// This thread's open handles. Each env (the main thread, or a worker)
+    /// runs on its own thread, so this is the env's registry.
+    static HANDLES: RefCell<Vec<Weak<RefCell<Option<Live>>>>> = const { RefCell::new(Vec::new()) };
+    static REGISTERED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Registers this env's cleanup, once; `mainThread` is worker_threads'
+/// `isMainThread`. When the env is torn down:
+/// - a worker's handles are freed, which stops their watchers and joins
+///   the watcher-setup and dropper threads;
+/// - the main env's are leaked, like the CLI's one-shot commands: the
+///   process is exiting, the OS reclaims everything at once, and `eslint .`
+///   shouldn't wait for a large graph to be freed or a watcher to finish
+///   setting up. Their threads touch only state they own.
+#[napi(catch_unwind)]
+pub fn init(env: Env, main_thread: bool) -> napi::Result<()> {
+    if REGISTERED.with(|r| r.replace(true)) {
+        return Ok(());
+    }
+    env.add_env_cleanup_hook(main_thread, |main| {
+        let handles: Vec<_> = HANDLES.with(|h| h.borrow_mut().drain(..).collect());
+        for h in handles.iter().filter_map(Weak::upgrade) {
+            let live = h.borrow_mut().take();
+            if main {
+                std::mem::forget(live);
+            }
+        }
+    })?;
+    Ok(())
+}
+
+/// `path` with symlinks resolved and, on Windows, in its on-disk case: the
+/// form every path and project key is compared in. Unchanged if it
+/// doesn't exist.
+#[napi(js_name = "canonical", catch_unwind)]
+pub fn canonical_js(path: String) -> String {
+    canonical(Path::new(&path)).to_string_lossy().into_owned()
 }
 
 /// Opens the project at `dir` (absolute), scanning it once and starting a
@@ -60,9 +110,15 @@ pub struct Project {
 /// reporting why until a config file changes.
 #[napi(catch_unwind)]
 pub fn open(dir: String, options: Option<OpenOptions>) -> Project {
-    let options = options.unwrap_or(OpenOptions { config: None, mode: None });
+    let options = options.unwrap_or(OpenOptions { config: None, mode: None, node: None });
+    if let Some(node) = options.node {
+        detangle::set_node(Some(PathBuf::from(node)));
+    }
     let config = options.config.map(PathBuf::from);
-    Project { live: Live::open(Path::new(&dir), config.as_deref(), options.mode.as_deref(), hooks::watch()) }
+    let live = Live::open(Path::new(&dir), config.as_deref(), options.mode.as_deref(), hooks::watch());
+    let live = Rc::new(RefCell::new(Some(live)));
+    HANDLES.with(|h| h.borrow_mut().push(Rc::downgrade(&live)));
+    Project { live }
 }
 
 #[napi]
@@ -70,7 +126,11 @@ impl Project {
     /// What to show in `file` (absolute), whose editor buffer holds `text`.
     #[napi(catch_unwind)]
     pub fn violations_for(&mut self, file: String, text: String) -> FileResult {
-        let r = self.live.violations_for(&canonical(Path::new(&file)), &text);
+        let mut live = self.live.borrow_mut();
+        let Some(live) = live.as_mut() else {
+            return FileResult { violations: vec![], problems: vec!["detangle: project closed".into()], exotic_require: vec![] };
+        };
+        let r = live.violations_for(&canonical(Path::new(&file)), &text);
         FileResult {
             violations: r
                 .violations
@@ -86,7 +146,15 @@ impl Project {
     /// stopped), for `process.emitWarning`.
     #[napi(catch_unwind)]
     pub fn take_warnings(&mut self) -> Vec<String> {
-        self.live.take_warnings()
+        self.live.borrow_mut().as_mut().map(Live::take_warnings).unwrap_or_default()
+    }
+
+    /// Stops the watcher and frees the project. Every later call returns
+    /// only the problem "detangle project closed". For idle eviction.
+    #[napi(catch_unwind)]
+    pub fn close(&mut self) {
+        let live = self.live.borrow_mut().take();
+        drop(live);
     }
 }
 
@@ -97,9 +165,13 @@ impl Project {
     /// Test hook: the state and step counts.
     #[napi(js_name = "__stats")]
     pub fn stats(&self) -> hooks::Stats {
-        let s = self.live.stats;
+        let live = self.live.borrow();
+        let Some(live) = live.as_ref() else {
+            return hooks::Stats { state: "closed".into(), opens: 0, open_attempts: 0, analyses: 0, refreshes: 0 };
+        };
+        let s = live.stats;
         hooks::Stats {
-            state: self.live.state().into(),
+            state: live.state().into(),
             opens: s.opens as u32,
             open_attempts: s.open_attempts as u32,
             analyses: s.analyses as u32,
@@ -110,7 +182,9 @@ impl Project {
     /// Test hook: how long a failed project waits before retrying.
     #[napi(js_name = "__setRetryFloorMs")]
     pub fn set_retry_floor_ms(&mut self, ms: u32) {
-        self.live.set_retry_floor(std::time::Duration::from_millis(ms.into()));
+        if let Some(live) = self.live.borrow_mut().as_mut() {
+            live.set_retry_floor(std::time::Duration::from_millis(ms.into()));
+        }
     }
 }
 

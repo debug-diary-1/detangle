@@ -7,7 +7,6 @@
 //! rule be skipped with a warning rather than silently loosened.
 
 use std::path::Path;
-use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Map, Value, json};
@@ -83,7 +82,7 @@ fn load_json(path: &Path) -> Result<Value> {
         }
     }
     let abs = dunce::canonicalize(path).with_context(|| format!("{} not found", path.display()))?;
-    let out = Command::new("node")
+    let out = crate::node_command()
         .args(["-e", LOADER])
         .env("DETANGLE_DC_CONFIG", &abs)
         .current_dir(abs.parent().unwrap_or(Path::new(".")))

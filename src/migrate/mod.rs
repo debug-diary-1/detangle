@@ -11,7 +11,6 @@ mod madge;
 mod rules_js;
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 use regex::Regex;
@@ -34,7 +33,7 @@ pub struct Imported {
 
 pub(crate) fn run_node(script: &str, file: &Path) -> Result<String> {
     let abs = dunce::canonicalize(file).with_context(|| format!("{} not found", file.display()))?;
-    let out = Command::new("node")
+    let out = crate::node_command()
         .args(["-e", script])
         .env("DETANGLE_CONFIG_FILE", &abs)
         .current_dir(abs.parent().unwrap_or(Path::new(".")))
