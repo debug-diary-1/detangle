@@ -1,0 +1,6 @@
+{
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": { "@m/*": ["packages/*/src/index.ts"] }
+  }
+}

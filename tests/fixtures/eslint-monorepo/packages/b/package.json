@@ -1,0 +1,5 @@
+{
+  "name": "@m/b",
+  "main": "src/index.ts",
+  "dependencies": { "@m/a": "*" }
+}

@@ -1,0 +1,22 @@
+# A workspace with a cycle across packages (npm/eslint.test.mjs).
+
+[[groups]]
+name = "package"
+path = '^packages/[^/]+'
+
+[[forbidden]]
+name = "no-cycles"
+severity = "error"
+to = { circular = true }
+
+[[forbidden]]
+name = "no-package-cycles"
+scope = "group"
+severity = "warn"
+to = { circular = true }
+
+[[forbidden]]
+name = "no-folder-cycles"
+scope = "folder"
+severity = "warn"
+to = { circular = true }
