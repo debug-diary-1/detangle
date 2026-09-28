@@ -384,3 +384,114 @@ test("a file created and linted before the watcher reports it is checked", async
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// Recovery, with no file watcher: every change below must be seen by the
+// polling at the start of each lint. These need an add-on built with the
+// `test-hooks` feature (cargo build -p detangle-napi --features test-hooks).
+const hooks = native.addon()?.__setWatcherEnabled ? native.addon() : undefined;
+const needsHooks = { skip: hooks ? false : "needs an add-on built with --features test-hooks" };
+
+/** A throwaway project with these files; returns its dir and a lint function. */
+function scratch(files) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "detangle-recovery-"));
+  for (const [rel, body] of Object.entries(files)) {
+    fs.mkdirSync(path.dirname(path.join(dir, rel)), { recursive: true });
+    fs.writeFileSync(path.join(dir, rel), body);
+  }
+  const lintFile = async (rel, text = fs.readFileSync(path.join(dir, rel), "utf8")) => {
+    const eslint = new ESLint10({
+      cwd: dir,
+      overrideConfigFile: true,
+      overrideConfig: [{ files: ["**/*.ts"], languageOptions: { parser: tseslint.parser } }, detangle.configs.recommended],
+    });
+    const [r] = await eslint.lintText(text, { filePath: path.join(dir, rel) });
+    return r.messages.map((m) => `${m.line}:${m.column} ${m.message}`);
+  };
+  return { dir, lintFile, write: (rel, body) => fs.writeFileSync(path.join(dir, rel), body), cleanup: () => fs.rmSync(dir, { recursive: true, force: true }) };
+}
+
+/** The add-on handle behind the last lint of `dir` (the one opened last). */
+const handleStats = (dir) => [...native.projects.entries()].filter(([k]) => k.startsWith(`${dir}\0`)).map(([, p]) => p.__stats())[0];
+
+const RULES = `
+[[forbidden]]
+name = "no-legacy"
+severity = "error"
+from = { path = '^src/' }
+to = { path = '^src/legacy/' }
+
+[[forbidden]]
+name = "unresolvable"
+severity = "error"
+to = { could_not_resolve = true }
+`;
+
+test("polling picks up a config edit", needsHooks, async () => {
+  hooks.__setWatcherEnabled(false);
+  const p = scratch({ "package.json": "{}", "detangle.toml": RULES, "src/a.ts": 'import "./legacy/old";\n', "src/legacy/old.ts": "" });
+  try {
+    assert.deepEqual(await p.lintFile("src/a.ts"), ["1:8 no-legacy: src/a.ts → src/legacy/old.ts"]);
+    p.write("detangle.toml", RULES.replace('"error"', '"warn"').replace("no-legacy", "no-old"));
+    assert.deepEqual(await p.lintFile("src/a.ts"), ["1:8 no-old: src/a.ts → src/legacy/old.ts"]);
+  } finally {
+    hooks.__setWatcherEnabled(true);
+    p.cleanup();
+  }
+});
+
+test("polling picks up installed packages through the lockfile", needsHooks, async () => {
+  hooks.__setWatcherEnabled(false);
+  const p = scratch({ "package.json": "{}", "package-lock.json": "{}", "detangle.toml": RULES, "src/a.ts": 'import "pkg";\n' });
+  try {
+    assert.deepEqual(await p.lintFile("src/a.ts"), ["1:8 unresolvable: src/a.ts → pkg"]);
+    // `npm install pkg`.
+    fs.mkdirSync(path.join(p.dir, "node_modules/pkg"), { recursive: true });
+    p.write("node_modules/pkg/index.js", "");
+    p.write("package-lock.json", '{ "lockfileVersion": 3 }');
+    assert.deepEqual(await p.lintFile("src/a.ts"), []);
+    const s = handleStats(p.dir);
+    assert.deepEqual([s.refreshes, s.opens], [1, 1]);
+  } finally {
+    hooks.__setWatcherEnabled(true);
+    p.cleanup();
+  }
+});
+
+test("a broken config recovers once it's fixed, without retrying before", needsHooks, async () => {
+  hooks.__setWatcherEnabled(false);
+  const p = scratch({ "package.json": "{}", "detangle.toml": "[[forbidden]\n", "src/a.ts": 'import "./legacy/old";\n', "src/legacy/old.ts": "" });
+  try {
+    for (let i = 0; i < 3; i++) {
+      const [m, ...rest] = await p.lintFile("src/a.ts");
+      assert.match(m, /^1:1 detangle: parsing .*detangle\.toml/);
+      assert.deepEqual(rest, []);
+    }
+    assert.deepEqual([handleStats(p.dir).state, handleStats(p.dir).openAttempts], ["broken", 1]);
+    p.write("detangle.toml", RULES);
+    assert.deepEqual(await p.lintFile("src/a.ts"), ["1:8 no-legacy: src/a.ts → src/legacy/old.ts"]);
+    assert.equal(handleStats(p.dir).state, "ready");
+  } finally {
+    hooks.__setWatcherEnabled(true);
+    p.cleanup();
+  }
+});
+
+test("a panic is reported, and recovers after the text changes and the floor passes", needsHooks, async () => {
+  const p = scratch({ "package.json": "{}", "detangle.toml": RULES, "src/a.ts": 'import "./legacy/old";\n', "src/legacy/old.ts": "" });
+  try {
+    const good = 'import "./legacy/old";\n';
+    assert.deepEqual(await p.lintFile("src/a.ts", good), ["1:8 no-legacy: src/a.ts → src/legacy/old.ts"]);
+    const [, handle] = [...native.projects.entries()].find(([k]) => k.startsWith(`${p.dir}\0`));
+    handle.__setRetryFloorMs(300);
+    const crash = `${good}// __detangle_test_panic__\n`;
+    const [m] = await p.lintFile("src/a.ts", crash);
+    assert.match(m, /^1:1 detangle: internal error \(test panic\)/);
+    // Fixed at once: within the floor, still failed. Nothing threw.
+    assert.match((await p.lintFile("src/a.ts", good))[0], /internal error/);
+    await new Promise((r) => setTimeout(r, 350));
+    assert.deepEqual(await p.lintFile("src/a.ts", good), ["1:8 no-legacy: src/a.ts → src/legacy/old.ts"]);
+    assert.equal(handle.__stats().openAttempts, 2);
+  } finally {
+    p.cleanup();
+  }
+});
