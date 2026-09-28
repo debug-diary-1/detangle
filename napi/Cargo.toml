@@ -28,5 +28,11 @@ napi-derive = "3.6.9"
 dunce = "1.0.5"
 mimalloc = "0.1.52"
 
+# musl's loader can't give a dlopen'ed library the initial-exec TLS that
+# mimalloc uses by default ("initial-exec TLS resolves to dynamic
+# definition"); the local-dynamic model works anywhere.
+[target.'cfg(target_env = "musl")'.dependencies]
+mimalloc = { version = "0.1.52", features = ["local_dynamic_tls"] }
+
 [build-dependencies]
 napi-build = "2.5.0"

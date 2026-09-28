@@ -73,13 +73,19 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - run: cargo build --locked --profile dist --target ${{ matrix.target }}
       # The add-on is loaded into Node, a dynamically linked process, so on
-      # musl it links the C runtime dynamically; only this step says so, and
-      # the CLI binary above stays static.
+      # musl it links the C runtime (and libgcc_s, for unwinding)
+      # dynamically. Ubuntu's musl-tools has no libgcc_s for musl, so musl
+      # add-ons are built in Alpine, where both are native, for the
+      # runner's own architecture. The CLI binary above stays static.
       - name: Build the ESLint add-on
         shell: bash
         run: |
-          if [ "${{ matrix.musl }}" = true ]; then export RUSTFLAGS="-C target-feature=-crt-static"; fi
-          cargo build --locked --profile dist -p detangle-napi --target "$TARGET"
+          if [ "${{ matrix.musl }}" = true ]; then
+            docker run --rm -v "$PWD:/w" -w /w -e RUSTFLAGS="-C target-feature=-crt-static" rust:1-alpine \
+              sh -c "apk add --no-cache musl-dev >/dev/null && cargo build --locked --profile dist -p detangle-napi --target $TARGET"
+          else
+            cargo build --locked --profile dist -p detangle-napi --target "$TARGET"
+          fi
       - name: Package
         shell: bash
         run: |
