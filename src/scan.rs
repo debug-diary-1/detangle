@@ -324,7 +324,10 @@ mod cache {
             }
         }
         std::fs::create_dir_all(dir)?;
-        let tmp = dir.join(format!("{FILE}.{}", std::process::id()));
+        // Unique per thread, not just per process: several projects in one
+        // process (e.g. the Node add-on) may save at once.
+        let thread: String = format!("{:?}", std::thread::current().id()).chars().filter(char::is_ascii_digit).collect();
+        let tmp = dir.join(format!("{FILE}.{}.{thread}", std::process::id()));
         std::fs::write(&tmp, w.0)?;
         std::fs::rename(tmp, dir.join(FILE))?;
         Ok(())
@@ -333,6 +336,32 @@ mod cache {
     impl Loaded {
         pub fn save(&self, dir: &Path, root: &Path, opts: &Options, files: &[ScannedFile]) -> Result<()> {
             save(dir, root, opts, files, &self.entries)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Threads in one process saving the same cache mustn't share a
+        /// temp file (one's rename would fail, or move the other's
+        /// half-written file into place).
+        #[test]
+        fn saves_from_two_threads() {
+            let dir = std::env::temp_dir().join(format!("detangle-cache-threads-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            let opts = Options::default();
+            std::thread::scope(|s| {
+                for _ in 0..2 {
+                    s.spawn(|| {
+                        for _ in 0..500 {
+                            save(&dir, &dir, &opts, &[], &HashMap::new()).unwrap();
+                        }
+                    });
+                }
+            });
+            assert!(decode(&std::fs::read(dir.join(FILE)).unwrap(), &opts).is_some());
+            let _ = std::fs::remove_dir_all(&dir);
         }
     }
 }
