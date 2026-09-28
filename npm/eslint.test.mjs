@@ -637,3 +637,22 @@ test("on Windows, a path differing only in case is the same file", { skip: proce
   assert.ok(exact.length > 0);
   assert.deepEqual(await lintAt("SRC/app.ts"), exact);
 });
+
+test("watcher setup time on this OS (logged)", needsHooks, async (t) => {
+  // The checkout's root, npm/node_modules included: thousands of
+  // directories, like a real project. Watcher setup runs on its own thread,
+  // picked up by the first lint after it's done.
+  const root = fileURLToPath(new URL("..", import.meta.url));
+  const file = path.join(root, "npm/eslint.js");
+  const started = performance.now();
+  const handle = native.addon().open(root, { mode: "watcher-timing" });
+  const opened = performance.now() - started;
+  while (!handle.__stats().watching) {
+    handle.violationsFor(file, "");
+    assert.ok(performance.now() - started < 30_000, "the watcher never started");
+    await new Promise((r) => setTimeout(r, 1));
+  }
+  const ready = performance.now() - started;
+  t.diagnostic(`${process.platform}: open (scan) ${opened.toFixed(0)} ms; watcher ready ${ready.toFixed(0)} ms after the open began`);
+  handle.close();
+});

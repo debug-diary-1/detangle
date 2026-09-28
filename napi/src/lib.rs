@@ -167,11 +167,12 @@ impl Project {
     pub fn stats(&self) -> hooks::Stats {
         let live = self.live.borrow();
         let Some(live) = live.as_ref() else {
-            return hooks::Stats { state: "closed".into(), opens: 0, open_attempts: 0, analyses: 0, refreshes: 0 };
+            return hooks::Stats { state: "closed".into(), watching: false, opens: 0, open_attempts: 0, analyses: 0, refreshes: 0 };
         };
         let s = live.stats;
         hooks::Stats {
             state: live.state().into(),
+            watching: live.watching(),
             opens: s.opens as u32,
             open_attempts: s.open_attempts as u32,
             analyses: s.analyses as u32,
@@ -212,6 +213,8 @@ mod hooks {
     #[napi_derive::napi(object)]
     pub struct Stats {
         pub state: String,
+        /// The file watcher is set up (it starts on its own thread).
+        pub watching: bool,
         pub opens: u32,
         pub open_attempts: u32,
         pub analyses: u32,
