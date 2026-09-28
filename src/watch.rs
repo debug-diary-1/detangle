@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError, channel};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -68,6 +68,10 @@ enum Msg {
     Rescan,
 }
 
+/// The watcher stopped delivering events (its thread died).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Disconnected;
+
 pub struct Watcher {
     _inner: RecommendedWatcher,
     rx: Receiver<Msg>,
@@ -75,7 +79,9 @@ pub struct Watcher {
     last_event: Option<Instant>,
 }
 
-fn is_config(name: &str) -> bool {
+/// Whether a file with this name configures resolution or the rules
+/// (tsconfig, package.json, detangle.toml, bundler configs, .env files).
+pub fn is_config(name: &str) -> bool {
     name == "detangle.toml"
         || name == "package.json"
         || (name.starts_with("tsconfig") && name.ends_with(".json"))
@@ -149,6 +155,19 @@ impl Watcher {
         match self.last_event {
             Some(t) if t.elapsed() >= QUIET => Some(self.take()),
             _ => None,
+        }
+    }
+
+    /// Everything reported so far, with no quiet period: for callers that
+    /// poll on their own schedule (the ESLint add-on, on each lint). A
+    /// half-written file parsed now is parsed again on its next event.
+    pub fn drain(&mut self) -> Result<Changes, Disconnected> {
+        loop {
+            match self.rx.try_recv() {
+                Ok(msg) => self.add(msg),
+                Err(TryRecvError::Empty) => return Ok(self.take()),
+                Err(TryRecvError::Disconnected) => return Err(Disconnected),
+            }
         }
     }
 
