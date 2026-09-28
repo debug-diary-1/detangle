@@ -43,9 +43,11 @@ function rule(severities, description) {
         Program() {
           // Problems with the project (e.g. its config) are reported once
           // per file, by whichever detangle rule runs first.
-          if (result.problemsReported) return;
-          result.problemsReported = true;
-          for (const message of result.problems) context.report({ loc: { line: 1, column: 0 }, message });
+          for (const message of result.problems) {
+            if (result.shown.has(message)) continue;
+            result.shown.add(message);
+            context.report({ loc: { line: 1, column: 0 }, message });
+          }
         },
         ImportDeclaration: (node) => report(node.source),
         ExportNamedDeclaration: (node) => report(node.source),

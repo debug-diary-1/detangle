@@ -177,18 +177,28 @@ for (const [name, ESLint] of Object.entries(versions)) {
 }
 
 test("an add-on that can't load gives one message at line 1 of each file", () => {
-  // In a child process: the add-on is loaded once per process.
+  // In a child process: the add-on is loaded once per process. The second
+  // config gives the rules different options, so two projects, which must
+  // still show the same problem only once.
   const script = `
     import { ESLint } from "eslint";
     import tseslint from "typescript-eslint";
     import detangle from "./eslint.js";
-    const eslint = new ESLint({
-      cwd: ${JSON.stringify(conditions)},
-      overrideConfigFile: true,
-      overrideConfig: [{ files: ["**/*.ts"], languageOptions: { parser: tseslint.parser } }, detangle.configs.recommended],
-    });
-    const results = await eslint.lintFiles(["src/c1.ts", "src/c3.ts"]);
-    console.log(JSON.stringify(results.map((r) => r.messages.map((m) => [m.line, m.column, m.ruleId, m.severity, m.message]))));
+    const configs = [
+      [detangle.configs.recommended],
+      [detangle.configs.recommended, { rules: { "detangle/warnings": ["warn", { mode: "other" }] } }],
+    ];
+    const out = [];
+    for (const extra of configs) {
+      const eslint = new ESLint({
+        cwd: ${JSON.stringify(conditions)},
+        overrideConfigFile: true,
+        overrideConfig: [{ files: ["**/*.ts"], languageOptions: { parser: tseslint.parser } }, ...extra],
+      });
+      const results = await eslint.lintFiles(["src/c1.ts", "src/c3.ts"]);
+      out.push(results.map((r) => r.messages.map((m) => [m.line, m.column, m.ruleId, m.severity, m.message])));
+    }
+    console.log(JSON.stringify(out));
   `;
   const r = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
     cwd: path.dirname(fileURLToPath(import.meta.url)),
@@ -196,14 +206,26 @@ test("an add-on that can't load gives one message at line 1 of each file", () =>
     encoding: "utf8",
   });
   assert.equal(r.status, 0, r.stderr);
-  const files = JSON.parse(r.stdout);
-  assert.equal(files.length, 2);
-  for (const messages of files) {
-    assert.equal(messages.length, 1);
-    const [line, column, rule, severity, message] = messages[0];
-    assert.deepEqual([line, column, rule, severity], [1, 1, "detangle/errors", 2]);
-    assert.match(message, /^detangle add-on unavailable: .*; run `detangle check`$/);
+  for (const files of JSON.parse(r.stdout)) {
+    assert.equal(files.length, 2);
+    for (const messages of files) {
+      assert.equal(messages.length, 1, JSON.stringify(messages));
+      const [line, column, rule, severity, message] = messages[0];
+      assert.deepEqual([line, column, rule, severity], [1, 1, "detangle/errors", 2]);
+      assert.match(message, /^detangle add-on unavailable: .*; run `detangle check`$/);
+    }
   }
+});
+
+test("different problems from the two rules' projects are both shown", async () => {
+  const got = await lint(conditions, ["src/c1.ts"], [
+    detangle.configs.recommended,
+    { rules: { "detangle/errors": ["error", { config: "missing-a.toml" }], "detangle/warnings": ["warn", { config: "missing-b.toml" }] } },
+  ]);
+  assert.deepEqual(
+    got.map((m) => [m.rule, m.message.match(/missing-.\.toml/)?.[0]]),
+    [["detangle/errors", "missing-a.toml"], ["detangle/warnings", "missing-b.toml"]],
+  );
 });
 
 test("a project reached through a symlink reports the same", async () => {
