@@ -33,11 +33,41 @@ pub struct FileViolation {
     pub specifiers: Vec<String>,
 }
 
-/// Violation indices by the module whose file shows them.
+/// Which violations show in which file (the design's placement table).
 #[derive(Default)]
 struct Placement {
-    /// Module scope with a `to`: by `from`.
-    by_from: rustc_hash::FxHashMap<usize, Vec<usize>>,
+    /// Module scope, by `from`: shown on its imports of `to`, or on the
+    /// file as a whole when there's no `to`.
+    by_module: rustc_hash::FxHashMap<usize, Vec<usize>>,
+    /// Folder scope with a `to`, by (from, to) folder node: shown on every
+    /// import behind that folder edge.
+    by_folder_edge: rustc_hash::FxHashMap<(usize, usize), Vec<usize>>,
+    /// Group scope, by the importing module of each import behind it:
+    /// (violation, module edge).
+    by_import: rustc_hash::FxHashMap<usize, Vec<(usize, usize)>>,
+}
+
+impl Placement {
+    fn new(g: &Graph, violations: &[Violation]) -> Self {
+        let mut p = Placement::default();
+        for (i, v) in violations.iter().enumerate() {
+            match v.scope {
+                Scope::Module => p.by_module.entry(v.from).or_default().push(i),
+                Scope::Folder => {
+                    // Without a `to` there's no import to show it on.
+                    if let Some(to) = v.to {
+                        p.by_folder_edge.entry((v.from, to)).or_default().push(i);
+                    }
+                }
+                Scope::Group => {
+                    for &e in &v.imports {
+                        p.by_import.entry(g.edges[e].from).or_default().push((i, e));
+                    }
+                }
+            }
+        }
+        p
+    }
 }
 
 impl Analysis {
@@ -46,37 +76,42 @@ impl Analysis {
         let g = &self.graph;
         let Ok(rel) = file.strip_prefix(&g.root) else { return Vec::new() };
         let Some(m) = g.find(ModuleKind::Local, &rel.to_string_lossy().replace('\\', "/")) else { return Vec::new() };
-        let placement = self.placement.get_or_init(|| {
-            let mut p = Placement::default();
-            for (i, v) in self.violations.iter().enumerate() {
-                if v.scope == Scope::Module && v.to.is_some() {
-                    p.by_from.entry(v.from).or_default().push(i);
+        let p = self.placement.get_or_init(|| Placement::new(g, &self.violations));
+        // Violation index → import strings, merged across the rows below.
+        let mut found: std::collections::BTreeMap<usize, Vec<String>> = Default::default();
+        let mut add = |i: usize, specs: &mut dyn Iterator<Item = &str>| {
+            let list = found.entry(i).or_default();
+            for s in specs {
+                if !list.iter().any(|x| x == s) {
+                    list.push(s.to_string());
                 }
             }
-            p
-        });
-        let Some(found) = placement.by_from.get(&m) else { return Vec::new() };
+        };
+        let specifiers = |e: usize| g.edges[e].imports().into_iter().map(|(s, _)| s);
+        for &i in p.by_module.get(&m).into_iter().flatten() {
+            let to = self.violations[i].to;
+            add(i, &mut g.out[m].iter().filter(|&&e| Some(g.edges[e].to) == to).flat_map(|&e| specifiers(e)));
+        }
+        if !p.by_folder_edge.is_empty() {
+            for &e in &g.out[m] {
+                for fe in g.folder_edges(e) {
+                    for &i in p.by_folder_edge.get(&fe).into_iter().flatten() {
+                        add(i, &mut specifiers(e));
+                    }
+                }
+            }
+        }
+        for &(i, e) in p.by_import.get(&m).into_iter().flatten() {
+            add(i, &mut specifiers(e));
+        }
         found
-            .iter()
-            .map(|&i| {
+            .into_iter()
+            .map(|(i, specifiers)| {
                 let v = &self.violations[i];
-                FileViolation { rule: v.rule.clone(), severity: v.severity, message: message(g, v), specifiers: imports_of(g, m, v.to) }
+                FileViolation { rule: v.rule.clone(), severity: v.severity, message: message(g, v), specifiers }
             })
             .collect()
     }
-}
-
-/// The distinct import strings in module `from` that import `to`.
-fn imports_of(g: &Graph, from: usize, to: Option<usize>) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for e in g.out[from].iter().map(|&e| &g.edges[e]).filter(|e| Some(e.to) == to) {
-        for (spec, _) in e.imports() {
-            if !out.iter().any(|s| s == spec) {
-                out.push(spec.to_string());
-            }
-        }
-    }
-    out
 }
 
 /// `rule: from → to (cycle: a → b → a) — comment`, leaving out the parts a
@@ -309,6 +344,34 @@ to = { circular = true }
         assert!(summary("src/b.ts").is_empty());
         assert!(summary("elsewhere.ts").is_empty());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Folder and group violations show on the imports behind them, in
+    /// every file that has one; module violations without a `to` show on
+    /// the file as a whole; ones with no import behind them nowhere.
+    #[test]
+    fn violations_for_every_scope() {
+        let root = dunce::canonicalize(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/eslint")).unwrap();
+        let a = Project::open(&root, None, None, &CacheArgs::default()).unwrap().analyze().unwrap();
+        let shown = |file: &str| -> Vec<(String, Vec<String>)> {
+            let mut v: Vec<_> = a.violations_for(&root.join(file)).into_iter().map(|v| (v.rule, v.specifiers)).collect();
+            v.sort();
+            v
+        };
+        let s = |x: &str| vec![x.to_string()];
+        assert_eq!(
+            shown("src/features/cart/ui/button.ts"),
+            [("features-independent".into(), s("../../orders/model")), ("no-cross-feature".into(), s("../../orders/model"))]
+        );
+        assert_eq!(
+            shown("src/features/cart/index.ts"),
+            [("features-independent".into(), s("../orders/api")), ("no-cross-feature".into(), s("../orders/api"))]
+        );
+        assert_eq!(shown("src/lonely.ts"), [("no-orphans".into(), vec![])]);
+        assert_eq!(shown("src/pages/home.ts"), [("no-legacy".into(), s("../legacy/old")), ("pages-use-shell".into(), vec![])]);
+        // orders-folder-unused and orders-group-unused have no import to show on.
+        assert!(a.violations.iter().any(|v| v.rule == "orders-folder-unused"));
+        assert!(shown("src/features/orders/api.ts").is_empty());
     }
 
     /// After lost events, rebuild re-opens the project, so it sees files

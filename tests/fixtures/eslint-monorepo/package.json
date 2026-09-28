@@ -1,0 +1,5 @@
+{
+  "name": "eslint-monorepo",
+  "private": true,
+  "workspaces": ["packages/*"]
+}
