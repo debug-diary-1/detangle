@@ -7,8 +7,14 @@
 
 use std::path::{Path, PathBuf};
 
-use detangle::{Analysis, CacheArgs};
+use detangle::live::Live;
 use napi_derive::napi;
+
+// As in the CLI: parsing and graph building allocate heavily from many
+// threads, where mimalloc is much faster than the system allocator
+// (notably on macOS). It serves only Rust's allocations, not Node's.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[napi(object)]
 pub struct OpenOptions {
@@ -38,27 +44,27 @@ pub struct FileResult {
 }
 
 enum State {
-    Ready { analysis: Box<Analysis>, exotic_require: Vec<String> },
+    Ready(Box<Live>),
     /// The project couldn't be opened.
     Broken(String),
 }
 
-/// An open project (a handle, in the design's terms).
+/// An open project (a handle, in the design's terms): the scan, kept
+/// current by a file watcher and by the buffers it's asked about.
 #[napi]
 pub struct Project {
     state: State,
 }
 
-/// Opens the project at `dir` (absolute), scanning it once.
+/// Opens the project at `dir` (absolute), scanning it once and starting a
+/// watcher on its root.
 #[napi]
 pub fn open(dir: String, options: Option<OpenOptions>) -> Project {
     let options = options.unwrap_or(OpenOptions { config: None, mode: None });
     let config = options.config.map(PathBuf::from);
-    let opened = detangle::Project::open(Path::new(&dir), config.as_deref(), options.mode.as_deref(), &CacheArgs::default())
-        .and_then(|p| Ok((Box::new(p.analyze()?), p.config().options.exotic_require.clone())));
     Project {
-        state: match opened {
-            Ok((analysis, exotic_require)) => State::Ready { analysis, exotic_require },
+        state: match Live::open(Path::new(&dir), config.as_deref(), options.mode.as_deref(), true) {
+            Ok(live) => State::Ready(Box::new(live)),
             Err(e) => State::Broken(format!("{e:#}")),
         },
     }
@@ -68,23 +74,33 @@ pub fn open(dir: String, options: Option<OpenOptions>) -> Project {
 impl Project {
     /// What to show in `file` (absolute), whose editor buffer holds `text`.
     #[napi]
-    pub fn violations_for(&self, file: String, _text: String) -> FileResult {
-        match &self.state {
-            State::Ready { analysis, exotic_require } => FileResult {
-                violations: analysis
-                    .violations_for(&canonical(Path::new(&file)))
-                    .into_iter()
-                    .map(|v| Violation {
-                        rule: v.rule,
-                        severity: severity(v.severity).into(),
-                        message: v.message,
-                        specifiers: v.specifiers,
-                    })
-                    .collect(),
-                problems: Vec::new(),
-                exotic_require: exotic_require.clone(),
-            },
-            State::Broken(e) => FileResult { violations: Vec::new(), problems: vec![format!("detangle: {e}")], exotic_require: Vec::new() },
+    pub fn violations_for(&mut self, file: String, text: String) -> FileResult {
+        let live = match &mut self.state {
+            State::Ready(live) => live,
+            State::Broken(e) => return FileResult { violations: Vec::new(), problems: vec![format!("detangle: {e}")], exotic_require: Vec::new() },
+        };
+        let (violations, mut problems) = match live.violations_for(&canonical(Path::new(&file)), &text) {
+            Ok(vs) => (vs, Vec::new()),
+            Err(e) => (Vec::new(), vec![format!("detangle: {e:#}")]),
+        };
+        problems.extend(live.problems().into_iter().map(|p| format!("detangle: {p}")));
+        FileResult {
+            violations: violations
+                .into_iter()
+                .map(|v| Violation { rule: v.rule, severity: severity(v.severity).into(), message: v.message, specifiers: v.specifiers })
+                .collect(),
+            problems,
+            exotic_require: live.project().config().options.exotic_require.clone(),
+        }
+    }
+
+    /// One-time notices since the last call (the file watcher failed or
+    /// stopped), for `process.emitWarning`.
+    #[napi]
+    pub fn take_warnings(&mut self) -> Vec<String> {
+        match &mut self.state {
+            State::Ready(live) => live.take_warnings(),
+            State::Broken(_) => Vec::new(),
         }
     }
 }

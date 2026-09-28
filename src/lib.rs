@@ -9,6 +9,7 @@ pub mod config;
 pub mod dotenv;
 pub mod graph;
 pub mod groups;
+pub mod live;
 pub mod migrate;
 mod project;
 pub mod report;
