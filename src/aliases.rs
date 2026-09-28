@@ -4,7 +4,6 @@
 //! the rest of the pipeline (tsconfig paths, package exports, …) still applies.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 use fancy_regex::Regex;
@@ -310,7 +309,7 @@ fn run_node(script: &str, file: &Path, eval: &EvalEnv) -> Result<String> {
     let args = serde_json::json!({ "mode": env.mode(), "command": command, "webpackEnv": webpack_env });
     // Precedence: detangle.toml `vars` > shell environment > `.env` files.
     let from_files = eval.files.iter().filter(|(k, _)| std::env::var_os(k).is_none());
-    let out = Command::new("node")
+    let out = crate::node_command()
         .args(["-e", script])
         .envs(from_files)
         .envs(&env.vars)
