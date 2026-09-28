@@ -1468,15 +1468,20 @@ export const f = (x) => [module.require("./g"), process.getBuiltinModule("fs"), 
         }
     }
 
-    /// Every file and resolved import, with the root masked, sorted.
+    /// Every file and resolved import, relative to the root, sorted.
     fn snapshot(s: &Session, root: &Path) -> Vec<String> {
-        let mask = |t: String| t.replace(&root.display().to_string(), "<root>");
+        // Stripped as paths, not replaced in text: Debug output escapes
+        // Windows backslashes.
+        let target = |t: &Target| match t {
+            Target::Local(p) => format!("Local({})", p.strip_prefix(root).unwrap_or(p).display()),
+            t => format!("{t:?}"),
+        };
         let mut v: Vec<String> = s
             .files()
             .iter()
             .flat_map(|f| {
                 let from = f.path.strip_prefix(root).unwrap().display().to_string();
-                let mut v: Vec<String> = f.imports.iter().map(|i| mask(format!("{from}: {} -> {:?}", i.specifier, i.target))).collect();
+                let mut v: Vec<String> = f.imports.iter().map(|i| format!("{from}: {} -> {}", i.specifier, target(&i.target))).collect();
                 v.push(format!("{from} ({} parse errors)", f.parse_errors));
                 v
             })
