@@ -73,12 +73,16 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - run: cargo build --locked --profile dist --target ${{ matrix.target }}
       # The add-on is loaded into Node, a dynamically linked process, so on
-      # musl it links the C runtime dynamically; only this step says so, and
-      # the CLI binary above stays static.
+      # musl it links the C runtime dynamically, through musl-gcc (the host
+      # cc would link glibc's loader, which Alpine doesn't have). Only this
+      # step says so; the CLI binary above stays static.
       - name: Build the ESLint add-on
         shell: bash
         run: |
-          if [ "${{ matrix.musl }}" = true ]; then export RUSTFLAGS="-C target-feature=-crt-static"; fi
+          if [ "${{ matrix.musl }}" = true ]; then
+            export RUSTFLAGS="-C target-feature=-crt-static"
+            export "CARGO_TARGET_$(echo "$TARGET" | tr 'a-z-' 'A-Z_')_LINKER=musl-gcc"
+          fi
           cargo build --locked --profile dist -p detangle-napi --target "$TARGET"
       - name: Package
         shell: bash
