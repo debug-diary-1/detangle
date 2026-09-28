@@ -10,6 +10,12 @@ use std::path::{Path, PathBuf};
 use detangle::live::Live;
 use napi_derive::napi;
 
+// As in the CLI: parsing and graph building allocate heavily from many
+// threads, where mimalloc is much faster than the system allocator
+// (notably on macOS). It serves only Rust's allocations, not Node's.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[napi(object)]
 pub struct OpenOptions {
     /// Config file (like `--config`), absolute.

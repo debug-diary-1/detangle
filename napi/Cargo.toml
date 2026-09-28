@@ -17,6 +17,7 @@ detangle = { path = ".." }
 napi = { version = "3.13.0", default-features = false, features = ["napi8"] }
 napi-derive = "3.6.9"
 dunce = "1.0.5"
+mimalloc = "0.1.52"
 
 [build-dependencies]
 napi-build = "2.5.0"

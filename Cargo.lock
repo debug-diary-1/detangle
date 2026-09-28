@@ -527,6 +527,7 @@ version = "0.1.3"
 dependencies = [
  "detangle",
  "dunce",
+ "mimalloc",
  "napi",
  "napi-build",
  "napi-derive",
