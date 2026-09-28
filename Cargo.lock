@@ -526,6 +526,7 @@ name = "detangle-napi"
 version = "0.1.3"
 dependencies = [
  "detangle",
+ "dunce",
  "napi",
  "napi-build",
  "napi-derive",

@@ -72,7 +72,7 @@ impl Project {
         match &self.state {
             State::Ready { analysis, exotic_require } => FileResult {
                 violations: analysis
-                    .violations_for(Path::new(&file))
+                    .violations_for(&canonical(Path::new(&file)))
                     .into_iter()
                     .map(|v| Violation {
                         rule: v.rule,
@@ -87,6 +87,12 @@ impl Project {
             State::Broken(e) => FileResult { violations: Vec::new(), problems: vec![format!("detangle: {e}")], exotic_require: Vec::new() },
         }
     }
+}
+
+/// `path` with symlinks resolved (and on Windows, the on-disk case), as the
+/// project's own paths are; unchanged if it doesn't exist.
+fn canonical(path: &Path) -> PathBuf {
+    dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 fn severity(s: detangle::config::Severity) -> &'static str {

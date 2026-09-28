@@ -16,6 +16,7 @@ detangle = { path = ".." }
 # Node-API 8: Node 12.22+, well below what ESLint 9 and 10 need.
 napi = { version = "3.13.0", default-features = false, features = ["napi8"] }
 napi-derive = "3.6.9"
+dunce = "1.0.5"
 
 [build-dependencies]
 napi-build = "2.5.0"

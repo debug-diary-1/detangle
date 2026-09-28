@@ -10,6 +10,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { ESLint } from "eslint";
@@ -98,5 +99,19 @@ test("a config that fails to load is reported at line 1 of every file", async ()
   for (const m of got) {
     assert.equal(`${m.line}:${m.column}`, "1:1");
     assert.match(m.message, /^detangle: reading .*missing\.toml/);
+  }
+});
+
+test("a project reached through a symlink reports the same", async () => {
+  const link = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "detangle-link-")), "conditions");
+  fs.symlinkSync(conditions, link, "junction"); // a junction needs no admin rights on Windows
+  try {
+    const rules = { "detangle/errors": ["error", { config: "rules.config.cjs" }] };
+    const direct = await lint(conditions, ["src/**/*.ts"], rules);
+    const linked = await lint(link, ["src/**/*.ts"], rules);
+    assert.ok(direct.length > 0);
+    assert.deepEqual(linked.map(key).sort(), direct.map(key).sort());
+  } finally {
+    fs.rmSync(path.dirname(link), { recursive: true, force: true });
   }
 });
