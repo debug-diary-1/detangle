@@ -7,3 +7,4 @@
 !tests/fixtures/**/.env
 # Copied from docs/demo by the Pages workflow
 /site/explorer.gif
+/npm/node_modules
