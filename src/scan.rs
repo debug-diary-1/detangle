@@ -285,7 +285,7 @@ mod cache {
                 let path = root.join(rel);
                 let raw = e.imports.iter().map(|(s, b)| (s.clone(), ImportFlags::from_bits(*b))).collect();
                 let key = path.as_os_str().to_os_string();
-                let file = ScannedFile { path, imports: vec![], parse_errors: e.errors, raw, stamp: parse_meta(&e.meta) };
+                let file = ScannedFile { path, imports: vec![], parse_errors: e.errors, raw, stamp: parse_meta(&e.meta), overlaid: false };
                 let hash = (content && !e.hash.is_empty()).then(|| e.hash.clone());
                 (key, Hit { file, hash })
             })
@@ -374,6 +374,8 @@ pub struct ScannedFile {
     /// Unresolved imports, kept so a file can be re-resolved without re-parsing.
     raw: Vec<(Arc<str>, ImportFlags)>,
     stamp: Stamp,
+    /// `raw` comes from an editor buffer (`Session::overlay`), not the disk.
+    overlaid: bool,
 }
 
 /// What a rebuild had to do.
@@ -412,7 +414,7 @@ impl Session {
         // Walk, parse and resolve in one pass: each file is handled by the
         // walker thread that finds it, so parsing starts with the first file.
         let (fresh, seen) = (AtomicBool::new(false), AtomicUsize::new(0));
-        let mut files = walk_sources(root, dir, opts, |p| {
+        let mut files = walk_sources(root, dir, opts, None, |p| {
             let hit = cached.files.get(p.as_os_str());
             seen.fetch_add(usize::from(hit.is_some()), Ordering::Relaxed);
             let (mut f, how) = parse_file(p, hit.map(|h| &h.file), hit.and_then(|h| h.hash.as_deref()), &detect);
@@ -486,8 +488,15 @@ impl Session {
                 let mut old: HashMap<PathBuf, ScannedFile> = self.files.drain(..).map(|f| (f.path.clone(), f)).collect();
                 let reused: Vec<(PathBuf, Option<ScannedFile>)> =
                     paths.into_iter().map(|p| { let o = old.remove(&p); (p, o) }).collect();
-                let parsed: Vec<(ScannedFile, Scanned)> =
-                    reused.into_par_iter().map(|(p, prev)| parse_file(p, prev.as_ref(), None, &detect)).collect();
+                let parsed: Vec<(ScannedFile, Scanned)> = reused
+                    .into_par_iter()
+                    .map(|(p, prev)| match prev {
+                        // An editor buffer stays authoritative until its own file changes.
+                        Some(prev) if prev.overlaid && !changed.contains(&p) => (prev, Scanned::Reused),
+                        Some(prev) if prev.overlaid => parse_file(p, None, None, &detect),
+                        prev => parse_file(p, prev.as_ref(), None, &detect),
+                    })
+                    .collect();
                 work.reparsed = parsed.iter().filter(|(_, how)| *how != Scanned::Reused).count();
                 self.files = parsed.into_iter().map(|(f, _)| f).collect();
                 self.resolver = make_resolver(&self.root, &self.opts)?;
@@ -503,7 +512,7 @@ impl Session {
             // paths plus anything whose stamp moved.
             let mut v: Vec<usize> = (0..self.files.len())
                 .into_par_iter()
-                .filter(|&i| stamp(&self.files[i].path) != self.files[i].stamp)
+                .filter(|&i| !self.files[i].overlaid && stamp(&self.files[i].path) != self.files[i].stamp)
                 .collect();
             v.extend(changed.iter().filter_map(|p| self.index.get(p).copied()));
             v
@@ -535,6 +544,65 @@ impl Session {
         self.work = work;
         Ok(())
     }
+
+    fn position(&mut self, path: &Path) -> Option<usize> {
+        if self.index.len() != self.files.len() {
+            self.reindex();
+        }
+        self.index.get(path).copied()
+    }
+
+    /// Whether `path` is one of the scanned files.
+    pub fn contains(&mut self, path: &Path) -> bool {
+        self.position(path).is_some()
+    }
+
+    /// Whether a walk would include `path`: under `dir`, a source file, not
+    /// ignored (.gitignore, .ignore, hidden, node_modules) and kept by the
+    /// include/exclude globs. It walks only the directories on the way to
+    /// `path`, with the walk's own rules, rather than the whole tree.
+    pub fn eligible(&self, path: &Path) -> bool {
+        walk_sources_along(&self.root, &self.dir, &self.opts, path).is_ok_and(|found| found.iter().any(|p| p == path))
+    }
+
+    /// Adds `path`, an eligible file that isn't a member yet: the structural
+    /// update its watcher event would bring.
+    pub fn admit(&mut self, path: &Path) -> Result<()> {
+        self.update(&[path.to_path_buf()])
+    }
+
+    /// Makes `source` (an editor buffer) the contents of member `path`.
+    /// Returns whether its imports or parse errors changed; if so, only this
+    /// file is re-resolved (resolution depends on the set of files and on
+    /// config files, which a buffer doesn't change) and `work.graph_changed`
+    /// is set. The buffer stays in effect across updates until an update
+    /// names `path` itself, which re-reads it from disk.
+    pub fn overlay(&mut self, path: &Path, source: &str) -> bool {
+        let Some(i) = self.position(path) else { return false };
+        let t = Instant::now();
+        let detect = Detect::new(&self.opts);
+        let (raw, parse_errors) = ALLOC.with(|a| {
+            let mut alloc = a.borrow_mut();
+            alloc.reset();
+            extract(&alloc, path, source, &detect)
+        });
+        let f = &mut self.files[i];
+        if f.raw == raw && f.parse_errors == parse_errors {
+            self.work = Work::default();
+            return false;
+        }
+        f.raw = raw;
+        f.parse_errors = parse_errors;
+        f.overlaid = true;
+        f.resolve(&self.resolver);
+        self.work = Work { reparsed: 1, reresolved: 1, graph_changed: true, scan_ms: ms(t), ..Default::default() };
+        true
+    }
+
+    /// Whether `dir` contains a scanned file, at any depth.
+    pub fn is_member_dir(&self, dir: &Path) -> bool {
+        self.files.iter().any(|f| f.path.starts_with(dir))
+    }
 }
 
 fn ms(t: Instant) -> f64 {
@@ -555,7 +623,7 @@ fn globset(patterns: &[String]) -> Result<Option<GlobSet>> {
 /// Walks `dir` (respecting .gitignore) and returns source files, filtered by
 /// the include/exclude globs, which are matched against root-relative paths.
 pub fn discover(root: &Path, dir: &Path, opts: &Options) -> Result<Vec<PathBuf>> {
-    let mut files = walk_sources(root, dir, opts, |p| p)?;
+    let mut files = walk_sources(root, dir, opts, None, |p| p)?;
     files.sort_by_cached_key(|p| path_key(p));
     Ok(files)
 }
@@ -568,17 +636,25 @@ fn path_key(p: &Path) -> Vec<u8> {
     p.as_os_str().as_encoded_bytes().iter().map(|&c| if std::path::is_separator(char::from(c)) { 0 } else { c }).collect()
 }
 
+/// The source files a walk would find on the way to `path` (at most `path`
+/// itself), visiting only its ancestors.
+fn walk_sources_along(root: &Path, dir: &Path, opts: &Options, path: &Path) -> Result<Vec<PathBuf>> {
+    walk_sources(root, dir, opts, Some(path), |p| p)
+}
+
 /// Like `discover`, but maps each source file with `f` on the walker thread
-/// that found it. The results are unordered.
-fn walk_sources<T: Send>(root: &Path, dir: &Path, opts: &Options, f: impl Fn(PathBuf) -> T + Sync) -> Result<Vec<T>> {
+/// that found it. The results are unordered. With `only`, the walk visits
+/// just that path and the directories leading to it.
+fn walk_sources<T: Send>(root: &Path, dir: &Path, opts: &Options, only: Option<&Path>, f: impl Fn(PathBuf) -> T + Sync) -> Result<Vec<T>> {
     let include = globset(&opts.include)?;
     let exclude = globset(&opts.exclude)?;
     let filter = crate::graph::PathFilter::new(opts);
     let found = Mutex::new(Vec::new());
     let f = &f;
+    let only = only.map(Path::to_path_buf);
     WalkBuilder::new(dir)
         .require_git(false)
-        .filter_entry(|e| e.file_name() != "node_modules")
+        .filter_entry(move |e| e.file_name() != "node_modules" && only.as_deref().is_none_or(|p| p.starts_with(e.path())))
         .build_parallel()
         .run(|| {
             Box::new(|entry| {
@@ -717,7 +793,9 @@ fn parse_file(path: PathBuf, prev: Option<&ScannedFile>, prev_hash: Option<&str>
     // One open for both the stamp and the contents.
     let (source, st) = match read_source(&path) {
         Ok(r) => r,
-        Err(_) => return (ScannedFile { stamp: stamp(&path), path, imports: vec![], parse_errors: 1, raw: vec![] }, Scanned::Parsed),
+        Err(_) => {
+            return (ScannedFile { stamp: stamp(&path), path, imports: vec![], parse_errors: 1, raw: vec![], overlaid: false }, Scanned::Parsed);
+        }
     };
     if let (Some(prev), Some(h)) = (prev, prev_hash)
         && cache::hash(source.as_bytes()) == h
@@ -729,13 +807,13 @@ fn parse_file(path: PathBuf, prev: Option<&ScannedFile>, prev_hash: Option<&str>
         alloc.reset();
         extract(&alloc, &path, &source, detect)
     });
-    (ScannedFile { path, imports: vec![], parse_errors, raw, stamp: st }, Scanned::Parsed)
+    (ScannedFile { path, imports: vec![], parse_errors, raw, stamp: st, overlaid: false }, Scanned::Parsed)
 }
 
 impl ScannedFile {
     #[cfg(test)]
     pub fn for_test(path: PathBuf, imports: Vec<Import>) -> Self {
-        ScannedFile { path, imports, parse_errors: 0, raw: vec![], stamp: None }
+        ScannedFile { path, imports, parse_errors: 0, raw: vec![], stamp: None, overlaid: false }
     }
 
     fn resolve(&mut self, resolver: &Resolvers) {
@@ -1355,5 +1433,196 @@ export const f = (x) => [module.require("./g"), process.getBuiltinModule("fs"), 
         assert_eq!(package_name("react-dom/client"), "react-dom");
         assert_eq!(package_name("@scope/pkg/deep/x"), "@scope/pkg");
         assert_eq!(package_name("@scope/pkg"), "@scope/pkg");
+    }
+
+    /// A test project in a fresh temp directory.
+    struct Tmp(PathBuf);
+
+    impl Tmp {
+        fn new(name: &str, files: &[(&str, &str)]) -> Tmp {
+            let dir = std::env::temp_dir().join(format!("detangle-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let t = Tmp(dunce::canonicalize(&dir).unwrap());
+            for (rel, body) in files {
+                t.write(rel, body);
+            }
+            t
+        }
+        fn path(&self, rel: &str) -> PathBuf {
+            self.0.join(rel)
+        }
+        fn write(&self, rel: &str, body: &str) {
+            let p = self.path(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, body).unwrap();
+        }
+        fn session(&self) -> Session {
+            Session::new(&self.0, &self.0, &Options::default()).unwrap()
+        }
+    }
+
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Every file and resolved import, with the root masked, sorted.
+    fn snapshot(s: &Session, root: &Path) -> Vec<String> {
+        let mask = |t: String| t.replace(&root.display().to_string(), "<root>");
+        let mut v: Vec<String> = s
+            .files()
+            .iter()
+            .flat_map(|f| {
+                let from = f.path.strip_prefix(root).unwrap().display().to_string();
+                let mut v: Vec<String> = f.imports.iter().map(|i| mask(format!("{from}: {} -> {:?}", i.specifier, i.target))).collect();
+                v.push(format!("{from} ({} parse errors)", f.parse_errors));
+                v
+            })
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// `s` must equal a fresh scan of `t`'s files with `buffers` written
+    /// over them: a copy of the project on disk, so the check doesn't rely
+    /// on overlays at all.
+    fn assert_matches_disk_plus(s: &Session, t: &Tmp, buffers: &[(&str, &str)]) {
+        let copy = Tmp::new(&format!("{}-copy", t.0.file_name().unwrap().to_string_lossy()), &[]);
+        for entry in WalkBuilder::new(&t.0).hidden(false).build().flatten() {
+            let rel = entry.path().strip_prefix(&t.0).unwrap();
+            if entry.file_type().is_some_and(|ft| ft.is_file()) {
+                copy.write(&rel.to_string_lossy(), &std::fs::read_to_string(entry.path()).unwrap());
+            }
+        }
+        for (rel, body) in buffers {
+            copy.write(rel, body);
+        }
+        assert_eq!(snapshot(s, &t.0), snapshot(&copy.session(), &copy.0));
+    }
+
+    const A: &str = "import './b';";
+
+    #[test]
+    fn overlay_equal_to_disk_changes_nothing() {
+        let t = Tmp::new("overlay-same", &[("src/a.ts", A), ("src/b.ts", "")]);
+        let mut s = t.session();
+        assert!(!s.overlay(&t.path("src/a.ts"), A));
+        assert!(!s.work.graph_changed);
+        assert_matches_disk_plus(&s, &t, &[]);
+    }
+
+    #[test]
+    fn overlay_adds_an_import() {
+        let t = Tmp::new("overlay-add", &[("src/a.ts", A), ("src/b.ts", ""), ("src/c.ts", "")]);
+        let mut s = t.session();
+        let buffer = "import './b'; import './c';";
+        assert!(s.overlay(&t.path("src/a.ts"), buffer));
+        assert!(s.work.graph_changed);
+        assert_eq!(s.work.reresolved, 1);
+        assert_matches_disk_plus(&s, &t, &[("src/a.ts", buffer)]);
+        // A syntax error counts too.
+        assert!(s.overlay(&t.path("src/a.ts"), "import './b'; import ("));
+        assert_matches_disk_plus(&s, &t, &[("src/a.ts", "import './b'; import (")]);
+    }
+
+    #[test]
+    fn overlay_then_saved_to_disk() {
+        let t = Tmp::new("overlay-save", &[("src/a.ts", A), ("src/b.ts", ""), ("src/c.ts", "")]);
+        let mut s = t.session();
+        let buffer = "import './c';";
+        s.overlay(&t.path("src/a.ts"), buffer);
+        t.write("src/a.ts", buffer);
+        s.update(&[t.path("src/a.ts")]).unwrap();
+        assert_matches_disk_plus(&s, &t, &[]);
+        // The file is plain disk content again: a later structural update re-reads it.
+        assert!(!s.files()[s.index[&t.path("src/a.ts")]].overlaid);
+    }
+
+    #[test]
+    fn overlay_then_disk_reverted() {
+        let t = Tmp::new("overlay-revert", &[("src/a.ts", A), ("src/b.ts", ""), ("src/c.ts", "")]);
+        let mut s = t.session();
+        s.overlay(&t.path("src/a.ts"), "import './c';");
+        // e.g. `git checkout src/a.ts`: an event for the file, disk content wins.
+        t.write("src/a.ts", A);
+        s.update(&[t.path("src/a.ts")]).unwrap();
+        assert!(s.work.graph_changed);
+        assert_matches_disk_plus(&s, &t, &[]);
+    }
+
+    #[test]
+    fn overlays_survive_other_files_changing() {
+        let t = Tmp::new("overlay-survive", &[("src/a.ts", A), ("src/b.ts", ""), ("src/c.ts", "export {}")]);
+        let mut s = t.session();
+        let a = "import './b'; import './new';";
+        s.overlay(&t.path("src/a.ts"), a);
+        // Another file is added (structural: every file re-resolved, and
+        // a's buffer import of './new' now resolves).
+        t.write("src/new.ts", "");
+        s.update(&[t.path("src/new.ts")]).unwrap();
+        assert!(s.work.walked);
+        assert_matches_disk_plus(&s, &t, &[("src/a.ts", a)]);
+        // Another file is saved (incremental).
+        t.write("src/c.ts", "import './b';");
+        s.update(&[t.path("src/c.ts")]).unwrap();
+        assert_matches_disk_plus(&s, &t, &[("src/a.ts", a)]);
+        // A second buffer.
+        let b = "import './c';";
+        s.overlay(&t.path("src/b.ts"), b);
+        assert_matches_disk_plus(&s, &t, &[("src/a.ts", a), ("src/b.ts", b)]);
+        // A directory event over an unchanged file set (same-set structural).
+        s.update(&[t.path("src")]).unwrap();
+        assert_matches_disk_plus(&s, &t, &[("src/a.ts", a), ("src/b.ts", b)]);
+    }
+
+    #[test]
+    fn admit_adds_a_new_file() {
+        let t = Tmp::new("admit", &[("src/a.ts", "import './new';")]);
+        let mut s = t.session();
+        t.write("src/new.ts", "import './a';");
+        let new = t.path("src/new.ts");
+        assert!(!s.contains(&new));
+        assert!(s.eligible(&new));
+        s.admit(&new).unwrap();
+        assert!(s.contains(&new) && s.work.graph_changed);
+        assert_matches_disk_plus(&s, &t, &[]);
+    }
+
+    #[test]
+    fn eligible_applies_the_walks_rules() {
+        let t = Tmp::new(
+            "eligible",
+            &[
+                (".gitignore", "dist/\n*.gen.ts\n"),
+                ("src/a.ts", ""),
+                ("src/x.gen.ts", ""),
+                ("dist/out.ts", ""),
+                (".hidden/h.ts", ""),
+                ("node_modules/p/index.ts", ""),
+                ("src/readme.md", ""),
+                ("vendor/v.ts", ""),
+            ],
+        );
+        let opts = Options { exclude: vec!["vendor/**".into()], ..Default::default() };
+        let s = Session::new(&t.0, &t.path("src"), &opts).unwrap();
+        let eligible = |rel: &str| s.eligible(&t.path(rel));
+        assert!(eligible("src/a.ts"));
+        for rel in ["src/x.gen.ts", "dist/out.ts", ".hidden/h.ts", "node_modules/p/index.ts", "src/readme.md", "src/missing.ts"] {
+            assert!(!eligible(rel), "{rel}");
+        }
+        // Outside the scanned directory, or excluded by a glob.
+        let whole = Session::new(&t.0, &t.0, &opts).unwrap();
+        assert!(!s.eligible(&t.path("vendor/v.ts")) && !whole.eligible(&t.path("vendor/v.ts")));
+        assert!(whole.eligible(&t.path("src/a.ts")) && !whole.eligible(&t.path("dist/out.ts")));
+    }
+
+    #[test]
+    fn member_dirs() {
+        let t = Tmp::new("member-dirs", &[("src/a/b.ts", ""), (".next/package.json", "{}")]);
+        let s = t.session();
+        assert!(s.is_member_dir(&t.0) && s.is_member_dir(&t.path("src")) && s.is_member_dir(&t.path("src/a")));
+        assert!(!s.is_member_dir(&t.path(".next")) && !s.is_member_dir(&t.path("src/a/b")));
     }
 }
