@@ -4,9 +4,9 @@
 //   node scripts/npm-packages.mjs <version> <binaries-dir> <out-dir>
 //
 // <binaries-dir> holds one directory per Rust target (as in
-// npm/platforms.json), each containing the detangle binary. Writes one
-// platform package per target plus the main package (npm/) to <out-dir>,
-// all at <version>.
+// npm/platforms.json), each containing the detangle binary and the ESLint
+// add-on (detangle.node). Writes one platform package per target plus the
+// main package (npm/) to <out-dir>, all at <version>.
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -30,21 +30,25 @@ for (const p of platforms) {
   fs.mkdirSync(path.join(dir, "bin"), { recursive: true });
   fs.copyFileSync(from, path.join(dir, "bin", exe));
   fs.chmodSync(path.join(dir, "bin", exe), 0o755);
+  // The add-on sits next to bin/ (npm/native.js loads <package>/detangle.node).
+  const addon = path.join(binaries, p.target, "detangle.node");
+  if (!fs.existsSync(addon)) throw new Error(`missing add-on for ${p.target}: ${addon}`);
+  fs.copyFileSync(addon, path.join(dir, "detangle.node"));
   for (const l of licenses) fs.copyFileSync(path.join(root, l), path.join(dir, l));
   const pkg = {
     name: p.package,
     version,
-    description: `The detangle binary for ${p.os} ${p.cpu}${p.libc ? ` (${p.libc})` : ""}. Install \`detangle\` instead.`,
+    description: `The detangle binary and ESLint add-on for ${p.os} ${p.cpu}${p.libc ? ` (${p.libc})` : ""}. Install \`detangle\` instead.`,
     license: main.license,
     repository: main.repository,
     os: [p.os],
     cpu: [p.cpu],
     ...(p.libc ? { libc: [p.libc] } : {}),
-    files: ["bin", ...licenses],
+    files: ["bin", "detangle.node", ...licenses],
     preferUnplugged: true,
   };
   fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify(pkg, null, 2) + "\n");
-  fs.writeFileSync(path.join(dir, "README.md"), `# ${p.package}\n\nThe \`detangle\` binary for ${p.os} ${p.cpu}${p.libc ? ` (${p.libc})` : ""}. Install [\`detangle\`](https://www.npmjs.com/package/detangle) instead; npm picks this package automatically.\n`);
+  fs.writeFileSync(path.join(dir, "README.md"), `# ${p.package}\n\nThe \`detangle\` binary and ESLint add-on for ${p.os} ${p.cpu}${p.libc ? ` (${p.libc})` : ""}. Install [\`detangle\`](https://www.npmjs.com/package/detangle) instead; npm picks this package automatically.\n`);
 }
 
 const dir = path.join(out, "detangle");
@@ -56,6 +60,8 @@ for (const f of main.files) {
 for (const l of licenses) fs.copyFileSync(path.join(root, l), path.join(dir, l));
 fs.copyFileSync(path.join(root, "README.md"), path.join(dir, "README.md"));
 const pkg = { ...main, version, files: [...main.files, ...licenses] };
+// Only for developing the package (its tests).
+delete pkg.devDependencies;
 pkg.optionalDependencies = Object.fromEntries(platforms.map((p) => [p.package, version]));
 fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify(pkg, null, 2) + "\n");
 console.log(`wrote ${platforms.length + 1} packages to ${out}`);

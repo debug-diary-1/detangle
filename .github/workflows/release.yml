@@ -1,8 +1,12 @@
 name: Release
 
 # Push a tag like v0.1.0 (matching Cargo.toml and npm/package.json) to build
-# binaries for every platform and publish them to GitHub Releases, npm,
-# crates.io and the Homebrew tap.
+# binaries and ESLint add-ons for every platform and publish them to GitHub
+# Releases, npm, crates.io and the Homebrew tap.
+#
+# Run it by hand (workflow_dispatch) for a dry run: it builds and
+# smoke-tests everything and uploads the artifacts, and publishes nothing
+# (every publishing job runs for tags only).
 #
 # npm and crates.io use trusted publishing (OIDC): no registry tokens are
 # stored here. On npmjs.com (each of detangle and detangle-*) and on crates.io
@@ -16,6 +20,7 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -29,9 +34,11 @@ jobs:
       - uses: actions/checkout@v4
       - id: v
         run: |
-          tag="${GITHUB_REF_NAME#v}"
           cargo=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
           npm=$(node -p 'require("./npm/package.json").version')
+          # A dry run (not a tag) builds whatever version the files say.
+          tag="$cargo"
+          [ "$GITHUB_REF_TYPE" = tag ] && tag="${GITHUB_REF_NAME#v}"
           if [ "$tag" != "$cargo" ] || [ "$tag" != "$npm" ]; then
             echo "::error::tag $tag, Cargo.toml $cargo and npm/package.json $npm must match"
             exit 1
@@ -65,6 +72,14 @@ jobs:
       - if: matrix.musl
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - run: cargo build --locked --profile dist --target ${{ matrix.target }}
+      # The add-on is loaded into Node, a dynamically linked process, so on
+      # musl it links the C runtime dynamically; only this step says so, and
+      # the CLI binary above stays static.
+      - name: Build the ESLint add-on
+        shell: bash
+        run: |
+          if [ "${{ matrix.musl }}" = true ]; then export RUSTFLAGS="-C target-feature=-crt-static"; fi
+          cargo build --locked --profile dist -p detangle-napi --target "$TARGET"
       - name: Package
         shell: bash
         run: |
@@ -73,16 +88,38 @@ jobs:
           mkdir -p "dist/$name" "bin/$TARGET"
           cp "target/$TARGET/dist/$exe" "dist/$name/"
           cp "target/$TARGET/dist/$exe" "bin/$TARGET/"
+          case "$TARGET" in
+            *windows*) lib=detangle_napi.dll ;;
+            *apple*) lib=libdetangle_napi.dylib ;;
+            *) lib=libdetangle_napi.so ;;
+          esac
+          cp "target/$TARGET/dist/$lib" "bin/$TARGET/detangle.node"
           cp README.md LICENSE-MIT LICENSE-APACHE "dist/$name/"
           cd dist
           if [[ "$exe" == *.exe ]]; then 7z a -tzip "$name.zip" "$name" >/dev/null; else tar czf "$name.tar.gz" "$name"; fi
           rm -r "$name"
+      - if: matrix.musl
+        name: The CLI binary is still static
+        run: |
+          file "bin/$TARGET/detangle"
+          file "bin/$TARGET/detangle" | grep -Eq 'statically linked|static-pie linked'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # x86_64 macOS is built on an arm64 runner, so neither runs here.
       - name: Smoke test
         if: ${{ !contains(matrix.target, 'x86_64-apple') }}
         shell: bash
         run: |
           exe=detangle; [[ "$TARGET" == *windows* ]] && exe=detangle.exe
           "./bin/$TARGET/$exe" --version
+          load='const a = require(process.argv[1]); if (typeof a.open !== "function") throw new Error("no open export"); console.log("add-on loads:", Object.keys(a).join(", "))'
+          if [ "${{ matrix.musl }}" = true ]; then
+            # A glibc Node can't load a musl add-on.
+            docker run --rm -v "$PWD:/w" -w /w node:22-alpine node -e "$load" "/w/bin/$TARGET/detangle.node"
+          else
+            node -e "$load" "$PWD/bin/$TARGET/detangle.node"
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: build-${{ matrix.target }}
@@ -92,6 +129,7 @@ jobs:
 
   github-release:
     needs: [version, build]
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -107,6 +145,7 @@ jobs:
 
   npm:
     needs: [version, github-release]
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -149,6 +188,7 @@ jobs:
 
   crates:
     needs: [version, github-release]
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -174,6 +214,7 @@ jobs:
 
   homebrew:
     needs: [version, github-release]
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

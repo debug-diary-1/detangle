@@ -26,8 +26,23 @@ jobs:
         with:
           node-version: 22
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo clippy -p detangle-napi --features test-hooks --locked -- -D warnings
       - run: cargo test --locked --no-fail-fast
+      # The ESLint rules: the add-on (with its test hooks) driven by real
+      # ESLint 10 and 9, checked against the CLI built by `cargo test`.
+      - run: cargo build --locked -p detangle-napi --features test-hooks
+      - run: npm ci
+        working-directory: npm
+      - name: ESLint tests
+        shell: bash
+        run: |
+          case "$RUNNER_OS" in
+            Linux) addon=libdetangle_napi.so bin=detangle ;;
+            macOS) addon=libdetangle_napi.dylib bin=detangle ;;
+            Windows) addon=detangle_napi.dll bin=detangle.exe ;;
+          esac
+          DETANGLE_ADDON="target/debug/$addon" DETANGLE_BIN="target/debug/$bin" node --test npm/eslint.test.mjs
 
   msrv:
     name: minimum Rust (Cargo.toml rust-version)
@@ -40,6 +55,15 @@ jobs:
       # What `cargo install detangle` does: no lockfile, newest compatible
       # dependencies whatever their rust-version. Fails when a dependency
       # release needs a newer Rust than we declare.
+      # What crates.io gets: the packaged crate (no [workspace], no add-on)
+      # must build on its own.
+      - name: Package the crate and build it alone
+        run: |
+          cargo package --locked
+          mkdir "$RUNNER_TEMP/crate"
+          tar xzf target/package/detangle-*.crate -C "$RUNNER_TEMP/crate"
+          cd "$RUNNER_TEMP"/crate/detangle-*/
+          CARGO_TARGET_DIR="$RUNNER_TEMP/crate-target" cargo build --locked
       - name: Build like cargo install (no lockfile, newest dependencies)
         env:
           CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS: allow
@@ -55,11 +79,11 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      # Every platform package gets a stand-in binary: this checks the
-      # packaging script and manifests, not the binaries themselves.
+      # Every platform package gets a stand-in binary and add-on: this checks
+      # the packaging script and manifests, not the binaries themselves.
       - run: |
           for t in $(node -p 'require("./npm/platforms.json").map(p => p.target + (p.os === "win32" ? "/detangle.exe" : "/detangle")).join(" ")'); do
-            mkdir -p "bins/$(dirname "$t")" && echo stub > "bins/$t"
+            mkdir -p "bins/$(dirname "$t")" && echo stub > "bins/$t" && echo stub > "bins/$(dirname "$t")/detangle.node"
           done
           node scripts/npm-packages.mjs 0.0.0-ci bins npm-dist
           for d in npm-dist/*/; do (cd "$d" && npm pack --dry-run >/dev/null); done

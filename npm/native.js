@@ -29,7 +29,8 @@ function load() {
     // any one-shot CLI) when the process exits.
     addon.init(isMainThread);
   } catch (e) {
-    unavailable = `detangle add-on unavailable: ${e.message}; run \`detangle check\``;
+    // One line: Windows' loader errors span two.
+    unavailable = `detangle add-on unavailable: ${String(e.message).replace(/\s+/g, " ").trim()}; run \`detangle check\``;
   }
   return addon;
 }

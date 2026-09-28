@@ -21,7 +21,9 @@ test-hooks = ["detangle/test-hooks"]
 [dependencies]
 detangle = { path = ".." }
 # Node-API 8: Node 12.22+, well below what ESLint 9 and 10 need.
-napi = { version = "3.13.0", default-features = false, features = ["napi8"] }
+# dyn-symbols: Node's symbols are looked up at load time, so nothing links
+# against node.lib (Windows).
+napi = { version = "3.13.0", default-features = false, features = ["napi8", "dyn-symbols"] }
 napi-derive = "3.6.9"
 dunce = "1.0.5"
 mimalloc = "0.1.52"

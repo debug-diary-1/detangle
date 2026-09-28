@@ -601,20 +601,20 @@ test("a worker's projects are torn down with it, and the process exits promptly"
     import { Worker } from "node:worker_threads";
     const started = Date.now();
     const worker = new Worker(\`
-      const { parentPort } = require("node:worker_threads");
+      const { parentPort, workerData } = require("node:worker_threads");
       const { ESLint } = require("eslint");
       const tseslint = require("typescript-eslint");
       const detangle = require("./eslint.js");
       (async () => {
         const eslint = new ESLint({
-          cwd: ${JSON.stringify(conditions)},
+          cwd: workerData,
           overrideConfigFile: true,
           overrideConfig: [{ files: ["**/*.ts"], languageOptions: { parser: tseslint.parser } }, detangle.configs.recommended],
         });
         const results = await eslint.lintFiles(["src/**/*.ts"]);
         parentPort.postMessage(results.reduce((n, r) => n + r.messages.length, 0));
       })();
-    \`, { eval: true, execArgv: [] });
+    \`, { eval: true, execArgv: [], workerData: ${JSON.stringify(conditions)} });
     const reports = await new Promise((resolve, reject) => { worker.once("message", resolve); worker.once("error", reject); });
     await worker.terminate();
     console.log(JSON.stringify({ reports, ms: Date.now() - started }));
@@ -636,4 +636,23 @@ test("on Windows, a path differing only in case is the same file", { skip: proce
   const exact = await lintAt("src/app.ts");
   assert.ok(exact.length > 0);
   assert.deepEqual(await lintAt("SRC/app.ts"), exact);
+});
+
+test("watcher setup time on this OS (logged)", needsHooks, async (t) => {
+  // The checkout's root, npm/node_modules included: thousands of
+  // directories, like a real project. Watcher setup runs on its own thread,
+  // picked up by the first lint after it's done.
+  const root = fileURLToPath(new URL("..", import.meta.url));
+  const file = path.join(root, "npm/eslint.js");
+  const started = performance.now();
+  const handle = native.addon().open(root, { mode: "watcher-timing" });
+  const opened = performance.now() - started;
+  while (!handle.__stats().watching) {
+    handle.violationsFor(file, "");
+    assert.ok(performance.now() - started < 30_000, "the watcher never started");
+    await new Promise((r) => setTimeout(r, 1));
+  }
+  const ready = performance.now() - started;
+  t.diagnostic(`${process.platform}: open (scan) ${opened.toFixed(0)} ms; watcher ready ${ready.toFixed(0)} ms after the open began`);
+  handle.close();
 });
