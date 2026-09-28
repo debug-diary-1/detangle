@@ -105,6 +105,8 @@ pub struct Live {
     /// One-time notices for the user (the watcher failed or stopped).
     warnings: Vec<String>,
     retry_floor: Duration,
+    /// Frees replaced analyses and projects off the linting thread.
+    dropper: Dropper,
     pub stats: Stats,
     /// Changes a test hands to the next drain, as if the watcher saw them.
     #[cfg(test)]
@@ -134,6 +136,7 @@ impl Live {
             rejected: HashSet::new(),
             warnings: Vec::new(),
             retry_floor: Duration::from_secs(30),
+            dropper: Dropper::new(),
             stats: Stats::default(),
             #[cfg(test)]
             injected: None,
@@ -272,7 +275,8 @@ impl Live {
         }
         let l = self.loaded().expect("loaded");
         if dirty {
-            l.analysis = l.project.analyze()?;
+            let old = std::mem::replace(&mut l.analysis, l.project.analyze()?);
+            self.dropper.drop_later(old);
             self.stats.analyses += 1;
         }
         let l = self.loaded().expect("loaded");
@@ -286,6 +290,11 @@ impl Live {
         self.stats.open_attempts += 1;
         let (dir, config, mode) = (&self.dir, self.config.as_deref(), self.mode.as_deref());
         let result = catch_unwind(AssertUnwindSafe(|| -> Result<Loaded> {
+            if let Ok(d) = dunce::canonicalize(dir)
+                && let Some(why) = refusal(&config::find_root(&d), std::env::home_dir().as_deref())
+            {
+                anyhow::bail!(why);
+            }
             let project = Project::open(dir, config, mode, &CacheArgs::default())?;
             let analysis = project.analyze()?;
             Ok(Loaded { project, analysis })
@@ -304,6 +313,9 @@ impl Live {
         };
         match result {
             Ok(Ok(loaded)) => {
+                if let Some(old) = had {
+                    self.dropper.drop_later(old);
+                }
                 self.state = State::Ready(Box::new(loaded));
                 self.rejected.clear();
                 self.stats.opens += 1;
@@ -411,6 +423,60 @@ impl Live {
         }
         session.admit(file)?;
         Ok(if session.contains(file) { Member::Admitted } else { Member::No })
+    }
+}
+
+impl Drop for Live {
+    fn drop(&mut self) {
+        // Don't leave a watcher being set up behind (at most its setup
+        // time); the dropper joins its thread when it's dropped next.
+        if let Watch::Starting(h) = std::mem::replace(&mut self.watch, Watch::Off) {
+            let _ = h.join();
+        }
+    }
+}
+
+/// Why a project rooted at `root` is refused: the filesystem root, or the
+/// home directory or one of its ancestors (reached through a stray
+/// package.json, say), would be a scan of everything the user has.
+fn refusal(root: &Path, home: Option<&Path>) -> Option<String> {
+    let home = home.map(|h| dunce::canonicalize(h).unwrap_or_else(|_| h.to_path_buf()));
+    let refused = root.parent().is_none() || home.is_some_and(|h| h.starts_with(root));
+    refused.then(|| format!("refusing to scan {}; set the \"dir\" option", root.display()))
+}
+
+/// Frees values on its own thread: a replaced analysis or project can take
+/// tens of ms to free (VS Code's graph: ~20 ms), which a lint shouldn't wait
+/// for. Dropping the Dropper joins its thread after the queue is empty.
+struct Dropper {
+    tx: Option<std::sync::mpsc::Sender<Box<dyn Send>>>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Dropper {
+    fn new() -> Dropper {
+        let (tx, rx) = std::sync::mpsc::channel::<Box<dyn Send>>();
+        match std::thread::Builder::new().name("detangle-dropper".into()).spawn(move || rx.into_iter().for_each(drop)) {
+            Ok(t) => Dropper { tx: Some(tx), thread: Some(t) },
+            Err(_) => Dropper { tx: None, thread: None },
+        }
+    }
+
+    /// Frees `v` on the dropper thread, or here if there isn't one.
+    fn drop_later<T: Send + 'static>(&self, v: T) {
+        if let Some(tx) = &self.tx {
+            // On failure the value comes back in the error and is dropped here.
+            let _ = tx.send(Box::new(v));
+        }
+    }
+}
+
+impl Drop for Dropper {
+    fn drop(&mut self) {
+        self.tx.take();
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
     }
 }
 
@@ -708,6 +774,31 @@ to = { path = '^src/legacy/' }
         assert_eq!(rules(&mut l, &t, "src/new.ts", "import './legacy/old';"), ["no-legacy"]);
         assert_eq!(rules(&mut l, &t, "src/b.ts", "import './legacy/old';"), ["no-legacy"]);
         assert_eq!(l.stats.analyses, 2);
+    }
+
+    #[test]
+    fn refuses_the_filesystem_root_and_home() {
+        let home = std::env::temp_dir().join("detangle-refusal-home");
+        std::fs::create_dir_all(home.join("projects/app")).unwrap();
+        let home = dunce::canonicalize(&home).unwrap();
+        let root = Path::new(if cfg!(windows) { "C:\\" } else { "/" });
+        assert!(refusal(root, Some(&home)).unwrap().starts_with("refusing to scan"));
+        assert!(refusal(&home, Some(&home)).is_some());
+        assert!(refusal(home.parent().unwrap(), Some(&home)).is_some());
+        assert_eq!(refusal(&home.join("projects/app"), Some(&home)), None);
+        assert_eq!(refusal(&home.join("projects/app"), None), None);
+    }
+
+    #[test]
+    fn replaced_analyses_are_freed_elsewhere() {
+        let t = project("dropper");
+        let mut l = open(&t);
+        let main = std::thread::current().id();
+        rules(&mut l, &t, "src/a.ts", "import './legacy/old';");
+        // The dropper thread is alive and isn't this one.
+        let dropper = l.dropper.thread.as_ref().unwrap().thread().id();
+        assert_ne!(dropper, main);
+        drop(l);
     }
 
     /// With the real watcher: a saved change to another file is seen at the
