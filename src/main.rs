@@ -1,16 +1,3 @@
-mod aliases;
-mod config;
-mod dotenv;
-mod graph;
-mod groups;
-mod migrate;
-mod report;
-mod rules;
-mod scan;
-mod sfc;
-mod tui;
-mod watch;
-
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -18,10 +5,10 @@ use std::process::ExitCode;
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
-use crate::config::Config;
-use crate::graph::{Graph, ModuleKind};
-use crate::report::Paint;
-use crate::rules::Violation;
+use detangle::config::{self, Config};
+use detangle::graph::ModuleKind;
+use detangle::report::{self, Paint};
+use detangle::{Analysis, CacheArgs, Project, migrate, rules, timing, tui, watch};
 
 // Parsing and graph building allocate heavily from many threads, where
 // mimalloc is much faster than the system allocator (notably on macOS).
@@ -47,9 +34,6 @@ struct Cli {
     #[arg(long, global = true, value_enum)]
     cache_strategy: Option<config::CacheStrategy>,
 }
-
-/// `--cache` / `--cache-strategy`, applied to every project opened.
-static CACHE_ARGS: std::sync::OnceLock<(Option<Option<PathBuf>>, Option<config::CacheStrategy>)> = std::sync::OnceLock::new();
 
 #[derive(Args, Clone)]
 struct Target {
@@ -240,136 +224,9 @@ enum GraphFormat {
     Csv,
 }
 
-pub struct Analysis {
-    pub graph: Graph,
-    /// Violations, minus those in the configured baseline.
-    pub violations: Vec<Violation>,
-    pub config_path: Option<PathBuf>,
-    /// How many violations the baseline suppressed.
-    pub suppressed: usize,
-    /// Baseline entries that no longer occur.
-    pub stale: Vec<rules::BaselineEntry>,
-}
-
-/// A loaded project whose scan can be kept up to date incrementally.
-pub struct Project {
-    dir: PathBuf,
-    root: PathBuf,
-    config_arg: Option<PathBuf>,
-    mode_arg: Option<String>,
-    cfg: Config,
-    config_path: Option<PathBuf>,
-    /// Notes from loading the config (e.g. JavaScript config import warnings).
-    notes: Vec<String>,
-    /// `[[groups]]` and discovered Nx projects.
-    groups: Vec<groups::Group>,
-    session: scan::Session,
-}
-
-impl Project {
-    fn open(path: &Path, config: Option<&Path>, mode: Option<&str>) -> Result<Self> {
-        let dir = dunce::canonicalize(path).with_context(|| format!("{} not found", path.display()))?;
-        if !dir.is_dir() {
-            bail!("{} is not a directory", path.display());
-        }
-        let root = config::find_root(&dir);
-        let t = std::time::Instant::now();
-        let loaded = config::load(&root, config)?;
-        let mut cfg: Config = loaded.config;
-        if let Some(m) = mode {
-            cfg.options.config_env.mode = Some(m.to_string());
-        }
-        if let Some((cache, strategy)) = CACHE_ARGS.get() {
-            match cache {
-                Some(Some(d)) => cfg.options.cache = config::CacheSetting::Dir(std::path::absolute(d)?.to_string_lossy().into_owned()),
-                Some(None) => cfg.options.cache = config::CacheSetting::Enabled(true),
-                None => {}
-            }
-            if let Some(s) = strategy {
-                cfg.options.cache_strategy = *s;
-            }
-        }
-        rules::validate(&cfg).with_context(|| match &loaded.path {
-            Some(p) => format!("in {}", p.display()),
-            None => "in the built-in rules".into(),
-        })?;
-        timing("config", t);
-        let t = std::time::Instant::now();
-        let session = scan::Session::new(&root, &dir, &cfg.options)?;
-        timing("scan", t);
-        let t = std::time::Instant::now();
-        let groups = groups::resolve(&root, &cfg)?;
-        timing("groups", t);
-        Ok(Project {
-            groups,
-            dir,
-            root,
-            config_arg: config.map(Path::to_path_buf),
-            mode_arg: mode.map(String::from),
-            cfg,
-            config_path: loaded.path,
-            notes: loaded.notes,
-            session,
-        })
-    }
-
-    fn analyze(&self) -> Result<Analysis> {
-        self.analyze_with(true)
-    }
-
-    /// The configured baseline file, if any (it may not exist yet).
-    fn baseline_path(&self) -> Option<PathBuf> {
-        self.cfg.options.baseline.as_ref().map(|b| self.root.join(b))
-    }
-
-    fn analyze_with(&self, use_baseline: bool) -> Result<Analysis> {
-        let t = std::time::Instant::now();
-        let mut graph = Graph::build(&self.root, self.session.files(), self.session.work, &self.cfg.options);
-        graph.assign_groups(&self.groups, self.cfg.options.group_match == config::GroupMatch::Deepest);
-        timing("graph", t);
-        let t = std::time::Instant::now();
-        let mut violations = rules::evaluate(&graph, &self.cfg)?;
-        timing("rules", t);
-        let used = match self.baseline_path().filter(|p| use_baseline && p.is_file()) {
-            Some(p) => rules::apply_baseline(&graph, &mut violations, &p)?,
-            None => Default::default(),
-        };
-        Ok(Analysis { graph, violations, config_path: self.config_path.clone(), suppressed: used.suppressed, stale: used.stale })
-    }
-
-    /// Applies filesystem changes and re-analyses. Returns the new analysis
-    /// and a one-line description of the work done. On error (e.g. a
-    /// half-edited detangle.toml) the previous state is kept.
-    /// Returns `None` for the analysis when it can't have changed: the edited
-    /// files still import exactly what they did (the common case of editing
-    /// code rather than imports).
-    fn rebuild(&mut self, changes: &watch::Changes) -> Result<(Option<Analysis>, String)> {
-        let t = std::time::Instant::now();
-        if changes.config {
-            *self = Project::open(&self.dir, self.config_arg.as_deref(), self.mode_arg.as_deref())?;
-        } else {
-            self.session.update(&changes.paths.iter().cloned().collect::<Vec<_>>())?;
-        }
-        let w = self.session.work;
-        let a = if w.graph_changed { Some(self.analyze()?) } else { None };
-        let work = if changes.config {
-            format!("full rebuild of {} files", w.reparsed)
-        } else if w.walked && w.reresolved > w.reparsed {
-            format!("{} reparsed, all re-resolved", w.reparsed)
-        } else if a.is_none() {
-            report::plural(w.reparsed, "file") + " reparsed, imports unchanged"
-        } else {
-            report::plural(w.reparsed, "file") + " reparsed"
-        };
-        let ms = t.elapsed().as_secs_f64() * 1000.0;
-        let what = if changes.paths.is_empty() { String::new() } else { format!("{} · ", changes.describe(&self.root)) };
-        Ok((a, format!("↻ {what}{work} · {ms:.0}ms")))
-    }
-}
-
 /// Analyses a project for a command that exits afterwards.
-fn analyze(path: &Path, config: Option<&Path>, mode: Option<&str>) -> Result<&'static mut Analysis> {
-    let project = one_shot(Project::open(path, config, mode)?.announce());
+fn analyze(path: &Path, config: Option<&Path>, mode: Option<&str>, cache: &CacheArgs) -> Result<&'static mut Analysis> {
+    let project = one_shot(announce(Project::open(path, config, mode, cache)?));
     Ok(one_shot(project.analyze()?))
 }
 
@@ -381,23 +238,13 @@ fn one_shot<T>(v: T) -> &'static mut T {
     Box::leak(Box::new(v))
 }
 
-impl Project {
-    /// Prints config notes (once) to stderr.
-    fn announce(self) -> Self {
-        let p = Paint::stderr();
-        for n in &self.notes {
-            eprintln!("{}", p.dim(&format!("note: {n}")));
-        }
-        self
+/// Prints a project's config notes to stderr.
+fn announce(project: Project) -> Project {
+    let p = Paint::stderr();
+    for n in project.notes() {
+        eprintln!("{}", p.dim(&format!("note: {n}")));
     }
-}
-
-/// With `DETANGLE_TIMINGS` set, prints how long a phase took to stderr.
-pub fn timing(phase: &str, t: std::time::Instant) {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var_os("DETANGLE_TIMINGS").is_some());
-    if *ON {
-        eprintln!("{phase:>8} {:7.1}ms", t.elapsed().as_secs_f64() * 1000.0);
-    }
+    project
 }
 
 fn main() -> ExitCode {
@@ -419,16 +266,16 @@ fn main_inner() -> ExitCode {
 
 fn run() -> Result<ExitCode> {
     let cli = Cli::parse();
-    let _ = CACHE_ARGS.set((cli.cache.clone(), cli.cache_strategy));
+    let cache = CacheArgs { cache: cli.cache, strategy: cli.cache_strategy };
     let p = Paint::stdout();
     match cli.cmd.unwrap_or(Cmd::Tui { target: cli.target, no_watch: false }) {
         Cmd::Tui { target: t, no_watch } => {
             if !std::io::stdout().is_terminal() {
                 bail!("the explorer needs a terminal; try `detangle check` or `detangle stats`");
             }
-            let mut project = Project::open(&t.path, t.config.as_deref(), t.mode.as_deref())?.announce();
+            let mut project = announce(Project::open(&t.path, t.config.as_deref(), t.mode.as_deref(), &cache)?);
             let a = project.analyze()?;
-            let watcher = if no_watch { None } else { watch::Watcher::new(&project.root).ok() };
+            let watcher = if no_watch { None } else { watch::Watcher::new(project.root()).ok() };
             tui::run(a, |changes| project.rebuild(changes), watcher)?;
         }
         Cmd::Watch { target: t } => {
@@ -444,7 +291,7 @@ fn run() -> Result<ExitCode> {
                 // after a config error) try a full open.
                 let result = match project.as_mut() {
                     Some(p) => p.rebuild(&changes).map(|(a, s)| (a, Some(s))),
-                    None => Project::open(&t.path, t.config.as_deref(), t.mode.as_deref()).and_then(|p| {
+                    None => Project::open(&t.path, t.config.as_deref(), t.mode.as_deref(), &cache).and_then(|p| {
                         let a = p.analyze()?;
                         project = Some(p);
                         Ok((Some(a), None))
@@ -470,7 +317,7 @@ fn run() -> Result<ExitCode> {
             }
         }
         Cmd::Check { target, format, strict, baseline, write_baseline, baseline_mode } => {
-            let project = one_shot(Project::open(&target.path, target.config.as_deref(), target.mode.as_deref())?.announce());
+            let project = one_shot(announce(Project::open(&target.path, target.config.as_deref(), target.mode.as_deref(), &cache)?));
             if let Some(path) = write_baseline {
                 let path = path.or_else(|| project.baseline_path()).unwrap_or_else(|| PathBuf::from(".detangle-baseline.json"));
                 let a = one_shot(project.analyze_with(false)?);
@@ -485,7 +332,7 @@ fn run() -> Result<ExitCode> {
                 suppressed += used.suppressed;
                 a.stale.extend(used.stale);
             }
-            let stale = report::Stale { entries: &a.stale, severity: project.cfg.options.baseline_stale };
+            let stale = report::Stale { entries: &a.stale, severity: project.config().options.baseline_stale };
             let (g, vs) = (&a.graph, &a.violations);
             match format {
                 CheckFormat::Text => print!("{}", report::text(g, vs, suppressed, &stale)),
@@ -510,7 +357,7 @@ fn run() -> Result<ExitCode> {
             return Ok(if failing { ExitCode::FAILURE } else { ExitCode::SUCCESS });
         }
         Cmd::Graph { target, format, collapse, focus, focus_depth, reaches, highlight, from, max_depth, externals, no_types, output } => {
-            let a = analyze(&target.path, target.config.as_deref(), target.mode.as_deref())?;
+            let a = analyze(&target.path, target.config.as_deref(), target.mode.as_deref(), &cache)?;
             let re = |r: Option<String>, what: &str| {
                 r.map(|r| regex::Regex::new(&r).with_context(|| format!("--{what}: invalid regex {r:?}"))).transpose()
             };
@@ -544,7 +391,7 @@ fn run() -> Result<ExitCode> {
             }
         }
         Cmd::Why { from, to, dir, config, mode } => {
-            let a = analyze(&dir, config.as_deref(), mode.as_deref())?;
+            let a = analyze(&dir, config.as_deref(), mode.as_deref(), &cache)?;
             let g = &a.graph;
             let (f, t) = (g.lookup(&from).map_err(anyhow::Error::msg)?, g.lookup(&to).map_err(anyhow::Error::msg)?);
             match g.path_between(f, t, false) {
@@ -570,7 +417,7 @@ fn run() -> Result<ExitCode> {
             }
         }
         Cmd::Affected { files, since, dir, config, mode, filter } => {
-            let a = analyze(&dir, config.as_deref(), mode.as_deref())?;
+            let a = analyze(&dir, config.as_deref(), mode.as_deref(), &cache)?;
             let g = &a.graph;
             let mut changed = files;
             if let Some(r) = since {
@@ -603,7 +450,7 @@ fn run() -> Result<ExitCode> {
             eprintln!("{}", p.dim(&format!("{} changed → {} affected", starts.len(), hit.len())));
         }
         Cmd::Report { target, output, open } => {
-            let a = analyze(&target.path, target.config.as_deref(), target.mode.as_deref())?;
+            let a = analyze(&target.path, target.config.as_deref(), target.mode.as_deref(), &cache)?;
             let html = report::html(&a.graph, &a.violations, a.config_path.as_deref());
             std::fs::write(&output, &html).with_context(|| format!("writing {}", output.display()))?;
             let (e, w, i) = report::counts(&a.violations);
@@ -620,7 +467,7 @@ fn run() -> Result<ExitCode> {
             }
         }
         Cmd::Stats { target, top } => {
-            let a = analyze(&target.path, target.config.as_deref(), target.mode.as_deref())?;
+            let a = analyze(&target.path, target.config.as_deref(), target.mode.as_deref(), &cache)?;
             print!("{}", report::stats(&a.graph, &a.violations, top));
         }
         Cmd::Migrate { path, dry_run, force } => {
@@ -687,7 +534,7 @@ fn run() -> Result<ExitCode> {
             }
             println!("{} {}", p.green("wrote"), out.display());
             // Show where things stand right away.
-            let a = one_shot(one_shot(Project::open(&root, None, None)?).analyze()?);
+            let a = one_shot(one_shot(Project::open(&root, None, None, &cache)?).analyze()?);
             let (err, warn, info) = report::counts(&a.violations);
             println!(
                 "{} {err} errors, {warn} warnings, {info} info{} — see them with `detangle check` or `detangle report --open`",

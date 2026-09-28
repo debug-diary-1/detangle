@@ -13,6 +13,18 @@ categories = ["development-tools", "command-line-utilities"]
 # Keep the published crate to what builds the binary.
 include = ["src/**/*", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE-MIT", "LICENSE-APACHE"]
 
+# The crate is also a library (src/lib.rs), an internal API shared with the
+# Node.js add-on. The binary has no docs of its own; its name matches the
+# library's, which would otherwise collide in `cargo doc`.
+[[bin]]
+name = "detangle"
+path = "src/main.rs"
+doc = false
+
+# The root of a workspace, so the add-on can be a member. `cargo package`
+# drops this table, so the published crate builds on its own.
+[workspace]
+
 [dependencies]
 anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive"] }
