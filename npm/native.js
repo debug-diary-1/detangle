@@ -75,7 +75,10 @@ function call(key, dir, config, mode, context) {
     projects.set(key, project);
   }
   stats.calls++;
-  return project.violationsFor(context.filename, context.sourceCode.text);
+  const result = project.violationsFor(context.filename, context.sourceCode.text);
+  // One-time notices (e.g. no file watcher); results are still right.
+  for (const w of project.takeWarnings()) process.emitWarning(w, "DetangleWarning");
+  return result;
 }
 
 module.exports = { violationsFor, stats };

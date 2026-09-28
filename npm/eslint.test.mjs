@@ -297,22 +297,21 @@ test("a project reached through a symlink reports the same", async () => {
   }
 });
 
-// Node matching, one form at a time. The add-on reads the files on disk, so
-// src/app.ts has its no-legacy violation on "./legacy/old" whatever the
-// linted text is; these check which nodes of that text carry it.
+// Node matching, one form at a time, by linting text as src/app.ts of the
+// eslint fixture: the buffer is the file's contents, so each text below
+// imports src/legacy/old.ts only through the form under test. The tests
+// use a project of their own (a distinct `mode`), so their buffers don't
+// affect other tests.
 const eslintFixture = path.join(fixtures, "eslint");
 const legacy = "no-legacy: src/app.ts → src/legacy/old.ts — Use the new API";
 
-async function lintText(code) {
+async function lintText(code, { file = "src/app.ts", mode = "node-matching", rules = { "detangle/errors": ["error", { mode }] } } = {}) {
   const eslint = new ESLint10({
     cwd: eslintFixture,
     overrideConfigFile: true,
-    overrideConfig: [
-      { files: ["**/*.ts"], languageOptions: { parser: tseslint.parser } },
-      { plugins: { detangle }, rules: { "detangle/errors": "error" } },
-    ],
+    overrideConfig: [{ files: ["**/*.ts"], languageOptions: { parser: tseslint.parser } }, { plugins: { detangle }, rules }],
   });
-  const [r] = await eslint.lintText(code, { filePath: path.join(eslintFixture, "src/app.ts") });
+  const [r] = await eslint.lintText(code, { filePath: path.join(eslintFixture, file) });
   return r.messages.map((m) => {
     assert.equal(m.fatal, undefined, m.message);
     return `${m.line}:${m.column} ${m.message}`;
@@ -339,8 +338,7 @@ for (const [name, code, at] of nodeCases) {
   });
 }
 
-// Forms detangle doesn't resolve either, so no node carries the violation:
-// it goes to line 1, naming the import string.
+// Forms detangle doesn't record as imports: nothing to report.
 const unmatched = [
   ["require(variable)", `const id = "./legacy/old";\nrequire(id);`],
   ["template literal with an expression", "const x = 'old';\nrequire(`./legacy/${x}`);"],
@@ -350,7 +348,7 @@ const unmatched = [
 ];
 for (const [name, code] of unmatched) {
   test(`node matching: never ${name}`, async () => {
-    assert.deepEqual(await lintText(code), [`1:1 ${legacy} [import "./legacy/old"]`]);
+    assert.deepEqual(await lintText(code), []);
   });
 }
 
@@ -359,4 +357,30 @@ test("folder and group violations without an import are shown nowhere", async ()
   assert.ok(cli.includes("orders-folder-unused") && cli.includes("orders-group-unused"));
   const got = await lint(eslintFixture, ["**/*.ts"], recommended({}));
   assert.ok(!got.some((m) => /orders-(folder|group)-unused/.test(m.message)));
+});
+
+test("an unsaved import edit is checked live, and undone live", async () => {
+  const options = { mode: "live-editing" };
+  const rules = { "detangle/errors": ["error", options], "detangle/warnings": ["warn", options] };
+  const lonely = (code) => lintText(code, { file: "src/lonely.ts", rules });
+  const disk = fs.readFileSync(path.join(eslintFixture, "src/lonely.ts"), "utf8");
+  assert.deepEqual(await lonely(disk), ["1:1 no-orphans: src/lonely.ts"]);
+  // Typed, not saved: a forbidden import, and the file is no longer an orphan.
+  assert.deepEqual(await lonely(`import "./legacy/old";\n${disk}`), ["1:8 no-legacy: src/lonely.ts → src/legacy/old.ts — Use the new API"]);
+  assert.deepEqual(await lonely(disk), ["1:1 no-orphans: src/lonely.ts"]);
+});
+
+test("a file created and linted before the watcher reports it is checked", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "detangle-new-file-"));
+  try {
+    fs.cpSync(eslintFixture, dir, { recursive: true });
+    const first = await lint(dir, ["src/app.ts"], recommended({}));
+    assert.ok(first.length > 0);
+    // Straight after, before any watcher event can have been drained.
+    fs.writeFileSync(path.join(dir, "src/fresh.ts"), 'import "./legacy/old";\n');
+    const got = await lint(dir, ["src/fresh.ts"], recommended({}));
+    assert.deepEqual(got.map((m) => `${m.line}:${m.column} ${m.message}`), ["1:8 no-legacy: src/fresh.ts → src/legacy/old.ts — Use the new API"]);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
