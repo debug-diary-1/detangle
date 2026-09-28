@@ -599,6 +599,21 @@ impl Session {
         true
     }
 
+    /// Re-resolves every file with a fresh resolver, from the imports
+    /// already extracted: no walk, no parse. For when installed packages
+    /// changed (a lockfile did), which changes what bare imports resolve to
+    /// but not the files or their imports. Overlays are kept.
+    pub fn refresh_resolution(&mut self) -> Result<()> {
+        let t = Instant::now();
+        let before: Vec<Vec<Import>> = self.files.iter_mut().map(|f| std::mem::take(&mut f.imports)).collect();
+        self.resolver = make_resolver(&self.root, &self.opts)?;
+        self.resolve_all();
+        let changed = self.files.iter().zip(&before).any(|(f, b)| f.imports != *b);
+        let n = self.files.len();
+        self.work = Work { reresolved: n, graph_changed: changed, scan_ms: ms(t), ..Default::default() };
+        Ok(())
+    }
+
     /// Whether `dir` contains a scanned file, at any depth.
     pub fn is_member_dir(&self, dir: &Path) -> bool {
         self.files.iter().any(|f| f.path.starts_with(dir))
@@ -1621,6 +1636,27 @@ export const f = (x) => [module.require("./g"), process.getBuiltinModule("fs"), 
         let whole = Session::new(&t.0, &t.0, &opts).unwrap();
         assert!(!s.eligible(&t.path("vendor/v.ts")) && !whole.eligible(&t.path("vendor/v.ts")));
         assert!(whole.eligible(&t.path("src/a.ts")) && !whole.eligible(&t.path("dist/out.ts")));
+    }
+
+    #[test]
+    fn refresh_resolution_sees_installed_packages() {
+        let t = Tmp::new("refresh", &[("package.json", "{}"), ("src/a.ts", "import 'pkg';")]);
+        let mut s = t.session();
+        let a = t.path("src/a.ts");
+        s.overlay(&a, "import 'pkg'; import 'other';");
+        assert_matches_disk_plus(&s, &t, &[("src/a.ts", "import 'pkg'; import 'other';")]);
+        // `npm install pkg other`.
+        t.write("node_modules/pkg/package.json", r#"{ "name": "pkg", "main": "index.js" }"#);
+        t.write("node_modules/pkg/index.js", "");
+        t.write("node_modules/other/index.js", "");
+        s.refresh_resolution().unwrap();
+        assert!(s.work.graph_changed && !s.work.walked && s.work.reparsed == 0);
+        let targets: Vec<&Target> = s.files()[0].imports.iter().map(|i| &i.target).collect();
+        assert_eq!(targets, [&Target::Npm("pkg".into()), &Target::Npm("other".into())]);
+        // The overlay was kept, and the result is what a fresh scan finds.
+        assert_matches_disk_plus(&s, &t, &[("src/a.ts", "import 'pkg'; import 'other';")]);
+        s.refresh_resolution().unwrap();
+        assert!(!s.work.graph_changed);
     }
 
     #[test]

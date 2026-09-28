@@ -8,8 +8,15 @@ license = "MIT OR Apache-2.0"
 # Shipped as detangle.node inside the npm platform packages, never on crates.io.
 publish = false
 
+# Panics are caught at every export and turned into a line-1 problem, which
+# needs unwinding: never set `panic = "abort"` in any profile.
 [lib]
 crate-type = ["cdylib"]
+
+[features]
+# Hidden exports for the recovery tests (npm/eslint.test.mjs): a text that
+# panics, a watcher switch, a shorter retry floor, step counts.
+test-hooks = ["detangle/test-hooks"]
 
 [dependencies]
 detangle = { path = ".." }

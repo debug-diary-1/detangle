@@ -42,7 +42,7 @@ const projects = new Map();
  */
 const passes = new WeakMap();
 
-/** Add-on calls made, for tests. */
+/** Add-on calls made, for tests (which also use `addon`). */
 const stats = { calls: 0 };
 
 /**
@@ -81,4 +81,4 @@ function call(key, dir, config, mode, context) {
   return result;
 }
 
-module.exports = { violationsFor, stats };
+module.exports = { violationsFor, stats, addon: load, projects };

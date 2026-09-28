@@ -217,6 +217,18 @@ impl Project {
         &self.notes
     }
 
+    /// The files that decide this project's configuration and resolution
+    /// (see `Stamps`), as they are now.
+    pub fn config_stamps(&self) -> crate::stamps::Stamps {
+        let config = self.config_path.as_deref().or(self.config_arg.as_deref());
+        crate::stamps::Stamps::collect(&self.root, config, Some(&self.cfg.options))
+    }
+
+    /// The scanned files' paths.
+    pub fn session_paths(&self) -> std::collections::HashSet<PathBuf> {
+        self.session.files().iter().map(|f| f.path.clone()).collect()
+    }
+
     /// The scan, for callers keeping it up to date themselves (`Live`).
     pub fn session_mut(&mut self) -> &mut scan::Session {
         &mut self.session

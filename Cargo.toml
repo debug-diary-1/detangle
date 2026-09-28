@@ -26,6 +26,11 @@ doc = false
 [workspace]
 members = ["napi"]
 
+[features]
+# Hidden hooks for the add-on's recovery tests (a text that panics); never
+# enabled in releases.
+test-hooks = []
+
 [dependencies]
 anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive"] }
@@ -33,6 +38,8 @@ dunce = "1.0.5"
 fancy-regex = "0.19.2"
 globset = "0.4.20"
 ignore = "0.4.33"
+# Already a dependency of oxc_resolver; reads tsconfig `extends` chains.
+json-strip-comments = "3.1.2"
 mimalloc = "0.1.52"
 notify = "8"
 oxc_allocator = "0.139.0"

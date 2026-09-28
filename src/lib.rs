@@ -16,6 +16,7 @@ pub mod report;
 pub mod rules;
 pub mod scan;
 pub mod sfc;
+pub mod stamps;
 pub mod tui;
 pub mod watch;
 

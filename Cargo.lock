@@ -503,6 +503,7 @@ dependencies = [
  "fancy-regex 0.19.2",
  "globset",
  "ignore",
+ "json-strip-comments",
  "mimalloc",
  "notify",
  "oxc_allocator",

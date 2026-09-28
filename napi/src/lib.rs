@@ -3,7 +3,11 @@
 //! `open(dir, options)` is `detangle check <dir> [--config …] [--mode …]`
 //! kept alive: it returns a handle whose `violationsFor(file, text)` says
 //! what to show in one linted file. JavaScript only matches the returned
-//! import strings to AST nodes.
+//! import strings to AST nodes. The handle's logic is `detangle::live::Live`.
+//!
+//! Every export catches panics (`Live` already does; `catch_unwind` here is
+//! the backstop), so ESLint never sees a throw. That needs `panic = "unwind"`,
+//! the default, in every profile.
 
 use std::path::{Path, PathBuf};
 
@@ -43,65 +47,101 @@ pub struct FileResult {
     pub exotic_require: Vec<String>,
 }
 
-enum State {
-    Ready(Box<Live>),
-    /// The project couldn't be opened.
-    Broken(String),
-}
-
 /// An open project (a handle, in the design's terms): the scan, kept
-/// current by a file watcher and by the buffers it's asked about.
+/// current by polling, a file watcher and the buffers it's asked about.
+/// It never throws: problems come back in `problems` (see `Live`).
 #[napi]
 pub struct Project {
-    state: State,
+    live: Live,
 }
 
 /// Opens the project at `dir` (absolute), scanning it once and starting a
-/// watcher on its root.
-#[napi]
+/// watcher on its root. A project that can't be opened is returned anyway,
+/// reporting why until a config file changes.
+#[napi(catch_unwind)]
 pub fn open(dir: String, options: Option<OpenOptions>) -> Project {
     let options = options.unwrap_or(OpenOptions { config: None, mode: None });
     let config = options.config.map(PathBuf::from);
-    Project {
-        state: match Live::open(Path::new(&dir), config.as_deref(), options.mode.as_deref(), true) {
-            Ok(live) => State::Ready(Box::new(live)),
-            Err(e) => State::Broken(format!("{e:#}")),
-        },
-    }
+    Project { live: Live::open(Path::new(&dir), config.as_deref(), options.mode.as_deref(), hooks::watch()) }
 }
 
 #[napi]
 impl Project {
     /// What to show in `file` (absolute), whose editor buffer holds `text`.
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn violations_for(&mut self, file: String, text: String) -> FileResult {
-        let live = match &mut self.state {
-            State::Ready(live) => live,
-            State::Broken(e) => return FileResult { violations: Vec::new(), problems: vec![format!("detangle: {e}")], exotic_require: Vec::new() },
-        };
-        let (violations, mut problems) = match live.violations_for(&canonical(Path::new(&file)), &text) {
-            Ok(vs) => (vs, Vec::new()),
-            Err(e) => (Vec::new(), vec![format!("detangle: {e:#}")]),
-        };
-        problems.extend(live.problems().into_iter().map(|p| format!("detangle: {p}")));
+        let r = self.live.violations_for(&canonical(Path::new(&file)), &text);
         FileResult {
-            violations: violations
+            violations: r
+                .violations
                 .into_iter()
                 .map(|v| Violation { rule: v.rule, severity: severity(v.severity).into(), message: v.message, specifiers: v.specifiers })
                 .collect(),
-            problems,
-            exotic_require: live.project().config().options.exotic_require.clone(),
+            problems: r.problems,
+            exotic_require: r.exotic_require,
         }
     }
 
     /// One-time notices since the last call (the file watcher failed or
     /// stopped), for `process.emitWarning`.
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn take_warnings(&mut self) -> Vec<String> {
-        match &mut self.state {
-            State::Ready(live) => live.take_warnings(),
-            State::Broken(_) => Vec::new(),
+        self.live.take_warnings()
+    }
+}
+
+/// Test hooks.
+#[cfg(feature = "test-hooks")]
+#[napi]
+impl Project {
+    /// Test hook: the state and step counts.
+    #[napi(js_name = "__stats")]
+    pub fn stats(&self) -> hooks::Stats {
+        let s = self.live.stats;
+        hooks::Stats {
+            state: self.live.state().into(),
+            opens: s.opens as u32,
+            open_attempts: s.open_attempts as u32,
+            analyses: s.analyses as u32,
+            refreshes: s.refreshes as u32,
         }
+    }
+
+    /// Test hook: how long a failed project waits before retrying.
+    #[napi(js_name = "__setRetryFloorMs")]
+    pub fn set_retry_floor_ms(&mut self, ms: u32) {
+        self.live.set_retry_floor(std::time::Duration::from_millis(ms.into()));
+    }
+}
+
+/// Hidden switches for the recovery tests, compiled in only with the
+/// `test-hooks` feature.
+mod hooks {
+    #[cfg(feature = "test-hooks")]
+    static WATCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+    /// Whether new projects start a file watcher.
+    pub fn watch() -> bool {
+        #[cfg(feature = "test-hooks")]
+        return WATCH.load(std::sync::atomic::Ordering::Relaxed);
+        #[cfg(not(feature = "test-hooks"))]
+        true
+    }
+
+    #[cfg(feature = "test-hooks")]
+    #[napi_derive::napi(js_name = "__setWatcherEnabled")]
+    pub fn set_watcher_enabled(enabled: bool) {
+        WATCH.store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "test-hooks")]
+    #[napi_derive::napi(object)]
+    pub struct Stats {
+        pub state: String,
+        pub opens: u32,
+        pub open_attempts: u32,
+        pub analyses: u32,
+        pub refreshes: u32,
     }
 }
 
