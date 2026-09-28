@@ -18,7 +18,7 @@ pub mod sfc;
 pub mod tui;
 pub mod watch;
 
-pub use project::{Analysis, CacheArgs, Project};
+pub use project::{Analysis, CacheArgs, FileViolation, Project};
 
 /// With `DETANGLE_TIMINGS` set, prints how long a phase took to stderr.
 pub fn timing(phase: &str, t: std::time::Instant) {

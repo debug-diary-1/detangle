@@ -1,0 +1,22 @@
+[package]
+name = "detangle-napi"
+version = "0.1.3"
+edition = "2024"
+rust-version = "1.94"
+description = "The Node.js add-on behind detangle's ESLint rules"
+license = "MIT OR Apache-2.0"
+# Shipped as detangle.node inside the npm platform packages, never on crates.io.
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+detangle = { path = ".." }
+# Node-API 8: Node 12.22+, well below what ESLint 9 and 10 need.
+napi = { version = "3.13.0", default-features = false, features = ["napi8"] }
+napi-derive = "3.6.9"
+dunce = "1.0.5"
+
+[build-dependencies]
+napi-build = "2.5.0"
