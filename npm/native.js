@@ -6,6 +6,7 @@
 // in a checkout), else detangle.node from this machine's platform package.
 
 const path = require("node:path");
+const { isMainThread } = require("node:worker_threads");
 const { platform } = require("./binary.js");
 
 let addon;
@@ -24,14 +25,24 @@ function load() {
     const m = { exports: {} };
     process.dlopen(m, file);
     addon = m.exports;
+    // Frees this thread's projects when a worker ends; leaks them (like
+    // any one-shot CLI) when the process exits.
+    addon.init(isMainThread);
   } catch (e) {
     unavailable = `detangle add-on unavailable: ${e.message}; run \`detangle check\``;
   }
   return addon;
 }
 
-/** Open projects by `dir \0 config \0 mode`. */
+/**
+ * Open projects by `dir \0 config \0 mode`, canonicalized by the add-on:
+ * `{ handle, lastUsed }`. A project unused for 15 minutes is closed at the
+ * next call, which covers option sets the ESLint config no longer uses and
+ * projects the user stopped touching; linting it again opens it afresh.
+ */
 const projects = new Map();
+const IDLE_MS = 15 * 60 * 1000;
+let clock = Date.now;
 
 /**
  * The current pass over each file: its results by key, and the problems
@@ -54,6 +65,8 @@ const stats = { calls: 0 };
  * to ESLint's working directory.
  */
 function violationsFor(context, options = {}) {
+  // Like the CLI: `dir` defaults to where ESLint runs, and both paths are
+  // relative to it.
   const dir = path.resolve(context.cwd, options.dir ?? ".");
   const config = options.config === undefined ? undefined : path.resolve(context.cwd, options.config);
   const key = [dir, config ?? "", options.mode ?? ""].join("\0");
@@ -61,24 +74,45 @@ function violationsFor(context, options = {}) {
   if (!pass) passes.set(context.sourceCode, (pass = { results: new Map(), shown: new Set() }));
   let result = pass.results.get(key);
   if (!result) {
-    result = { ...call(key, dir, config, options.mode, context), shown: pass.shown };
+    result = { ...call(dir, config, options.mode, context), shown: pass.shown };
     pass.results.set(key, result);
   }
   return result;
 }
 
-function call(key, dir, config, mode, context) {
+function call(dir, config, mode, context) {
   if (!load()) return { violations: [], problems: [unavailable], exoticRequire: [] };
-  let project = projects.get(key);
-  if (!project) {
-    project = addon.open(dir, { config, mode });
-    projects.set(key, project);
+  const now = clock();
+  for (const [k, entry] of projects) {
+    if (now - entry.lastUsed > IDLE_MS) {
+      entry.handle.close();
+      projects.delete(k);
+    }
   }
+  // Canonical, so `./app`, a symlink to it and (on Windows) `C:\App` share
+  // one project, and a missing config is kept as given (its open fails).
+  const canonical = [addon.canonical(dir), config === undefined ? "" : addon.canonical(config), mode ?? ""].join("\0");
+  let entry = projects.get(canonical);
+  if (!entry) {
+    // JavaScript configs are evaluated with the Node running ESLint.
+    entry = { handle: addon.open(dir, { config, mode, node: process.execPath }), lastUsed: now };
+    projects.set(canonical, entry);
+  }
+  entry.lastUsed = now;
   stats.calls++;
-  const result = project.violationsFor(context.filename, context.sourceCode.text);
+  const result = entry.handle.violationsFor(context.filename, context.sourceCode.text);
   // One-time notices (e.g. no file watcher); results are still right.
-  for (const w of project.takeWarnings()) process.emitWarning(w, "DetangleWarning");
+  for (const w of entry.handle.takeWarnings()) process.emitWarning(w, "DetangleWarning");
   return result;
 }
 
-module.exports = { violationsFor, stats, addon: load, projects };
+module.exports = {
+  violationsFor,
+  // For tests.
+  stats,
+  addon: load,
+  projects,
+  setClock: (fn) => {
+    clock = fn;
+  },
+};

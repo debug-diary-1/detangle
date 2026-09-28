@@ -19,6 +19,8 @@ import { ESLint as ESLint9 } from "eslint9";
 import tseslint from "typescript-eslint";
 import detangle from "./eslint.js";
 
+// Child processes below run from npm/: make a relative add-on path absolute.
+if (process.env.DETANGLE_ADDON) process.env.DETANGLE_ADDON = path.resolve(process.env.DETANGLE_ADDON);
 const native = createRequire(import.meta.url)("./native.js");
 const fixtures = fileURLToPath(new URL("../tests/fixtures/", import.meta.url));
 const conditions = path.join(fixtures, "conditions");
@@ -393,7 +395,7 @@ const needsHooks = { skip: hooks ? false : "needs an add-on built with --feature
 
 /** A throwaway project with these files; returns its dir and a lint function. */
 function scratch(files) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "detangle-recovery-"));
+  const dir = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "detangle-recovery-")));
   for (const [rel, body] of Object.entries(files)) {
     fs.mkdirSync(path.dirname(path.join(dir, rel)), { recursive: true });
     fs.writeFileSync(path.join(dir, rel), body);
@@ -411,7 +413,8 @@ function scratch(files) {
 }
 
 /** The add-on handle behind the last lint of `dir` (the one opened last). */
-const handleStats = (dir) => [...native.projects.entries()].filter(([k]) => k.startsWith(`${dir}\0`)).map(([, p]) => p.__stats())[0];
+const handleOf = (dir) => [...native.projects.entries()].find(([k]) => k.startsWith(`${dir}\0`))?.[1].handle;
+const handleStats = (dir) => handleOf(dir).__stats();
 
 const RULES = `
 [[forbidden]]
@@ -481,7 +484,7 @@ test("a panic is reported, and recovers after the text changes and the floor pas
   try {
     const good = 'import "./legacy/old";\n';
     assert.deepEqual(await p.lintFile("src/a.ts", good), ["1:8 no-legacy: src/a.ts → src/legacy/old.ts"]);
-    const [, handle] = [...native.projects.entries()].find(([k]) => k.startsWith(`${p.dir}\0`));
+    const handle = handleOf(p.dir);
     handle.__setRetryFloorMs(300);
     const crash = `${good}// __detangle_test_panic__\n`;
     const [m] = await p.lintFile("src/a.ts", crash);
@@ -494,4 +497,143 @@ test("a panic is reported, and recovers after the text changes and the floor pas
   } finally {
     p.cleanup();
   }
+});
+
+// Project keys and lifecycle (D8).
+
+test("the same project through another spelling or a symlink is one project", async () => {
+  const before = native.projects.size;
+  const opts = (dir) => [detangle.configs.recommended, { rules: { "detangle/errors": ["error", { dir, mode: "keys" }], "detangle/warnings": ["warn", { dir, mode: "keys" }] } }];
+  await lint(conditions, ["src/c1.ts"], opts("."));
+  await lint(conditions, ["src/c1.ts"], opts(conditions + path.sep));
+  const link = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "detangle-key-")), "c");
+  fs.symlinkSync(conditions, link, "junction");
+  try {
+    await lint(conditions, ["src/c1.ts"], opts(link));
+  } finally {
+    fs.rmSync(path.dirname(link), { recursive: true, force: true });
+  }
+  assert.equal(native.projects.size, before + 1);
+});
+
+test("a root at the home directory is refused", async () => {
+  const home = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "detangle-home-")));
+  fs.mkdirSync(path.join(home, "src"));
+  fs.writeFileSync(path.join(home, "src/a.ts"), 'import "./b";\n');
+  const saved = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE };
+  process.env.HOME = process.env.USERPROFILE = home;
+  try {
+    const got = await lint(home, ["src/a.ts"], recommended({}));
+    assert.deepEqual(got.map((m) => `${m.line}:${m.column} ${m.message}`), [`1:1 detangle: refusing to scan ${home}; set the "dir" option`]);
+    // The dir option is the way out.
+    const ok = await lint(home, ["src/a.ts"], recommended({ dir: "src" }));
+    assert.ok(!ok.some((m) => /refusing/.test(m.message)), JSON.stringify(ok));
+  } finally {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("a project unused for 15 minutes is closed, and opened again when linted", async () => {
+  let now = Date.now();
+  native.setClock(() => now);
+  try {
+    const a = recommended({ mode: "idle-a" });
+    const b = recommended({ mode: "idle-b" });
+    await lint(conditions, ["src/c1.ts"], a);
+    const key = [...native.projects.keys()].find((k) => k.endsWith("\0idle-a"));
+    const first = native.projects.get(key).handle;
+    now += 14 * 60 * 1000;
+    await lint(conditions, ["src/c1.ts"], b);
+    assert.equal(native.projects.get(key)?.handle, first, "not idle for 15 minutes yet");
+    now += 2 * 60 * 1000;
+    await lint(conditions, ["src/c1.ts"], b);
+    assert.equal(native.projects.get(key), undefined);
+    // Closed: a handle kept elsewhere only reports that.
+    assert.deepEqual(first.violationsFor(path.join(conditions, "src/c1.ts"), "").problems, ["detangle: project closed"]);
+    await lint(conditions, ["src/c1.ts"], a);
+    assert.notEqual(native.projects.get(key).handle, first);
+  } finally {
+    native.setClock(Date.now);
+  }
+});
+
+/** Runs an ES module script in a fresh Node from npm/; returns its result. */
+function runNode(script, env = {}) {
+  return spawnSync(process.execPath, ["--input-type=module", "-e", script], {
+    cwd: path.dirname(fileURLToPath(import.meta.url)),
+    env: { ...process.env, ...env },
+    encoding: "utf8",
+    timeout: 60_000,
+  });
+}
+
+test("JavaScript configs are evaluated with the Node running ESLint", () => {
+  // No node on PATH at all.
+  const r = runNode(
+    `
+    import { ESLint } from "eslint";
+    import tseslint from "typescript-eslint";
+    import detangle from "./eslint.js";
+    const eslint = new ESLint({
+      cwd: ${JSON.stringify(conditions)},
+      overrideConfigFile: true,
+      overrideConfig: [
+        { files: ["**/*.ts"], languageOptions: { parser: tseslint.parser } },
+        detangle.configs.recommended,
+        { rules: { "detangle/errors": ["error", { config: "rules.config.cjs" }] } },
+      ],
+    });
+    const [r] = await eslint.lintFiles(["src/c3.ts"]);
+    console.log(JSON.stringify(r.messages.filter((m) => m.ruleId === "detangle/errors").map((m) => m.message)));
+  `,
+    { PATH: "", Path: "" },
+  );
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(JSON.parse(r.stdout), ["value-cycles: src/c3.ts → src/c4.ts (cycle: src/c3.ts → src/c4.ts → src/c5.ts → src/c3.ts)"]);
+});
+
+test("a worker's projects are torn down with it, and the process exits promptly", () => {
+  const r = runNode(`
+    import { Worker } from "node:worker_threads";
+    const started = Date.now();
+    const worker = new Worker(\`
+      const { parentPort } = require("node:worker_threads");
+      const { ESLint } = require("eslint");
+      const tseslint = require("typescript-eslint");
+      const detangle = require("./eslint.js");
+      (async () => {
+        const eslint = new ESLint({
+          cwd: ${JSON.stringify(conditions)},
+          overrideConfigFile: true,
+          overrideConfig: [{ files: ["**/*.ts"], languageOptions: { parser: tseslint.parser } }, detangle.configs.recommended],
+        });
+        const results = await eslint.lintFiles(["src/**/*.ts"]);
+        parentPort.postMessage(results.reduce((n, r) => n + r.messages.length, 0));
+      })();
+    \`, { eval: true, execArgv: [] });
+    const reports = await new Promise((resolve, reject) => { worker.once("message", resolve); worker.once("error", reject); });
+    await worker.terminate();
+    console.log(JSON.stringify({ reports, ms: Date.now() - started }));
+  `);
+  assert.equal(r.status, 0, r.stderr);
+  assert.doesNotMatch(r.stderr, /panicked|Abort|Segmentation/);
+  const { reports } = JSON.parse(r.stdout);
+  assert.ok(reports > 0);
+});
+
+test("on Windows, a path differing only in case is the same file", { skip: process.platform !== "win32" && "Windows only" }, async () => {
+  const code = fs.readFileSync(path.join(eslintFixture, "src/app.ts"), "utf8");
+  const eslint = new ESLint10({
+    cwd: eslintFixture,
+    overrideConfigFile: true,
+    overrideConfig: [{ files: ["**/*.ts"], languageOptions: { parser: tseslint.parser } }, recommended({ mode: "case" })].flat(),
+  });
+  const lintAt = async (rel) => (await eslint.lintText(code, { filePath: path.join(eslintFixture, rel) }))[0].messages.map((m) => `${m.line}:${m.column} ${m.message}`);
+  const exact = await lintAt("src/app.ts");
+  assert.ok(exact.length > 0);
+  assert.deepEqual(await lintAt("SRC/app.ts"), exact);
 });
