@@ -34,8 +34,8 @@ fn stamp(p: &Path) -> Stamp {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Stamps {
     root: PathBuf,
-    /// Changes when a file is created or deleted in the root directory.
-    root_mtime: Option<SystemTime>,
+    /// Whether the root directory existed.
+    root_exists: bool,
     files: BTreeMap<PathBuf, (Kind, Stamp)>,
 }
 
@@ -44,7 +44,7 @@ impl Stamps {
     /// file (the explicit one, or the one found), and, when its config
     /// loaded, its options:
     /// - detangle.toml, package.json and tsconfig*.json at the root, and
-    ///   the root directory itself (for files appearing there);
+    ///   any of those names appearing at the root later;
     /// - the config file, wherever it is;
     /// - the Vite, webpack and Babel configs and the .env files the options
     ///   name, and the explicit tsconfig;
@@ -85,26 +85,25 @@ impl Stamps {
         for t in tsconfig_chain(&tsconfigs) {
             add(t, Kind::Config);
         }
-        Stamps { root: root.to_path_buf(), root_mtime: stamp(root).map(|(t, _)| t), files }
+        Stamps { root: root.to_path_buf(), root_exists: stamp(root).is_some(), files }
     }
 
     /// The most significant kind of file that changed since `collect`, if
-    /// any. Costs one stat per file, plus one directory listing when a file
-    /// was created or deleted at the root.
+    /// any. Costs one stat per file and one listing of the root directory
+    /// (for files created there; the directory's mtime can't be trusted for
+    /// that, as Windows timestamps are coarse enough for two quick creates
+    /// to leave it unchanged).
     pub fn check(&self) -> Option<Kind> {
-        let mut changed = self.files.iter().filter(|(p, (_, s))| stamp(p) != *s).map(|(_, (k, _))| *k).max();
-        let root_mtime = stamp(&self.root).map(|(t, _)| t);
-        if root_mtime.is_some() != self.root_mtime.is_some() {
+        if stamp(&self.root).is_some() != self.root_exists {
             // The directory itself appeared or went away (a branch switch).
             return Some(Kind::Config);
         }
-        if root_mtime != self.root_mtime {
-            // A relevant name that wasn't there before (existing ones and
-            // deletions show up in their stamps).
-            for (name, kind) in root_names(&self.root) {
-                if !self.files.contains_key(&self.root.join(&name)) {
-                    changed = changed.max(Some(kind));
-                }
+        let mut changed = self.files.iter().filter(|(p, (_, s))| stamp(p) != *s).map(|(_, (k, _))| *k).max();
+        // A relevant name that wasn't there before (existing ones and
+        // deletions show up in their stamps).
+        for (name, kind) in root_names(&self.root) {
+            if !self.files.contains_key(&self.root.join(&name)) {
+                changed = changed.max(Some(kind));
             }
         }
         changed
