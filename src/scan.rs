@@ -714,6 +714,9 @@ struct Resolvers {
     id: u64,
     /// The project root (canonical): workspace packages live under it.
     root: PathBuf,
+    /// `options.resolve.preserve_symlinks`: keep linked packages at their
+    /// node_modules path.
+    preserve_symlinks: bool,
     main: Resolver,
     plain: Resolver,
     aliases: Aliases,
@@ -780,7 +783,7 @@ fn make_resolver(root: &Path, opts: &Options) -> Result<Resolvers> {
     let plain = main.clone_with_options(ResolveOptions { tsconfig: None, ..main.options().clone() });
     static NEXT_ID: AtomicU64 = AtomicU64::new(0);
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    Ok(Resolvers { id, root: root.to_path_buf(), main, plain, aliases, builtins: r.builtins.clone(), builtins_add: r.builtins_add.clone() })
+    Ok(Resolvers { id, root: root.to_path_buf(), preserve_symlinks: r.preserve_symlinks, main, plain, aliases, builtins: r.builtins.clone(), builtins_add: r.builtins_add.clone() })
 }
 
 thread_local! {
@@ -1047,8 +1050,16 @@ fn resolve_unbuilt_workspace(resolver: &Resolvers, from: &Path, spec: &str) -> O
     if !real.starts_with(&resolver.root) || real.components().any(|c| c.as_os_str() == "node_modules") {
         return None;
     }
-    let target = if sub.is_empty() { real } else { real.join(sub) };
-    let res = resolver.plain.resolve_file(from, &target.to_string_lossy()).ok()?;
+    // With preserve_symlinks the link is kept, as it is for a built package.
+    let base = if resolver.preserve_symlinks { linked } else { real };
+    // The package itself is a directory request (a trailing separator), so a
+    // sibling file named like it (packages/lib.ts) can't match first.
+    let request = if sub.is_empty() {
+        format!("{}{}", base.display(), std::path::MAIN_SEPARATOR)
+    } else {
+        base.join(sub).to_string_lossy().into_owned()
+    };
+    let res = resolver.plain.resolve_file(from, &request).ok()?;
     Some(classify(res.path(), spec))
 }
 
@@ -1700,6 +1711,8 @@ export const f = (x) => [module.require("./g"), process.getBuiltinModule("fs"), 
                 ("packages/lib/package.json", unbuilt),
                 ("packages/lib/index.ts", "export const lib = 1;"),
                 ("packages/lib/types.ts", "export type T = 1;"),
+                // A sibling file named like the package directory mustn't win.
+                ("packages/lib.ts", "export const sibling = 1;"),
                 ("examples/app/package.json", r#"{ "name": "app" }"#),
                 ("examples/app/src/a.ts", "import '@x/lib'; import type { T } from '@x/lib/types'; import '@x/broken'; import '@x/lib/missing';"),
                 ("node_modules/@x/broken/package.json", &unbuilt.replace("@x/lib", "@x/broken")),
@@ -1707,28 +1720,34 @@ export const f = (x) => [module.require("./g"), process.getBuiltinModule("fs"), 
             ],
         );
         std::os::unix::fs::symlink("../../packages/lib", t.path("node_modules/@x/lib")).unwrap();
-        let s = t.session();
-        let a = s.files().iter().find(|f| f.path.ends_with("src/a.ts")).unwrap();
-        let targets: Vec<(&str, String)> = a
-            .imports
-            .iter()
-            .map(|i| {
-                let target = match &i.target {
-                    Target::Local(p) => format!("local {}", p.strip_prefix(&t.0).unwrap().display()),
-                    other => format!("{other:?}"),
-                };
-                (&*i.specifier, target)
-            })
-            .collect();
-        assert_eq!(
-            targets,
-            [
-                ("@x/lib", "local packages/lib/index.ts".to_string()),
-                ("@x/lib/types", "local packages/lib/types.ts".to_string()),
-                ("@x/broken", "Unresolved".to_string()),
-                ("@x/lib/missing", "Unresolved".to_string()),
+        let targets = |s: &Session| -> Vec<(String, String)> {
+            let a = s.files().iter().find(|f| f.path.ends_with("src/a.ts")).unwrap();
+            a.imports
+                .iter()
+                .map(|i| {
+                    let target = match &i.target {
+                        Target::Local(p) => format!("local {}", p.strip_prefix(&t.0).unwrap().display()),
+                        other => format!("{other:?}"),
+                    };
+                    (i.specifier.to_string(), target)
+                })
+                .collect()
+        };
+        let want = |lib: &str, types: &str| {
+            vec![
+                ("@x/lib".to_string(), lib.to_string()),
+                ("@x/lib/types".to_string(), types.to_string()),
+                ("@x/broken".to_string(), "Unresolved".to_string()),
+                ("@x/lib/missing".to_string(), "Unresolved".to_string()),
             ]
-        );
+        };
+        assert_eq!(targets(&t.session()), want("local packages/lib/index.ts", "local packages/lib/types.ts"));
+        // With preserve_symlinks, the link is kept, as for a built package:
+        // the import is of an npm package, not a local file.
+        let mut opts = Options::default();
+        opts.resolve.preserve_symlinks = true;
+        let s = Session::new(&t.0, &t.0, &opts).unwrap();
+        assert_eq!(targets(&s), want("Npm(\"@x/lib\")", "Npm(\"@x/lib\")"));
     }
 
     #[test]
