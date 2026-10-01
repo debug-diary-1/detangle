@@ -38,6 +38,7 @@
   h1 { font-size: clamp(30px, 5vw, 42px); line-height: 1.15; letter-spacing: -0.02em; margin: 0 0 14px; }
   .lede { font-size: 18px; color: var(--muted); margin: 0; max-width: 620px; }
   h2 { font-size: 22px; letter-spacing: -0.01em; margin: 48px 0 12px; }
+  .tag { font-size: 12px; font-weight: 600; letter-spacing: 0.02em; color: var(--muted); border: 1px solid var(--line); border-radius: 999px; padding: 2px 8px; vertical-align: 3px; }
   p { margin: 0 0 14px; }
   .bench { margin-top: 28px; border: 1px solid var(--line); border-radius: 10px; background: var(--card); padding: 18px 20px; }
   .bench-title { font-size: 14px; color: var(--muted); margin-bottom: 12px; }
@@ -217,6 +218,16 @@ to = { path = '^src/features/', path_not = '^src/features/$1/' }</pre></div>
     <p>In a GitHub Actions workflow, violations appear as annotations on the pull request:</p>
     <div class="code"><pre>- run: npx detangle check -f github</pre></div>
     <p>Adopting rules on an existing codebase? <code>detangle check --write-baseline</code> records today's violations, so CI fails only on new ones.</p>
+  </section>
+
+  <section id="eslint">
+    <h2>In your editor <span class="tag">experimental</span></h2>
+    <p>The <code>detangle/eslint</code> plugin shows violations on the imports that cause them, as you type, including unsaved edits. It keeps the scan in memory, so after the first lint it adds under a millisecond for a typical file.</p>
+    <div class="code"><pre><span class="c">// eslint.config.js (ESLint 9 or 10)</span>
+import detangle from "detangle/eslint";
+
+export default [<span class="c">/* ...your config */</span> detangle.configs.recommended];</pre></div>
+    <p>Keep <code>detangle check</code> as the CI gate. See the <a href="https://github.com/debug-diary-1/detangle/blob/main/docs/reference.md#eslint-rules-experimental">ESLint reference</a> for options and limits.</p>
   </section>
 
   <section id="benchmarks">

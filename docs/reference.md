@@ -288,6 +288,67 @@ const svgSource = await graph(".", { format: "dot", focus: /cart/, focusDepth: 2
 const { config } = await migrate(".");                               // the detangle.toml migrate would write
 ```
 
+## ESLint rules (experimental)
+
+`detangle/eslint` puts detangle's violations in your editor, on the import that causes them, while you type. It's an ESLint plugin backed by a native add-on that keeps the project's scan in memory. The first lint scans the project (about 0.2 s for VS Code's `src/`); after that, a lint adds under a millisecond for a typical file, or about 20 ms on VS Code when an edit changes the file's imports. It needs ESLint 9 or 10 with a flat config.
+
+```js
+// eslint.config.js
+import detangle from "detangle/eslint";
+
+export default [
+  // ...your existing config: TypeScript, Vue and Svelte files need their usual parser setup
+  detangle.configs.recommended,
+];
+```
+
+The rules are the ones in your `detangle.toml` (or rules config), as for `detangle check`:
+
+| ESLint rule | Reports | In `recommended` |
+| --- | --- | --- |
+| `detangle/errors` | detangle `error` violations | `"error"` |
+| `detangle/warnings` | detangle `warn` and `info` violations | `"warn"` |
+
+Both take the same options as `detangle check <dir> --config <file> --mode <mode>`, with paths relative to ESLint's working directory. Give both rules the same options, so they share one project:
+
+```js
+{
+  rules: {
+    "detangle/errors": ["error", { dir: "packages/web", config: "packages/web/detangle.toml" }],
+    "detangle/warnings": ["warn", { dir: "packages/web", config: "packages/web/detangle.toml" }],
+  },
+}
+```
+
+**Which project.** By default `dir` is ESLint's working directory, so linting behaves like `detangle check .` run where ESLint runs. Editors usually run ESLint in each workspace folder. Set `dir` when the project to check isn't there: a package in a monorepo with its own `detangle.toml`, or a repository opened from a parent folder. detangle refuses to scan your home directory or the filesystem root, and says so at line 1; `dir` is the way out.
+
+**Where violations appear.**
+
+- A violation between two modules shows on every import of the target in the importing file: `import`/`export … from`, `import()`, `require()`, `import x = require()`, `import("…")` types, AMD `define`/`require` arrays, configured exotic requires, `process.getBuiltinModule()` and Angular `templateUrl`/`styleUrl(s)`.
+- A cycle shows in every file on it, each on its import of the next file, as `detangle check` lists them.
+- A folder violation (`scope = "folder"`) shows in every file under the folder, on the imports that leave it for the target folder. A group violation shows on each import behind it, in that import's file.
+- Violations about a module itself (orphans, `required`, dependents counts) show at line 1. So do imports that have no node in the code (`/// <reference>`, JSDoc imports, Vue/Svelte template imports), with `[import "…"]` added to the message.
+- Folder and group violations with no import behind them (dependents counts) aren't shown; `detangle check` lists them.
+
+**Staying current.** One project per `(dir, config, mode)` is kept for each ESLint process or worker thread:
+
+- The file being linted is read from the editor's buffer, so unsaved changes count.
+- Other files' saved changes arrive through a file watcher, and a new file is picked up when it's first linted.
+- Changes to `detangle.toml`, `package.json`, tsconfig files (including their `extends` chain), bundler and `.env` configs re-open the project. A lockfile change (an install) re-resolves imports.
+- If the config stops loading, the last good results stay and the error shows at line 1 until it's fixed.
+- A project unused for 15 minutes is closed, and opened again when next linted.
+
+Problems with the project itself (a config that doesn't load, an add-on that can't load on this platform) are reported once per file, at line 1, by whichever detangle rule runs first.
+
+**In CI, run `detangle check`.** The ESLint rules are for editor feedback. A file's result depends on other files, which `eslint --cache` doesn't know about, so a cached ESLint run can miss violations caused by changes elsewhere. `detangle check` (with `-f github` for annotations) is the authoritative gate for CI and pre-commit.
+
+**Known limits.**
+
+- One folder violation can show in many files: every import that creates it.
+- Changes inside `node_modules` that don't touch a lockfile (`npm link`, editing a package by hand) aren't seen until a re-open, which a config or lockfile change, or restarting ESLint, causes.
+- Files imported by a JavaScript rules config aren't watched; edit the config itself, or restart ESLint.
+- With `eslint --concurrency N`, each worker scans the project and keeps its own copy.
+
 ## HTML report
 
 `detangle report` writes one self-contained HTML file with no external requests, so it can be attached to CI runs or shared as a file. It has:

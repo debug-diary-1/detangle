@@ -67,9 +67,20 @@ detangle migrate             # write detangle.toml
 - run: npx detangle check -f github   # violations appear as annotations on the pull request
 ```
 
+## In your editor (experimental)
+
+```js
+// eslint.config.js (ESLint 9 or 10)
+import detangle from "detangle/eslint";
+
+export default [/* ...your config */ detangle.configs.recommended];
+```
+
+Violations show on the imports that cause them as you type, including unsaved edits. Keep `detangle check` as the CI gate. See [ESLint rules](https://github.com/debug-diary-1/detangle/blob/main/docs/reference.md#eslint-rules-experimental) for options and limits.
+
 ## Learn more
 
-- [Full reference](https://github.com/debug-diary-1/detangle/blob/main/docs/reference.md): every command, rule option, the explorer, groups and Nx projects, the Node.js API and the HTML report.
+- [Full reference](https://github.com/debug-diary-1/detangle/blob/main/docs/reference.md): every command, rule option, the explorer, groups and Nx projects, the ESLint rules, the Node.js API and the HTML report.
 - [Releasing](https://github.com/debug-diary-1/detangle/blob/main/docs/releasing.md)
 
 ## License
