@@ -1,0 +1,65 @@
+name: Install check
+
+# After a release: install the published `detangle` from npm on every
+# platform and check that the CLI runs and the ESLint rules report the
+# eslint fixture's violations. Run by hand with the version to check.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Published version to install (e.g. 0.2.0)
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: macOS arm64, os: macos-14 }
+          - { name: Linux x64 (glibc), os: ubuntu-latest }
+          - { name: Linux arm64 (glibc), os: ubuntu-22.04-arm }
+          - { name: Linux x64 (musl), os: ubuntu-latest, container: "node:22-alpine", shell: sh }
+          - { name: Windows x64, os: windows-latest }
+          - { name: Windows arm64, os: windows-11-arm }
+    runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container }}
+    defaults:
+      run:
+        # node:22-alpine has no bash.
+        shell: ${{ matrix.shell || 'bash' }}
+    steps:
+      - uses: actions/checkout@v4
+      - if: ${{ !matrix.container }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install from npm and lint the eslint fixture
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          dir="$RUNNER_TEMP/install-check"
+          mkdir -p "$dir"
+          cp -R tests/fixtures/eslint/. "$dir/"
+          cd "$dir"
+          echo '{ "name": "install-check", "private": true, "type": "module" }' > package.json
+          cat > eslint.config.js <<'JS'
+          import detangle from "detangle/eslint";
+          import tseslint from "typescript-eslint";
+          export default [{ files: ["**/*.ts"], languageOptions: { parser: tseslint.parser } }, detangle.configs.recommended];
+          JS
+          npm install --no-audit --no-fund "detangle@$VERSION" eslint@^10 typescript-eslint@^8 typescript@^5
+          npx detangle --version | grep -qx "detangle $VERSION"
+          npx eslint --format json src > results.json || true
+          node -e '
+            const r = require("./results.json").flatMap((f) => f.messages);
+            const counts = [2, 1].map((s) => r.filter((m) => m.severity === s && m.ruleId?.startsWith("detangle/")).length);
+            console.log(`detangle reported ${counts[0]} errors and ${counts[1]} warnings`);
+            if (r.some((m) => m.fatal)) throw new Error(JSON.stringify(r.filter((m) => m.fatal)));
+            if (counts[0] !== 10 || counts[1] !== 10) throw new Error("expected 10 errors and 10 warnings, as in tests/fixtures/eslint");
+          '
