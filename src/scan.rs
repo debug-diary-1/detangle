@@ -712,6 +712,8 @@ fn with_extra(mut base: Vec<String>, extra: &[String]) -> Vec<String> {
 struct Resolvers {
     /// Tells resolvers apart in the thread-local `DirMemo`s.
     id: u64,
+    /// The project root (canonical): workspace packages live under it.
+    root: PathBuf,
     main: Resolver,
     plain: Resolver,
     aliases: Aliases,
@@ -778,7 +780,7 @@ fn make_resolver(root: &Path, opts: &Options) -> Result<Resolvers> {
     let plain = main.clone_with_options(ResolveOptions { tsconfig: None, ..main.options().clone() });
     static NEXT_ID: AtomicU64 = AtomicU64::new(0);
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    Ok(Resolvers { id, main, plain, aliases, builtins: r.builtins.clone(), builtins_add: r.builtins_add.clone() })
+    Ok(Resolvers { id, root: root.to_path_buf(), main, plain, aliases, builtins: r.builtins.clone(), builtins_add: r.builtins_add.clone() })
 }
 
 thread_local! {
@@ -1012,6 +1014,9 @@ fn resolve(resolver: &Resolvers, from: &Path, spec: &str) -> Option<Target> {
         Err(ResolveError::Ignored(_)) => None,
         Err(ResolveError::Builtin { .. }) => Some(Target::Builtin(spec.to_string())),
         Err(_) if is_bare(spec) && !spec.starts_with('#') => {
+            if let Some(t) = resolve_unbuilt_workspace(resolver, from, spec) {
+                return Some(t);
+            }
             // Types-only packages (`import type { X } from "estree"`) live in @types.
             let pkg = package_name(spec);
             let types = match pkg.strip_prefix('@') {
@@ -1025,6 +1030,26 @@ fn resolve(resolver: &Resolvers, from: &Path, spec: &str) -> Option<Target> {
         }
         Err(_) => Some(Target::Unresolved),
     }
+}
+
+/// A workspace package of this project (linked into node_modules, its real
+/// directory under the root and outside node_modules) whose `exports` and
+/// `main` point at build output that doesn't exist yet, as in a fresh clone
+/// of a monorepo: the import resolves into the package's sources, the way
+/// TypeScript's `node` module resolution does, by resolving the package's own
+/// path (no `exports`; `main`, then an index file) or the subpath in it.
+/// Installed packages are never resolved this way.
+fn resolve_unbuilt_workspace(resolver: &Resolvers, from: &Path, spec: &str) -> Option<Target> {
+    let pkg = package_name(spec);
+    let sub = spec[pkg.len()..].trim_start_matches('/');
+    let linked = from.ancestors().skip(1).map(|d| d.join("node_modules").join(pkg)).find(|p| p.is_dir())?;
+    let real = dunce::canonicalize(&linked).ok()?;
+    if !real.starts_with(&resolver.root) || real.components().any(|c| c.as_os_str() == "node_modules") {
+        return None;
+    }
+    let target = if sub.is_empty() { real } else { real.join(sub) };
+    let res = resolver.plain.resolve_file(from, &target.to_string_lossy()).ok()?;
+    Some(classify(res.path(), spec))
 }
 
 struct Collector<'d> {
@@ -1657,6 +1682,53 @@ export const f = (x) => [module.require("./g"), process.getBuiltinModule("fs"), 
         assert_matches_disk_plus(&s, &t, &[("src/a.ts", "import 'pkg'; import 'other';")]);
         s.refresh_resolution().unwrap();
         assert!(!s.work.graph_changed);
+    }
+
+    /// A workspace package whose `exports` and `main` point at build output
+    /// that doesn't exist yet (a fresh clone, as Excalidraw's examples
+    /// import `@excalidraw/excalidraw`) resolves into its sources, the way
+    /// TypeScript's `node` module resolution does. An installed package with
+    /// the same broken `exports` stays unresolved.
+    #[cfg(unix)]
+    #[test]
+    fn unbuilt_workspace_packages_resolve_to_their_sources() {
+        let unbuilt = r#"{ "name": "@x/lib", "main": "./dist/index.js", "exports": { ".": "./dist/index.js", "./*": { "types": "./dist/types/*.d.ts" } } }"#;
+        let t = Tmp::new(
+            "unbuilt",
+            &[
+                ("package.json", r#"{ "workspaces": ["packages/*", "examples/*"] }"#),
+                ("packages/lib/package.json", unbuilt),
+                ("packages/lib/index.ts", "export const lib = 1;"),
+                ("packages/lib/types.ts", "export type T = 1;"),
+                ("examples/app/package.json", r#"{ "name": "app" }"#),
+                ("examples/app/src/a.ts", "import '@x/lib'; import type { T } from '@x/lib/types'; import '@x/broken'; import '@x/lib/missing';"),
+                ("node_modules/@x/broken/package.json", &unbuilt.replace("@x/lib", "@x/broken")),
+                ("node_modules/@x/broken/index.js", ""),
+            ],
+        );
+        std::os::unix::fs::symlink("../../packages/lib", t.path("node_modules/@x/lib")).unwrap();
+        let s = t.session();
+        let a = s.files().iter().find(|f| f.path.ends_with("src/a.ts")).unwrap();
+        let targets: Vec<(&str, String)> = a
+            .imports
+            .iter()
+            .map(|i| {
+                let target = match &i.target {
+                    Target::Local(p) => format!("local {}", p.strip_prefix(&t.0).unwrap().display()),
+                    other => format!("{other:?}"),
+                };
+                (&*i.specifier, target)
+            })
+            .collect();
+        assert_eq!(
+            targets,
+            [
+                ("@x/lib", "local packages/lib/index.ts".to_string()),
+                ("@x/lib/types", "local packages/lib/types.ts".to_string()),
+                ("@x/broken", "Unresolved".to_string()),
+                ("@x/lib/missing", "Unresolved".to_string()),
+            ]
+        );
     }
 
     #[test]
