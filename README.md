@@ -8,10 +8,10 @@ Fast dependency analysis and architecture rules for JavaScript and TypeScript: f
 
 | Checking VS Code `src/` (10k modules, 113k imports) | Time | Memory |
 |---|---|---|
-| detangle | 0.19 s | 164 MB |
-| the JavaScript rules tool | 41 s | 3.5 GB |
-| madge `--circular` | 35 s | 0.9 GB |
-| ESLint `import/no-cycle` | 291 s | 2.4 GB |
+| detangle | 0.18 s | 156 MB |
+| the JavaScript rules tool | 35 s | 4.6 GB |
+| madge `--circular` | 34 s | 0.7 GB |
+| ESLint `import/no-cycle` | 289 s | 2.6 GB |
 
 ## Install
 
