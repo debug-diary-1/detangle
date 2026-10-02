@@ -719,6 +719,9 @@ struct Resolvers {
     preserve_symlinks: bool,
     main: Resolver,
     plain: Resolver,
+    /// `main` without each of its condition names in turn, for a bare import
+    /// whose matched `exports` condition points at a missing file (#18).
+    without_condition: Vec<Resolver>,
     aliases: Aliases,
     /// `options.resolve.builtins` (a replacement list) and `builtins_add`.
     builtins: Option<Vec<String>>,
@@ -781,9 +784,17 @@ fn make_resolver(root: &Path, opts: &Options) -> Result<Resolvers> {
         ..ResolveOptions::default()
     });
     let plain = main.clone_with_options(ResolveOptions { tsconfig: None, ..main.options().clone() });
+    let conditions = &main.options().condition_names;
+    let without_condition = conditions
+        .iter()
+        .map(|c| {
+            let rest = conditions.iter().filter(|x| *x != c).cloned().collect();
+            main.clone_with_options(ResolveOptions { condition_names: rest, ..main.options().clone() })
+        })
+        .collect();
     static NEXT_ID: AtomicU64 = AtomicU64::new(0);
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    Ok(Resolvers { id, root: root.to_path_buf(), preserve_symlinks: r.preserve_symlinks, main, plain, aliases, builtins: r.builtins.clone(), builtins_add: r.builtins_add.clone() })
+    Ok(Resolvers { id, root: root.to_path_buf(), preserve_symlinks: r.preserve_symlinks, main, plain, without_condition, aliases, builtins: r.builtins.clone(), builtins_add: r.builtins_add.clone() })
 }
 
 thread_local! {
@@ -1017,6 +1028,14 @@ fn resolve(resolver: &Resolvers, from: &Path, spec: &str) -> Option<Target> {
         Err(ResolveError::Ignored(_)) => None,
         Err(ResolveError::Builtin { .. }) => Some(Target::Builtin(spec.to_string())),
         Err(_) if is_bare(spec) && !spec.starts_with('#') => {
+            // Node takes the first matching `exports` condition even when its
+            // file is missing; TypeScript moves on to the next one. Leaving
+            // out the condition that matched makes the next one match.
+            for r in &resolver.without_condition {
+                if let Ok(res) = r.resolve_file(from, spec) {
+                    return Some(classify(res.path(), spec));
+                }
+            }
             if let Some(t) = resolve_unbuilt_workspace(resolver, from, spec) {
                 return Some(t);
             }
