@@ -71,6 +71,33 @@ fn resolves_tsconfig_paths_and_js_extensions() {
     assert!(deps.contains(&"react") && deps.contains(&"fs"), "{deps:?}");
 }
 
+/// Unresolvable imports `check` reports, as (from, to).
+fn unresolvable(fixture: &str) -> Vec<(String, String)> {
+    let (out, _) = detangle(&["check", fixture, "-f", "json"]);
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    v.as_array()
+        .unwrap()
+        .iter()
+        .filter(|x| x["rule"] == "not-to-unresolvable")
+        .map(|x| (x["from"].as_str().unwrap().into(), x["to"].as_str().unwrap().into()))
+        .collect()
+}
+
+/// When the first matching `exports` condition points at a file that doesn't
+/// exist, the next matching condition is tried, as TypeScript does (#18).
+#[test]
+fn exports_fall_through_to_the_next_condition() {
+    let found = unresolvable("tests/fixtures/exports-fallthrough");
+    assert!(!found.iter().any(|(from, _)| from == "src/a.ts"), "{found:?}");
+}
+
+/// With no condition's file on disk, the import is still unresolvable.
+#[test]
+fn exports_with_no_existing_target_stay_unresolvable() {
+    let found = unresolvable("tests/fixtures/exports-fallthrough");
+    assert!(found.contains(&("src/b.ts".into(), "sdk/missing.js".into())), "{found:?}");
+}
+
 #[test]
 fn why_prints_shortest_chain() {
     let (out, code) = detangle(&["why", "src/index.ts", "helper.test.ts", "-C", FIXTURE]);
