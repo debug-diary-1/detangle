@@ -63,9 +63,27 @@ detangle migrate             # write detangle.toml
 
 ## In CI
 
+With GitHub Actions, the [detangle action](https://github.com/debug-diary-1/detangle-action) installs the binary, annotates the pull request and writes a report to the job summary:
+
 ```yaml
-- run: npx detangle check -f github   # violations appear as annotations on the pull request
+- uses: debug-diary-1/detangle-action@v1
 ```
+
+Anywhere else, run it through npm: `npx detangle check` (exit 1 on errors), with `-f github`, `-f markdown`, `-f azure` or `-f teamcity` for that CI's annotations.
+
+## Before you commit
+
+With [pre-commit](https://pre-commit.com), in `.pre-commit-config.yaml`:
+
+```yaml
+repos:
+  - repo: https://github.com/debug-diary-1/detangle
+    rev: v0.2.3
+    hooks:
+      - id: detangle
+```
+
+The hook runs when a source file, `package.json`, a tsconfig or `detangle.toml` is staged. With lefthook or husky, run `npx detangle check` (or `npx detangle check --cache`) in the pre-commit hook.
 
 ## In your editor (experimental)
 

@@ -879,3 +879,12 @@ fn node_api() {
     };
     assert!(out.status.success(), "{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
 }
+
+/// The pre-commit hook installs detangle from npm; it must install the
+/// version being released (docs/releasing.md).
+#[test]
+fn pre_commit_hook_installs_this_version() {
+    let hooks = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/.pre-commit-hooks.yaml")).unwrap();
+    let want = format!("\"detangle@{}\"", env!("CARGO_PKG_VERSION"));
+    assert!(hooks.contains(&want), "{want} not in .pre-commit-hooks.yaml");
+}
