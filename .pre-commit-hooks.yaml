@@ -6,6 +6,6 @@
   description: Check import cycles and architecture rules in JavaScript and TypeScript.
   entry: detangle check
   language: node
-  additional_dependencies: ["detangle@0.2.4"]
+  additional_dependencies: ["detangle@0.2.5"]
   pass_filenames: false
   files: '\.([cm]?[jt]sx?|vue|svelte)$|(^|/)(detangle\.toml|package\.json|tsconfig[^/]*\.json)$'

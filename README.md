@@ -80,7 +80,7 @@ With [pre-commit](https://pre-commit.com), in `.pre-commit-config.yaml`:
 ```yaml
 repos:
   - repo: https://github.com/debug-diary-1/detangle
-    rev: v0.2.4
+    rev: v0.2.5
     hooks:
       - id: detangle
 ```
