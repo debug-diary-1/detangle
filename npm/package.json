@@ -1,6 +1,6 @@
 {
   "name": "detangle",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "description": "Fast dependency analysis and architecture rules for JavaScript and TypeScript (CLI and Node.js API)",
   "license": "MIT OR Apache-2.0",
   "repository": {
@@ -61,14 +61,14 @@
     "native.js"
   ],
   "optionalDependencies": {
-    "detangle-darwin-arm64": "0.2.3",
-    "detangle-darwin-x64": "0.2.3",
-    "detangle-linux-arm64-gnu": "0.2.3",
-    "detangle-linux-arm64-musl": "0.2.3",
-    "detangle-linux-x64-gnu": "0.2.3",
-    "detangle-linux-x64-musl": "0.2.3",
-    "detangle-windows-arm64": "0.2.3",
-    "detangle-windows-x64": "0.2.3"
+    "detangle-darwin-arm64": "0.2.4",
+    "detangle-darwin-x64": "0.2.4",
+    "detangle-linux-arm64-gnu": "0.2.4",
+    "detangle-linux-arm64-musl": "0.2.4",
+    "detangle-linux-x64-gnu": "0.2.4",
+    "detangle-linux-x64-musl": "0.2.4",
+    "detangle-windows-arm64": "0.2.4",
+    "detangle-windows-x64": "0.2.4"
   },
   "engines": {
     "node": ">=18"
