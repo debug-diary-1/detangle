@@ -8,7 +8,7 @@ use regex::Regex;
 use serde::Serialize;
 use serde_json::json;
 
-use crate::config::Severity;
+use crate::config::{Scope, Severity};
 use crate::graph::{Graph, ModuleKind};
 use crate::rules::{BaselineEntry, Violation};
 
@@ -188,22 +188,25 @@ struct Finding {
     comment: Option<String>,
     file: String,
     message: String,
+    /// The import string behind it, when there is one.
+    specifier: Option<String>,
 }
 
 /// Violations (group ones on each import behind them) and stale entries.
 fn findings(g: &Graph, vs: &[Violation], stale: &Stale) -> Vec<Finding> {
     let mut out = vec![];
     for v in vs {
-        let base = |file: &str, message: String| Finding {
+        let base = |file: &str, message: String, specifier: Option<&str>| Finding {
             rule: v.rule.clone(),
             severity: v.severity,
             comment: v.comment.clone(),
             file: file.to_string(),
             message,
+            specifier: specifier.map(String::from),
         };
         if !v.imports.is_empty() {
             for (file, specifier, _) in imports(g, v) {
-                out.push(base(file, format!("imports {specifier} ({} → {})", v.source_id(g), v.target_id(g).unwrap_or(""))));
+                out.push(base(file, format!("imports {specifier} ({} → {})", v.source_id(g), v.target_id(g).unwrap_or("")), Some(specifier)));
             }
             continue;
         }
@@ -212,7 +215,12 @@ fn findings(g: &Graph, vs: &[Violation], stale: &Stale) -> Vec<Finding> {
         } else {
             v.target_id(g).map(|t| format!("depends on {t}")).unwrap_or_default()
         };
-        out.push(base(v.source_id(g), message));
+        // A module's dependency on another: the import that makes it.
+        let specifier = match (v.scope, v.to) {
+            (Scope::Module, Some(to)) => g.out[v.from].iter().map(|&e| &g.edges[e]).find(|e| e.to == to).map(|e| &*e.specifier),
+            _ => None,
+        };
+        out.push(base(v.source_id(g), message, specifier));
     }
     for e in stale.reported() {
         out.push(Finding {
@@ -221,6 +229,7 @@ fn findings(g: &Graph, vs: &[Violation], stale: &Stale) -> Vec<Finding> {
             comment: Some(STALE_COMMENT.into()),
             file: e.from.clone(),
             message: format!("{}: {}{}", e.rule, e.from, e.to.as_ref().map(|t| format!(" → {t}")).unwrap_or_default()),
+            specifier: None,
         });
     }
     out
@@ -239,6 +248,7 @@ impl Finding {
 /// GitHub Actions workflow commands → inline PR annotations.
 pub fn github(g: &Graph, vs: &[Violation], stale: &Stale) -> String {
     let esc = |s: &str| s.replace('%', "%25").replace('\r', "%0D").replace('\n', "%0A");
+    let mut sources: HashMap<String, Option<String>> = HashMap::new();
     let mut out = String::new();
     for f in findings(g, vs, stale) {
         let level = match f.severity {
@@ -246,9 +256,22 @@ pub fn github(g: &Graph, vs: &[Violation], stale: &Stale) -> String {
             Severity::Warn => "warning",
             _ => "notice",
         };
-        let _ = writeln!(out, "::{level} file={},title={}::{}", f.file, f.rule, esc(&f.text()));
+        let line = f.specifier.as_deref().and_then(|spec| {
+            let source = sources.entry(f.file.clone()).or_insert_with(|| std::fs::read_to_string(g.root.join(&f.file)).ok());
+            import_line(source.as_deref()?, spec)
+        });
+        let line = line.map(|n| format!(",line={n}")).unwrap_or_default();
+        let _ = writeln!(out, "::{level} file={}{line},title={}::{}", f.file, f.rule, esc(&f.text()));
     }
     out
+}
+
+/// The 1-based line where `spec` first appears as a quoted string, outside
+/// lines that are comments.
+fn import_line(source: &str, spec: &str) -> Option<usize> {
+    let quoted = ['"', '\'', '`'].map(|q| format!("{q}{spec}{q}"));
+    let comment = |l: &str| ["//", "/*", "*"].iter().any(|c| l.trim_start().starts_with(c));
+    source.lines().position(|l| !comment(l) && quoted.iter().any(|q| l.contains(q.as_str()))).map(|i| i + 1)
 }
 
 /// TeamCity service messages: an inspection type per rule, an inspection

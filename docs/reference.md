@@ -8,7 +8,7 @@ Everything detangle does, in detail. For installation and a quick start, see the
 detangle                        # interactive explorer; rebuilds live as you edit
 detangle watch                  # re-run the rules on every change
 detangle check                  # run the rules; exit 1 on errors (CI)
-detangle check -f github        # GitHub Actions annotations on the PR
+detangle check -f github        # GitHub Actions annotations on the PR, on the import's line
 detangle check -f markdown      # summary + details for a PR comment or job summary
 detangle check -f teamcity      # TeamCity inspections (also: -f azure for Azure DevOps)
 detangle check --strict         # also fail on warnings

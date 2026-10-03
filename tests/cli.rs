@@ -888,3 +888,38 @@ fn pre_commit_hook_installs_this_version() {
     let want = format!("\"detangle@{}\"", env!("CARGO_PKG_VERSION"));
     assert!(hooks.contains(&want), "{want} not in .pre-commit-hooks.yaml");
 }
+
+/// `check -f github` annotations as (file, line, rule).
+fn github_annotations(fixture: &str) -> Vec<(String, Option<u32>, String)> {
+    let (out, _) = detangle(&["check", fixture, "-f", "github"]);
+    out.lines()
+        .filter_map(|l| l.strip_prefix("::"))
+        .map(|l| {
+            let props = l.split_once(' ').unwrap().1.split("::").next().unwrap();
+            let get = |k: &str| props.split(',').find_map(|p| p.strip_prefix(&format!("{k}=")).map(String::from));
+            (get("file").unwrap(), get("line").map(|n| n.parse().unwrap()), get("title").unwrap())
+        })
+        .collect()
+}
+
+/// A GitHub annotation lands on the line of the import that causes it.
+#[test]
+fn github_annotations_point_at_the_import_line() {
+    let found = github_annotations("tests/fixtures/github-lines");
+    assert!(found.contains(&("src/a.ts".into(), Some(3), "not-to-unresolvable".into())), "{found:?}");
+}
+
+/// Each import on a cycle is annotated at its own line, whatever its quotes.
+#[test]
+fn github_cycle_annotations_point_at_each_import() {
+    let found = github_annotations("tests/fixtures/github-lines");
+    assert!(found.contains(&("src/a.ts".into(), Some(2), "no-circular".into())), "{found:?}");
+    assert!(found.contains(&("src/b.ts".into(), Some(3), "no-circular".into())), "{found:?}");
+}
+
+/// The same string in a comment above the import doesn't take the annotation.
+#[test]
+fn github_annotations_skip_comments() {
+    let found = github_annotations("tests/fixtures/github-lines");
+    assert!(found.contains(&("src/c.ts".into(), Some(3), "not-to-unresolvable".into())), "{found:?}");
+}
