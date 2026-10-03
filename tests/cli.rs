@@ -527,6 +527,38 @@ fn empty_exclude_keeps_the_project() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+#[test]
+fn says_when_declared_packages_are_not_installed() {
+    // A fresh CI checkout without `npm ci`: every import of a declared
+    // package is unresolvable. `check` says why, once.
+    let dir = std::env::temp_dir().join(format!("detangle-not-installed-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("package.json"), r#"{"name":"r","private":true,"dependencies":{"dayjs":"1","@s/ui":"1"}}"#).unwrap();
+    std::fs::write(dir.join("src/a.ts"), "import d from 'dayjs';\nimport { b } from '@s/ui/button';\nimport x from 'undeclared';\nexport const a = [d, b, x];\n").unwrap();
+    std::fs::write(dir.join("src/b.ts"), "import d from 'dayjs';\nexport const c = d;\n").unwrap();
+    let run = |format: &str| {
+        let out = Command::new(env!("CARGO_BIN_EXE_detangle")).args(["check", "-f", format]).current_dir(&dir).env("NO_COLOR", "1").output().unwrap();
+        (String::from_utf8(out.stdout).unwrap(), String::from_utf8(out.stderr).unwrap())
+    };
+    let note = "3 imports of 2 declared packages don't resolve because they aren't installed (@s/ui, dayjs)";
+    let (_, err) = run("text");
+    assert!(err.contains(note), "{err}");
+    let (out, _) = run("github");
+    assert!(out.lines().any(|l| l.starts_with("::warning title=detangle::") && l.contains(note)), "{out}");
+    let (out, _) = run("markdown");
+    assert!(out.contains(note), "{out}");
+    let (out, err) = run("json");
+    assert!(err.contains(note) && serde_json::from_str::<serde_json::Value>(&out).is_ok(), "{err}");
+
+    // Installed, though not completely: no note. `@s/ui` and `undeclared`
+    // are ordinary unresolvable imports then.
+    std::fs::create_dir_all(dir.join("node_modules/dayjs")).unwrap();
+    let (_, err) = run("text");
+    assert!(!err.contains("installed"), "{err}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
     std::fs::create_dir_all(to).unwrap();
     for e in std::fs::read_dir(from).unwrap() {
