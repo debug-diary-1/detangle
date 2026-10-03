@@ -161,7 +161,7 @@ impl Graph {
         let mut seen: HashMap<usize, usize> = HashMap::default();
         let mut bases: Vec<Vec<&'static str>> = vec![];
         let filter = PathFilter::new(opts);
-        let unfollowed = opts.do_not_follow.as_ref().and_then(|p| fancy_regex::Regex::new(&p.0).ok());
+        let unfollowed = opts.do_not_follow.as_ref().filter(|p| !p.0.is_empty()).and_then(|p| fancy_regex::Regex::new(&p.0).ok());
         for (from, f) in files.iter().enumerate() {
             seen.clear();
             if unfollowed.as_ref().is_some_and(|r| r.is_match(&g.modules[from].id).unwrap_or(false)) {
@@ -869,9 +869,11 @@ pub struct PathFilter {
 }
 
 impl PathFilter {
-    /// Patterns were validated when the config was loaded.
+    /// Patterns were validated when the config was loaded. An empty pattern
+    /// (`exclude_path = ""` or `[]`) sets no filter, rather than matching
+    /// every path.
     pub fn new(opts: &Options) -> Self {
-        let re = |p: &Option<crate::config::Pat>| p.as_ref().and_then(|p| fancy_regex::Regex::new(&p.0).ok());
+        let re = |p: &Option<crate::config::Pat>| p.as_ref().filter(|p| !p.0.is_empty()).and_then(|p| fancy_regex::Regex::new(&p.0).ok());
         PathFilter { include: re(&opts.include_only), exclude: re(&opts.exclude_path) }
     }
 

@@ -489,6 +489,44 @@ fn migrate_writes_config_and_baseline() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+#[test]
+fn empty_exclude_keeps_the_project() {
+    // The rules config the JavaScript rules tool generates has `exclude: []`.
+    // Migrated, it must not exclude every file; nor may an empty pattern
+    // written in detangle.toml.
+    let dir = std::env::temp_dir().join(format!("detangle-empty-exclude-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("package.json"), r#"{"name":"r","private":true}"#).unwrap();
+    std::fs::write(dir.join("src/a.ts"), "import { b } from './b';\nexport const a = 1;\n").unwrap();
+    std::fs::write(dir.join("src/b.ts"), "import { a } from './a';\nexport const b = a;\n").unwrap();
+    std::fs::write(
+        dir.join(".rules.cjs"),
+        "module.exports = { forbidden: [{ name: 'no-circular', severity: 'error', from: {}, to: { circular: true } }], options: { exclude: [], doNotFollow: [] } };\n",
+    )
+    .unwrap();
+    let run = |args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_detangle")).args(args).current_dir(&dir).env("NO_COLOR", "1").output().unwrap();
+        (String::from_utf8(out.stdout).unwrap(), out.status.code().unwrap())
+    };
+    let cycles = |out: &str| {
+        let v: serde_json::Value = serde_json::from_str(out).unwrap();
+        v.as_array().unwrap().iter().filter(|x| x["rule"] == "no-circular").count()
+    };
+    assert_eq!(run(&["migrate"]).1, 0);
+    let (out, code) = run(&["check", "-f", "json"]);
+    assert_eq!((cycles(&out), code), (2, 1), "{out}");
+
+    std::fs::write(
+        dir.join("detangle.toml"),
+        "[options]\nexclude_path = \"\"\ndo_not_follow = \"\"\n\n[[forbidden]]\nname = \"no-circular\"\nseverity = \"error\"\nto = { circular = true }\n",
+    )
+    .unwrap();
+    let (out, _) = run(&["check", "-f", "json"]);
+    assert_eq!(cycles(&out), 2, "{out}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
     std::fs::create_dir_all(to).unwrap();
     for e in std::fs::read_dir(from).unwrap() {
