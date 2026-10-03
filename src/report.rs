@@ -46,6 +46,29 @@ pub fn plural(n: usize, word: &str) -> String {
     format!("{n} {word}{}", if n == 1 { "" } else { "s" })
 }
 
+/// Why imports of declared packages don't resolve, when the packages aren't
+/// installed (a CI checkout before `npm ci`), or `None`.
+pub fn not_installed_note(g: &Graph) -> Option<String> {
+    let missing = g.not_installed();
+    if missing.is_empty() {
+        return None;
+    }
+    let imports: usize = missing.values().sum();
+    let mut names: Vec<&str> = missing.keys().map(String::as_str).take(5).collect();
+    if missing.len() > 5 {
+        names.push("…");
+    }
+    Some(format!(
+        "{} of {} declared {} {} resolve because {} installed ({}); install dependencies (for example `npm ci`) before `detangle check`",
+        plural(imports, "import"),
+        missing.len(),
+        if missing.len() == 1 { "package" } else { "packages" },
+        if imports == 1 { "doesn't" } else { "don't" },
+        if missing.len() == 1 { "it isn't" } else { "they aren't" },
+        names.join(", "),
+    ))
+}
+
 pub fn counts(vs: &[Violation]) -> (usize, usize, usize) {
     let n = |s| vs.iter().filter(|v| v.severity == s).count();
     (n(Severity::Error), n(Severity::Warn), n(Severity::Info))
@@ -336,6 +359,9 @@ pub fn markdown(g: &Graph, vs: &[Violation], stale: &Stale) -> String {
     let cell = |s: &str| s.replace('|', "\\|").replace('\n', " ");
     let code = |s: &str| format!("`{}`", s.replace('`', "'"));
     let mut out = String::from("## Dependency check\n\n");
+    if let Some(note) = not_installed_note(g) {
+        let _ = writeln!(out, "> [!WARNING]\n> {note}\n");
+    }
     let (e, w, i) = totals(vs, stale);
     let summary = format!(
         "{} modules, {} dependencies, {}",

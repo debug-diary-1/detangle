@@ -324,6 +324,44 @@ impl Graph {
         self.groups = Some(Box::new(g));
     }
 
+    /// When dependencies were never installed (no `node_modules` at or above
+    /// the root, as in a CI checkout before `npm ci`): the declared npm
+    /// packages that unresolvable imports name, with the number of such
+    /// imports. Empty once anything is installed, so a single missing
+    /// package stays an ordinary unresolvable import, and under Yarn
+    /// Plug'n'Play, which has no `node_modules`.
+    pub fn not_installed(&self) -> std::collections::BTreeMap<String, usize> {
+        let mut out = std::collections::BTreeMap::new();
+        if self.root.join(".pnp.cjs").is_file()
+            || self.root.join(".pnp.js").is_file()
+            || self.root.ancestors().any(|d| d.join("node_modules").is_dir())
+        {
+            return out;
+        }
+        let mut pkgs = PackageJsons::default();
+        let mut installed: HashMap<(PathBuf, String), bool> = HashMap::default();
+        for e in &self.edges {
+            let spec = &*e.specifier;
+            if self.modules[e.to].kind != ModuleKind::Unresolved
+                || !crate::scan::is_bare(spec)
+                || spec.starts_with('#')
+                || crate::scan::is_builtin(spec)
+            {
+                continue;
+            }
+            let pkg = crate::scan::package_name(spec);
+            let file = self.root.join(&self.modules[e.from].id);
+            let dir = file.parent().unwrap_or(&self.root).to_path_buf();
+            let here = *installed
+                .entry((dir, pkg.to_string()))
+                .or_insert_with_key(|(dir, pkg)| dir.ancestors().any(|d| d.join("node_modules").join(pkg).is_dir()));
+            if !here && pkgs.classify(&file, pkg) != ["npm-undeclared"] {
+                *out.entry(pkg.to_string()).or_insert(0) += 1;
+            }
+        }
+        out
+    }
+
     /// The group graph (empty until `assign_groups`).
     pub fn groups(&self) -> &Graph {
         static EMPTY: std::sync::OnceLock<Graph> = std::sync::OnceLock::new();

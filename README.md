@@ -63,9 +63,11 @@ detangle migrate             # write detangle.toml
 
 ## In CI
 
-With GitHub Actions, the [detangle action](https://github.com/debug-diary-1/detangle-action) installs the binary, annotates the pull request and writes a report to the job summary:
+With GitHub Actions, the [detangle action](https://github.com/debug-diary-1/detangle-action) installs the binary, annotates the pull request and writes a report to the job summary. Install your dependencies first, so imports of npm packages resolve:
 
 ```yaml
+- uses: actions/checkout@v4
+- run: npm ci   # or pnpm / yarn install
 - uses: debug-diary-1/detangle-action@v1
 ```
 

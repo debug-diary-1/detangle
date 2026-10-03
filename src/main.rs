@@ -334,6 +334,10 @@ fn run() -> Result<ExitCode> {
             }
             let stale = report::Stale { entries: &a.stale, severity: project.config().options.baseline_stale };
             let (g, vs) = (&a.graph, &a.violations);
+            let not_installed = report::not_installed_note(g);
+            if let Some(n) = &not_installed {
+                eprintln!("{}", Paint::stderr().dim(&format!("note: {n}")));
+            }
             match format {
                 CheckFormat::Text => print!("{}", report::text(g, vs, suppressed, &stale)),
                 CheckFormat::Json => {
@@ -341,6 +345,9 @@ fn run() -> Result<ExitCode> {
                 }
                 CheckFormat::Markdown => print!("{}", report::markdown(g, vs, &stale)),
                 CheckFormat::Github | CheckFormat::Teamcity | CheckFormat::Azure => {
+                    if let (CheckFormat::Github, Some(n)) = (format, &not_installed) {
+                        println!("::warning title=detangle::{n}");
+                    }
                     print!(
                         "{}",
                         match format {
