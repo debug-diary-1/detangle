@@ -1,0 +1,11 @@
+# pre-commit (https://pre-commit.com) hook: `detangle check` on the whole
+# project whenever a file that can change its result is staged. The npm
+# version below is bumped with every release (docs/releasing.md).
+- id: detangle
+  name: detangle
+  description: Check import cycles and architecture rules in JavaScript and TypeScript.
+  entry: detangle check
+  language: node
+  additional_dependencies: ["detangle@0.2.2"]
+  pass_filenames: false
+  files: '\.([cm]?[jt]sx?|vue|svelte)$|(^|/)(detangle\.toml|package\.json|tsconfig[^/]*\.json)$'
