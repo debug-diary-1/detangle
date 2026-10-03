@@ -254,7 +254,9 @@ fn regex_option(v: &Value, name: &str, warnings: &mut Vec<String>) -> Option<Pat
         }
         other => other,
     };
-    serde_json::from_value(pat.clone()).ok()
+    // An empty pattern (`exclude: []`) means no filter there; as a regex it
+    // would match every path.
+    serde_json::from_value::<Pat>(pat.clone()).ok().filter(|p| !p.0.is_empty())
 }
 
 pub fn convert(v: &Value) -> Imported {
@@ -284,6 +286,7 @@ pub fn convert(v: &Value) -> Imported {
                         other => other.clone(),
                     };
                     if let Ok(p) = serde_json::from_value::<Pat>(path)
+                        && !p.0.is_empty()
                         && !p.0.split('|').all(|alt| alt.contains("node_modules"))
                     {
                         opts.do_not_follow = Some(p);
@@ -501,5 +504,16 @@ mod tests {
         let back: Config = toml::from_str(&text).unwrap();
         assert_eq!(back.forbidden.len(), 8);
         crate::rules::validate(&back).unwrap();
+    }
+
+    #[test]
+    fn empty_path_options_mean_no_filter() {
+        // The stock generated config has `exclude: []`; an empty pattern
+        // would match every path and exclude the whole project.
+        for empty in [json!([]), json!(""), json!({ "path": [] }), json!({ "path": "" })] {
+            let imp = convert(&json!({ "options": { "exclude": empty, "includeOnly": empty, "doNotFollow": empty } }));
+            let o = &imp.config.options;
+            assert!(o.exclude_path.is_none() && o.include_only.is_none() && o.do_not_follow.is_none(), "{empty}: {o:?}");
+        }
     }
 }
