@@ -101,6 +101,7 @@ Violations show on the imports that cause them as you type, including unsaved ed
 ## Learn more
 
 - [Full reference](https://github.com/debug-diary-1/detangle/blob/main/docs/reference.md): every command, rule option, the explorer, groups and Nx projects, the ESLint rules, the Node.js API and the HTML report.
+- [Contributing](https://github.com/debug-diary-1/detangle/blob/main/CONTRIBUTING.md): reporting a wrong result, sharing your repo's numbers, building and testing.
 - [Releasing](https://github.com/debug-diary-1/detangle/blob/main/docs/releasing.md)
 
 ## License

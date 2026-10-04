@@ -1,0 +1,48 @@
+name: My repo's numbers
+description: How long detangle took on your codebase, and what it found
+labels: [numbers]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Numbers from real codebases and machines are how we find out where detangle is slow or wrong. Public or private repositories are both welcome; for a private one, describe its size.
+  - type: input
+    id: repo
+    attributes:
+      label: Repository
+      description: A link and commit, or a description (for a private repository).
+      placeholder: https://github.com/org/repo at abc1234, or "private monorepo, ~4,000 TypeScript files"
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: detangle version
+      placeholder: detangle 0.2.6
+    validations:
+      required: true
+  - type: input
+    id: machine
+    attributes:
+      label: Machine
+      placeholder: Apple M2, 16 GB, macOS 15 / Ryzen 7 5800X, Ubuntu 24.04 / GitHub Actions ubuntu-latest
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Output
+      description: The summary line of `detangle check` (modules, dependencies, cycles, time), and `DETANGLE_TIMINGS=1 detangle check` if you can.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: compare
+    attributes:
+      label: Compared with
+      description: Optional. What you used before (madge, ESLint import/no-cycle, another rules tool), how long it took, and whether the results agreed.
+  - type: textarea
+    id: notes
+    attributes:
+      label: Anything it got wrong or missed
+      description: Optional. If something looks wrong, a bug report with a reproduction helps even more.

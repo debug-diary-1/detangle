@@ -1,0 +1,72 @@
+name: Bug or wrong result
+description: detangle crashes, or reports something wrong (an import it can't resolve, a cycle it misses or invents, a migration that differs)
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. A public repository and commit, or a few files that reproduce it, is the most useful thing you can add.
+  - type: input
+    id: version
+    attributes:
+      label: detangle version
+      description: Output of `detangle --version` (or `npx detangle --version`).
+      placeholder: detangle 0.2.6
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: How you run it
+      options:
+        - npm / npx
+        - Homebrew
+        - cargo install
+        - Release binary
+        - GitHub Action
+        - ESLint rules (detangle/eslint)
+        - Node.js API
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: macOS 15 (arm64), Ubuntu 24.04, Windows 11…
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: The command you ran and its output. For a wrong import, the importing file and the import as written.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+      description: For example, the file your bundler or TypeScript resolves the import to.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: How to reproduce
+      description: A public repository and commit, or the files (package.json, tsconfig, detangle.toml, the source files involved).
+    validations:
+      required: true
+  - type: checkboxes
+    id: setup
+    attributes:
+      label: Project setup
+      description: What applies to the project?
+      options:
+        - label: Monorepo / workspaces (npm, yarn, pnpm)
+        - label: tsconfig `paths`, `extends` or `references`
+        - label: Bundler aliases (Vite, webpack, Babel)
+        - label: Yarn Plug'n'Play
+        - label: Nx
+        - label: Vue, Svelte or Angular
+        - label: Dependencies were installed (node_modules present)
