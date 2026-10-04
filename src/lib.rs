@@ -17,6 +17,7 @@ pub mod rules;
 pub mod scan;
 pub mod sfc;
 pub mod stamps;
+pub mod tsconfig_fallback;
 pub mod tui;
 pub mod watch;
 

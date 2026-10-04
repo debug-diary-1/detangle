@@ -25,6 +25,7 @@ use serde::Serialize;
 
 use crate::aliases::{Aliases, Rewrite};
 use crate::config::Options;
+use crate::tsconfig_fallback::Fallback;
 use crate::sfc;
 
 pub const SOURCE_EXTS: &[&str] =
@@ -447,6 +448,11 @@ impl Session {
         Ok(s)
     }
 
+    /// Notes about tsconfigs that failed to load.
+    pub fn notes(&self) -> Vec<String> {
+        self.resolver.notes()
+    }
+
     pub fn files(&self) -> &[ScannedFile] {
         &self.files
     }
@@ -726,6 +732,11 @@ struct Resolvers {
     /// `options.resolve.builtins` (a replacement list) and `builtins_add`.
     builtins: Option<Vec<String>>,
     builtins_add: Vec<String>,
+    /// `options.tsconfig`, when it names one tsconfig for every file.
+    manual_tsconfig: Option<PathBuf>,
+    /// Tsconfigs that failed to load, by path: their own `paths` and
+    /// `baseUrl` (`None` when nothing in them is missing).
+    fallbacks: Mutex<HashMap<PathBuf, Option<Arc<Fallback>>>>,
 }
 
 impl Resolvers {
@@ -735,6 +746,22 @@ impl Resolvers {
             Some(list) => listed(list),
             None => is_builtin(spec) || listed(&self.builtins_add),
         }
+    }
+
+    /// The fallback for the tsconfig governing `file`, which failed to load.
+    fn fallback_for(&self, file: &Path) -> Option<Arc<Fallback>> {
+        let tsconfig = match &self.manual_tsconfig {
+            Some(p) => p.clone(),
+            None => file.ancestors().skip(1).map(|d| d.join("tsconfig.json")).find(|p| p.is_file())?,
+        };
+        let mut map = self.fallbacks.lock().unwrap();
+        map.entry(tsconfig).or_insert_with_key(|p| Fallback::load(p).map(Arc::new)).clone()
+    }
+
+    /// Notes about tsconfigs that failed to load.
+    fn notes(&self) -> Vec<String> {
+        let map = self.fallbacks.lock().unwrap();
+        crate::tsconfig_fallback::notes(&self.root, map.values().flatten().map(|f| &**f))
     }
 
     fn resolve_file(&self, from: &Path, spec: &str) -> Result<Resolution, ResolveError> {
@@ -794,7 +821,19 @@ fn make_resolver(root: &Path, opts: &Options) -> Result<Resolvers> {
         .collect();
     static NEXT_ID: AtomicU64 = AtomicU64::new(0);
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    Ok(Resolvers { id, root: root.to_path_buf(), preserve_symlinks: r.preserve_symlinks, main, plain, without_condition, aliases, builtins: r.builtins.clone(), builtins_add: r.builtins_add.clone() })
+    Ok(Resolvers {
+        id,
+        root: root.to_path_buf(),
+        preserve_symlinks: r.preserve_symlinks,
+        main,
+        plain,
+        without_condition,
+        aliases,
+        builtins: r.builtins.clone(),
+        builtins_add: r.builtins_add.clone(),
+        manual_tsconfig: opts.tsconfig.as_ref().map(|p| root.join(p)),
+        fallbacks: Mutex::default(),
+    })
 }
 
 thread_local! {
@@ -874,6 +913,8 @@ struct DirMemo {
     dir: PathBuf,
     /// The governing tsconfig, by identity (the resolver caches it).
     tsconfig: Option<std::sync::Arc<oxc_resolver::TsConfig>>,
+    /// When the governing tsconfig failed to load: its own `paths` and `baseUrl`.
+    fallback: Option<Arc<Fallback>>,
     targets: rustc_hash::FxHashMap<String, Option<Target>>,
 }
 
@@ -884,17 +925,28 @@ thread_local! {
 impl DirMemo {
     fn enter(&mut self, resolver: &Resolvers, file: &Path) {
         let dir = file.parent().unwrap_or(file);
+        let same_place = self.resolver == resolver.id && self.dir == dir;
         // A tsconfig that fails to load governs nothing; resolution then
-        // falls back to the plain resolver, which ignores tsconfigs.
-        let tsconfig = resolver.main.find_tsconfig(file).ok().flatten();
+        // falls back to the plain resolver, which ignores tsconfigs, plus the
+        // failed tsconfig's own `paths` and `baseUrl`.
+        let (tsconfig, fallback) = match resolver.main.find_tsconfig(file) {
+            Ok(t) => (t, None),
+            Err(_) if same_place && self.tsconfig.is_none() && self.fallback.is_some() => (None, self.fallback.clone()),
+            Err(_) => (None, resolver.fallback_for(file)),
+        };
         let same_tsconfig = match (&self.tsconfig, &tsconfig) {
             (Some(a), Some(b)) => std::sync::Arc::ptr_eq(a, b),
             (a, b) => a.is_none() && b.is_none(),
         };
-        if self.resolver != resolver.id || self.dir != dir || !same_tsconfig {
+        let same_fallback = match (&self.fallback, &fallback) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            (a, b) => a.is_none() && b.is_none(),
+        };
+        if !same_place || !same_tsconfig || !same_fallback {
             self.resolver = resolver.id;
             self.dir = dir.to_path_buf();
             self.tsconfig = tsconfig;
+            self.fallback = fallback;
             self.targets.clear();
         }
     }
@@ -903,7 +955,7 @@ impl DirMemo {
         if let Some(t) = self.targets.get(spec) {
             return t.clone();
         }
-        let t = resolve(resolver, from, spec);
+        let t = resolve(resolver, from, spec, self.fallback.as_deref());
         self.targets.insert(spec.to_string(), t.clone());
         t
     }
@@ -994,7 +1046,7 @@ fn package_from_path(p: &Path) -> Option<String> {
     }
 }
 
-fn resolve(resolver: &Resolvers, from: &Path, spec: &str) -> Option<Target> {
+fn resolve(resolver: &Resolvers, from: &Path, spec: &str, fallback: Option<&Fallback>) -> Option<Target> {
     // Aliases (webpack / babel / detangle.toml) replace the specifier outright.
     match resolver.aliases.rewrite(spec) {
         Some(Rewrite::Ignore) => return None,
@@ -1014,6 +1066,13 @@ fn resolve(resolver: &Resolvers, from: &Path, spec: &str) -> Option<Target> {
             if let Ok(res) = resolver.resolve_file(from, &r.join(spec).to_string_lossy()) {
                 return Some(classify(res.path(), spec));
             }
+        }
+    }
+    // A failed tsconfig's own `paths` and `baseUrl`, tried before packages
+    // as TypeScript does.
+    for c in fallback.map(|f| f.candidates(spec)).unwrap_or_default() {
+        if let Ok(res) = resolver.plain.resolve_file(from, &c.to_string_lossy()) {
+            return Some(classify(res.path(), spec));
         }
     }
     if resolver.is_builtin(spec) {
@@ -1354,7 +1413,7 @@ export const f = (x) => [module.require("./g"), process.getBuiltinModule("fs"), 
         let from = root.join("src/index.js");
         let resolved = |opts: &Options, spec: &str| -> String {
             let r = make_resolver(&root, opts).unwrap();
-            match resolve(&r, &from, spec) {
+            match resolve(&r, &from, spec, None) {
                 Some(Target::Local(p)) => p.strip_prefix(&root).unwrap().to_string_lossy().replace('\\', "/"),
                 Some(Target::Builtin(b)) => format!("builtin:{b}"),
                 Some(Target::Npm(n)) => format!("npm:{n}"),

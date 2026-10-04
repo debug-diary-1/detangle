@@ -197,7 +197,7 @@ impl Project {
             cache_args: cache_args.clone(),
             cfg,
             config_path: loaded.path,
-            notes: loaded.notes,
+            notes: loaded.notes.into_iter().chain(session.notes()).collect(),
             session,
         })
     }
