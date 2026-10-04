@@ -232,7 +232,7 @@ export default [<span class="c">/* ...your config */</span> detangle.configs.rec
 
   <section id="benchmarks">
     <h2>Benchmarks</h2>
-    <p>Each tool checks the same repository for the problems it's built to find. detangle always runs its full default rule set: cycles, unresolvable imports, undeclared packages and orphans.</p>
+    <p>Each tool checks the same repository for the problems it's built to find. detangle always runs its full default rule set: cycles, unresolvable imports, undeclared packages, devDependencies in production code, test files imported by production code, and orphans.</p>
     <div class="controls" role="group" aria-label="Benchmark view">
       <div class="seg" id="repo-seg" aria-label="Repository"></div>
       <div class="seg" id="metric-seg" aria-label="Metric"></div>

@@ -32,7 +32,7 @@ detangle init           # write a starter detangle.toml
 detangle report --open  # HTML report
 ```
 
-With no config, `detangle check` reports import cycles, unresolvable imports, undeclared npm packages and orphaned files.
+With no config, `detangle check` reports import cycles, unresolvable imports, undeclared npm packages, devDependencies imported by production code, production code importing test files, and orphaned files.
 
 ## Rules
 
