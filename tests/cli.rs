@@ -559,6 +559,47 @@ fn says_when_declared_packages_are_not_installed() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+#[test]
+fn tsconfig_with_a_missing_extends_keeps_its_own_paths() {
+    // `extends` names a package that isn't installed: TypeScript reports it
+    // and still applies the file's own `paths` and `baseUrl`. So does detangle.
+    let extending = |options: &str| {
+        format!("{{\n  // a comment, as tsconfigs have\n  \"extends\": \"some-missing-pkg/tsconfig.base\",\n  \"compilerOptions\": {options},\n}}\n")
+    };
+    for (name, files, spec) in [
+        ("paths", vec![("tsconfig.json", extending(r#"{"paths": {"@src/*": ["./src/*"]}}"#))], "@src/"),
+        ("base-url", vec![("tsconfig.json", extending(r#"{"baseUrl": "src"}"#))], ""),
+        // A solution-style tsconfig: its own `paths`, and `references` to a
+        // project whose `extends` chain reaches the missing package.
+        (
+            "references",
+            vec![
+                ("tsconfig.json", r#"{"compilerOptions": {"paths": {"@src/*": ["./src/*"]}}, "files": [], "references": [{"path": "./tsconfig.app.json"}]}"#.to_string()),
+                ("tsconfig.app.json", r#"{"extends": "./tsconfig.base.json", "include": ["src"]}"#.to_string()),
+                ("tsconfig.base.json", extending(r#"{"paths": {"@src/*": ["./src/*"]}}"#)),
+            ],
+            "@src/",
+        ),
+    ] {
+        let dir = std::env::temp_dir().join(format!("detangle-ts-extends-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("package.json"), r#"{"name":"r","private":true}"#).unwrap();
+        for (file, body) in &files {
+            std::fs::write(dir.join(file), body).unwrap();
+        }
+        std::fs::write(dir.join("src/a.ts"), format!("import {{ b }} from '{spec}b';\nexport const a = 1;\n")).unwrap();
+        std::fs::write(dir.join("src/b.ts"), format!("import {{ a }} from '{spec}a';\nexport const b = a;\n")).unwrap();
+        let out = Command::new(env!("CARGO_BIN_EXE_detangle")).args(["check", "-f", "json"]).current_dir(&dir).env("NO_COLOR", "1").output().unwrap();
+        let (stdout, stderr) = (String::from_utf8(out.stdout).unwrap(), String::from_utf8(out.stderr).unwrap());
+        let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        let rules: Vec<&str> = v.as_array().unwrap().iter().map(|x| x["rule"].as_str().unwrap()).collect();
+        assert_eq!(rules, ["no-circular", "no-circular"], "{name}: {stdout}");
+        assert!(stderr.contains("tsconfig.json") && stderr.contains("some-missing-pkg/tsconfig.base"), "{name}: {stderr}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
 fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
     std::fs::create_dir_all(to).unwrap();
     for e in std::fs::read_dir(from).unwrap() {

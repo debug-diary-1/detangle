@@ -167,7 +167,7 @@ fn tsconfig_chain(start: &[PathBuf]) -> BTreeSet<PathBuf> {
 /// Where a tsconfig `extends` entry points: a path relative to `dir` (with
 /// or without `.json`), or a package (`@tsconfig/node20`, or a file inside
 /// one) in the nearest node_modules that has it.
-fn resolve_extends(dir: &Path, spec: &str) -> Option<PathBuf> {
+pub(crate) fn resolve_extends(dir: &Path, spec: &str) -> Option<PathBuf> {
     let file = |p: PathBuf| -> Option<PathBuf> {
         let json = PathBuf::from(format!("{}.json", p.display()));
         let found = [p.clone(), json, p.join("tsconfig.json")].into_iter().find(|c| c.is_file())?;
