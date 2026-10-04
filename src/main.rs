@@ -230,6 +230,46 @@ fn analyze(path: &Path, config: Option<&Path>, mode: Option<&str>, cache: &Cache
     Ok(one_shot(project.analyze()?))
 }
 
+/// Files changed on this branch, relative to `root`: whatever differs
+/// between the merge-base of `since` and HEAD and the working tree
+/// (committed, staged and unstaged), plus untracked files git doesn't ignore.
+/// Comparing from the merge-base keeps out commits that landed on `since`
+/// after the branch. Returns (present, deleted).
+fn changed_since(root: &Path, since: &str) -> Result<(Vec<String>, Vec<String>)> {
+    let git = |args: &[&str]| -> Result<Vec<u8>> {
+        let out = std::process::Command::new("git").args(args).current_dir(root).output().context("running git")?;
+        if !out.status.success() {
+            bail!("git {} failed: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim());
+        }
+        Ok(out.stdout)
+    };
+    if git(&["rev-parse", "--git-dir"]).is_err() {
+        bail!("--since {since}: {} isn't in a git repository", root.display());
+    }
+    if git(&["rev-parse", "--verify", "--quiet", &format!("{since}^{{commit}}")]).is_err() {
+        bail!("--since {since}: not a commit in this repository; fetch it first (with actions/checkout, `fetch-depth: 0`)");
+    }
+    let base = match git(&["merge-base", since, "HEAD"]) {
+        Ok(b) if !b.is_empty() => String::from_utf8_lossy(&b).trim().to_string(),
+        _ => bail!(
+            "--since {since}: no common ancestor with HEAD; in a shallow clone, fetch more history (with actions/checkout, `fetch-depth: 0`)"
+        ),
+    };
+    let fields = |bytes: Vec<u8>| -> Vec<String> {
+        bytes.split(|&b| b == 0).filter(|f| !f.is_empty()).map(|f| String::from_utf8_lossy(f).into_owned()).collect()
+    };
+    // `--no-renames`: a rename is its old path deleted and its new path added.
+    let diff = fields(git(&["diff", "--name-status", "-z", "--no-renames", "--relative", &base])?);
+    let (mut present, mut deleted) = (vec![], vec![]);
+    for pair in diff.chunks(2) {
+        if let [status, path] = pair {
+            if status.starts_with('D') { deleted.push(path.clone()) } else { present.push(path.clone()) }
+        }
+    }
+    present.extend(fields(git(&["ls-files", "--others", "--exclude-standard", "-z"])?));
+    Ok((present, deleted))
+}
+
 /// Keeps `v` until the process exits. One-shot commands use it for the
 /// project and its analysis: freeing a large graph piece by piece takes
 /// longer than the rest of the output (20 ms on VS Code), and the OS
@@ -426,22 +466,31 @@ fn run() -> Result<ExitCode> {
         Cmd::Affected { files, since, dir, config, mode, filter } => {
             let a = analyze(&dir, config.as_deref(), mode.as_deref(), &cache)?;
             let g = &a.graph;
-            let mut changed = files;
+            let (mut present, mut deleted) = (files, vec![]);
             if let Some(r) = since {
-                let out = std::process::Command::new("git")
-                    .args(["diff", "--name-only", "--relative", &r])
-                    .current_dir(&g.root)
-                    .output()
-                    .context("running git")?;
-                if !out.status.success() {
-                    bail!("git diff failed: {}", String::from_utf8_lossy(&out.stderr).trim());
-                }
-                changed.extend(String::from_utf8_lossy(&out.stdout).lines().map(String::from));
+                let (p, d) = changed_since(&g.root, &r)?;
+                present.extend(p);
+                deleted = d;
             }
-            let starts: Vec<usize> = changed
-                .iter()
-                .filter_map(|f| g.find(ModuleKind::Local, f.trim_start_matches("./")).or_else(|| g.lookup(f).ok()))
-                .collect();
+            present.sort();
+            present.dedup();
+            let is_config = |f: &str| {
+                let name = f.rsplit('/').next().unwrap_or(f);
+                watch::is_config(name) || detangle::stamps::LOCKFILES.contains(&name)
+            };
+            let (config_changed, present): (Vec<String>, Vec<String>) = present.into_iter().partition(|f| is_config(f));
+            let (config_deleted, deleted): (Vec<String>, Vec<String>) = deleted.into_iter().partition(|f| is_config(f));
+            let config_changed: Vec<String> = config_changed.into_iter().chain(config_deleted).collect();
+            let mut starts = vec![];
+            let mut other = 0;
+            for f in &present {
+                match g.find(ModuleKind::Local, f.trim_start_matches("./")).or_else(|| g.lookup(f).ok()) {
+                    Some(m) => starts.push(m),
+                    None => other += 1,
+                }
+            }
+            starts.sort_unstable();
+            starts.dedup();
             let filter = filter.map(|f| regex::Regex::new(&f)).transpose()?;
             let mut hit: Vec<&str> = g
                 .closure(&starts, false)
@@ -454,7 +503,26 @@ fn run() -> Result<ExitCode> {
             for id in &hit {
                 println!("{id}");
             }
-            eprintln!("{}", p.dim(&format!("{} changed → {} affected", starts.len(), hit.len())));
+            let mut summary = format!("{} changed {}", starts.len(), if starts.len() == 1 { "module" } else { "modules" });
+            for (n, what) in [(deleted.len(), "deleted"), (config_changed.len(), "config"), (other, "other")] {
+                if n > 0 {
+                    summary += &format!(", {n} {what}");
+                }
+            }
+            eprintln!("{}", p.dim(&format!("{summary} → {} affected", hit.len())));
+            let list = |v: &[String]| {
+                let mut s = v.iter().take(5).cloned().collect::<Vec<_>>().join(", ");
+                if v.len() > 5 {
+                    s += &format!(", and {} more", v.len() - 5);
+                }
+                s
+            };
+            if !deleted.is_empty() {
+                eprintln!("{}", p.dim(&format!("deleted: {} (files that still import them aren't found)", list(&deleted))));
+            }
+            if !config_changed.is_empty() {
+                eprintln!("{}", p.dim(&format!("config changed: {} (this can affect any module; not followed)", list(&config_changed))));
+            }
         }
         Cmd::Report { target, output, open } => {
             let a = analyze(&target.path, target.config.as_deref(), target.mode.as_deref(), &cache)?;

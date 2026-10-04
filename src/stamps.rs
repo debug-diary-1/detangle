@@ -21,7 +21,7 @@ pub enum Kind {
 }
 
 /// The lockfiles package managers write at the root.
-const LOCKFILES: &[&str] = &["package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml", "yarn.lock", "bun.lock", "bun.lockb"];
+pub const LOCKFILES: &[&str] = &["package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml", "yarn.lock", "bun.lock", "bun.lockb"];
 
 /// (modified time, size), or `None` for a missing file.
 type Stamp = Option<(SystemTime, u64)>;
