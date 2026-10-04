@@ -495,7 +495,7 @@ dependencies = [
 
 [[package]]
 name = "detangle"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "anyhow",
  "clap",
@@ -524,7 +524,7 @@ dependencies = [
 
 [[package]]
 name = "detangle-napi"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "detangle",
  "dunce",
