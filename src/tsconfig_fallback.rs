@@ -133,10 +133,13 @@ impl Fallback {
                     best = Some((usize::MAX, targets, ""));
                     break;
                 }
-                Some((pre, suf)) if spec.len() >= pre.len() + suf.len() && spec.starts_with(pre) && spec.ends_with(suf) => {
-                    if best.is_none_or(|(len, _, _)| pre.len() > len) {
-                        best = Some((pre.len(), targets, &spec[pre.len()..spec.len() - suf.len()]));
-                    }
+                Some((pre, suf))
+                    if spec.len() >= pre.len() + suf.len()
+                        && spec.starts_with(pre)
+                        && spec.ends_with(suf)
+                        && best.is_none_or(|(len, _, _)| pre.len() > len) =>
+                {
+                    best = Some((pre.len(), targets, &spec[pre.len()..spec.len() - suf.len()]));
                 }
                 _ => {}
             }
