@@ -28,6 +28,8 @@ detangle init                   # write a starter detangle.toml
 
 The project root is the nearest ancestor containing `detangle.toml`, or else `package.json`. Pointing detangle at a subdirectory scans only that subdirectory, and paths are still reported relative to the root.
 
+`affected --since <ref>` takes the changes since the branch left `<ref>` (their merge-base), so commits that landed on `<ref>` afterwards don't count, up to the working tree: committed, staged and unstaged changes, and untracked files git doesn't ignore. It prints the changed modules and everything that imports them, directly or not. Deleted files and changed config files (package.json, lockfiles, tsconfigs, bundler configs, detangle.toml) are listed on stderr but not followed: files that still import a deleted one, and modules a config change affects, aren't found. In CI, the merge-base needs history: with actions/checkout, set `fetch-depth: 0`.
+
 ### Explorer keys
 
 | key | action |

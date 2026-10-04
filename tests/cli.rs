@@ -131,6 +131,62 @@ fn affected_lists_transitive_dependents() {
 }
 
 #[test]
+fn affected_since_compares_from_the_merge_base() {
+    let dir = std::env::temp_dir().join(format!("detangle-affected-git-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false", "-c", "init.defaultBranch=main"])
+            .args(args)
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    };
+    let write = |p: &str, s: &str| std::fs::write(dir.join(p), s).unwrap();
+    write("package.json", r#"{"name":"r","private":true}"#);
+    write("src/a.ts", "import { b } from './b';\nexport const a = b;\n");
+    write("src/b.ts", "export const b = 1;\n");
+    write("src/c.ts", "export const c = 1;\n");
+    write("src/d.ts", "import { c } from './c';\nexport const d = c;\n");
+    write("src/gone.ts", "export const gone = 1;\n");
+    git(&["init", "-q"]);
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "base"]);
+    git(&["checkout", "-qb", "feature"]);
+    // The branch: b.ts edited and gone.ts deleted (committed), package.json
+    // edited (unstaged), new.ts added (untracked).
+    write("src/b.ts", "export const b = 2;\n");
+    std::fs::remove_file(dir.join("src/gone.ts")).unwrap();
+    git(&["commit", "-qam", "feature"]);
+    write("package.json", r#"{"name":"r","private":true,"version":"1.0.0"}"#);
+    write("src/new.ts", "export const n = 1;\n"); // imports nothing that changed
+    // main moves on after the branch: c.ts changes there.
+    git(&["checkout", "-q", "main"]);
+    write("src/c.ts", "export const c = 2;\n");
+    git(&["commit", "-qm", "main moves on", "src/c.ts"]);
+    git(&["checkout", "-q", "feature"]);
+
+    let run = |args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_detangle")).args(args).current_dir(&dir).env("NO_COLOR", "1").output().unwrap();
+        (String::from_utf8(out.stdout).unwrap(), String::from_utf8(out.stderr).unwrap(), out.status.code().unwrap())
+    };
+    let (out, err, code) = run(&["affected", "--since", "main"]);
+    assert_eq!(code, 0, "{err}");
+    // c.ts changed only on main, so neither it nor d.ts is affected.
+    assert_eq!(out.lines().collect::<Vec<_>>(), ["src/a.ts", "src/b.ts", "src/new.ts"], "{err}");
+    assert!(err.contains("2 changed modules, 1 deleted, 1 config → 3 affected"), "{err}");
+    assert!(err.contains("deleted: src/gone.ts"), "{err}");
+    assert!(err.contains("config changed: package.json"), "{err}");
+
+    let (_, err, code) = run(&["affected", "--since", "no-such-ref"]);
+    assert_ne!(code, 0);
+    assert!(err.contains("no-such-ref"), "{err}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn backreference_rules() {
     let dir = std::env::temp_dir().join(format!("detangle-cfg-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
