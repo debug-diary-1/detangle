@@ -32,6 +32,7 @@ DETANGLE_ADDON=target/debug/libdetangle_napi.dylib DETANGLE_BIN=target/debug/det
 - **Keep output stable.** For a refactor or a performance change, `scripts/cmp-output.sh <old-binary> <new-binary> <project>...` compares `check` and `graph` output byte for byte.
 - **Don't run `cargo fmt`** on files you aren't otherwise changing: the code isn't rustfmt-formatted, and a whole-file reformat buries the real change. Match the surrounding style.
 - **One change per pull request**, with a description of what changed and how you checked it. CI runs on Linux, macOS and Windows; Windows often catches path handling.
+- **Waiting on CI.** `scripts/wait-pr.sh <n>` waits for a PR's checks and shows why one failed.
 - Benchmarks against other tools live in [detangle-bench](https://github.com/debug-diary-1/detangle-bench), not in this repository.
 
 ## License
