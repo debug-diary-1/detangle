@@ -18,7 +18,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # The version in rust-toolchain.toml.
+      - uses: dtolnay/rust-toolchain@1.99.0
         with:
           components: clippy
       # The Node.js API's tests run from `cargo test`.
@@ -47,10 +48,14 @@ jobs:
   msrv:
     name: minimum Rust (Cargo.toml rust-version)
     runs-on: ubuntu-latest
+    # rust-toolchain.toml would otherwise pick the pinned stable here.
+    env:
+      RUSTUP_TOOLCHAIN: "1.94"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.94
       - uses: Swatinem/rust-cache@v2
+      - run: rustc --version && cargo --version
       - run: cargo check --locked --all-targets
       # What `cargo install detangle` does: no lockfile, newest compatible
       # dependencies whatever their rust-version. Fails when a dependency
