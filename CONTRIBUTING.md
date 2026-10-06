@@ -8,7 +8,7 @@ Thanks for helping. The most useful contributions, in order:
 
 ## Building and testing
 
-You need Rust 1.94 or newer and Node.js 18 or newer (for the npm package and the ESLint rules).
+rustup picks the pinned toolchain from `rust-toolchain.toml`; the minimum supported Rust stays 1.94, and CI checks it. You also need Node.js 18 or newer (for the npm package and the ESLint rules).
 
 ```sh
 cargo build                     # the CLI: target/debug/detangle

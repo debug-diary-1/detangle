@@ -1,0 +1,7 @@
+# One toolchain for local runs and CI, so clippy lints the same everywhere.
+# Bump it on purpose, together with the workflows that name the same version
+# (.github/workflows/ci.yml and release.yml). The minimum supported Rust is
+# Cargo.toml's rust-version, which CI's msrv job checks separately.
+[toolchain]
+channel = "1.99.0"
+components = ["clippy"]
