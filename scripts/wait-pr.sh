@@ -16,7 +16,9 @@
 # Exit status: 0 if every check passed, was skipped or was neutral; 1 if any
 # failed or was cancelled; 2 after 30 minutes without a result, or on a usage
 # error. With --merge, a PR whose checks all passed is merged with
-# `gh pr merge --merge --delete-branch`; anything else is left alone.
+# `gh pr merge --merge --delete-branch`, which deletes the remote branch but
+# leaves the local checkout alone; anything else is left alone. A merge that
+# GitHub refuses (a conflict, say) also exits 1.
 set -euo pipefail
 
 usage() {
@@ -113,6 +115,13 @@ EOF
 fi
 
 if [ "$merge" -eq 1 ]; then
-  gh pr merge "$pr" --merge --delete-branch
+  # --repo keeps gh off the local checkout: without it gh also switches to and
+  # pulls main, which fails in a worktree when main is checked out elsewhere,
+  # and then skips deleting the remote branch.
+  repo=$(gh repo view --json nameWithOwner -q .nameWithOwner)
+  if ! gh pr merge "$pr" --repo "$repo" --merge --delete-branch; then
+    echo "wait-pr: checks passed but merging PR #$pr failed" >&2
+    exit 1
+  fi
 fi
 exit 0
