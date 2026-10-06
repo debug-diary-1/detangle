@@ -71,6 +71,20 @@ jobs:
           rm Cargo.lock
           cargo build --release
 
+  guardrails:
+    name: guardrails
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # Naming and docs/ on the tree; on a pull request, also the identity
+      # of every commit it adds.
+      - if: github.event_name == 'pull_request'
+        run: scripts/guardrails.sh "origin/${{ github.base_ref }}..${{ github.event.pull_request.head.sha }}"
+      - if: github.event_name != 'pull_request'
+        run: scripts/guardrails.sh
+
   npm-packaging:
     name: npm packaging
     runs-on: ubuntu-latest
