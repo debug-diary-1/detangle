@@ -41,9 +41,10 @@ while IFS= read -r file; do
   esac
 done < <(git ls-files docs)
 
-# 3. Commit identity, on a range: every commit authored as the project
-# identity, with no co-author trailer. Bot authors and merge commits GitHub
-# creates are exempt.
+# 3. Commit identity, on a range: the maintainer's commits (author name
+# Pallav) use the project identity, and no commit credits Claude or Anthropic
+# as a co-author. Other contributors' commits, and their own co-authors, are
+# fine. Bot authors and merge commits GitHub creates are exempt.
 if [ $# -gt 0 ]; then
   range=$1
   case "$range" in
@@ -61,13 +62,13 @@ if [ $# -gt 0 ]; then
     if [ "$parents" -gt 1 ] && [ "$ce" = noreply@github.com ]; then
       continue
     fi
-    if [ "$ae" != "$identity" ]; then
+    if [ "$(printf '%s' "$an" | tr '[:upper:]' '[:lower:]')" = pallav ] && [ "$ae" != "$identity" ]; then
       fail identity "commit $short is authored as $an <$ae>" \
         "amend or rebase it with: git -c user.name=Pallav -c user.email=$identity commit --amend --reset-author --no-edit"
     fi
     body=$(git log -1 --format=%B "$c")
-    if grep -qi '^[[:space:]]*co-authored-by:' <<<"$body"; then
-      fail identity "commit $short has a Co-authored-by trailer" \
+    if grep -qiE '^[[:space:]]*co-authored-by:.*(claude|anthropic)' <<<"$body"; then
+      fail identity "commit $short credits Claude as a co-author" \
         "reword it without the trailer: git commit --amend (or git rebase -i, reword)"
     fi
   done
