@@ -1090,3 +1090,75 @@ fn github_annotations_skip_comments() {
     let found = github_annotations("tests/fixtures/github-lines");
     assert!(found.contains(&("src/c.ts".into(), Some(3), "not-to-unresolvable".into())), "{found:?}");
 }
+
+/// A package whose `exports` map the `custom` condition to sources (build
+/// output absent), a tsconfig declaring it through `extends`, and the
+/// unresolvable imports `check` reports with `toml` as detangle.toml.
+fn custom_condition_unresolvable(name: &str, toml: Option<&str>) -> Vec<String> {
+    let dir = std::env::temp_dir().join(format!("detangle-custom-conditions-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::create_dir_all(dir.join("node_modules/pkg")).unwrap();
+    std::fs::write(dir.join("package.json"), r#"{"name":"r","private":true}"#).unwrap();
+    std::fs::write(dir.join("tsconfig.base.json"), r#"{"compilerOptions": {"customConditions": ["custom"]}}"#).unwrap();
+    std::fs::write(dir.join("tsconfig.json"), r#"{"extends": "./tsconfig.base.json"}"#).unwrap();
+    std::fs::write(
+        dir.join("node_modules/pkg/package.json"),
+        r#"{"name":"pkg","exports":{"./*":{"custom":"./*.ts","default":"./out/*.js"}}}"#,
+    )
+    .unwrap();
+    std::fs::write(dir.join("node_modules/pkg/util.ts"), "export const u = 1;\n").unwrap();
+    std::fs::write(dir.join("src/a.ts"), "import { u } from 'pkg/util';\nexport const a = u;\n").unwrap();
+    if let Some(t) = toml {
+        std::fs::write(dir.join("detangle.toml"), t).unwrap();
+    }
+    let out = Command::new(env!("CARGO_BIN_EXE_detangle")).args(["check", "-f", "json"]).current_dir(&dir).env("NO_COLOR", "1").output().unwrap();
+    let v: serde_json::Value = serde_json::from_str(&String::from_utf8(out.stdout).unwrap()).unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+    v.as_array().unwrap().iter().filter(|x| x["rule"] == "not-to-unresolvable").map(|x| x["to"].as_str().unwrap().to_string()).collect()
+}
+
+#[test]
+fn tsconfig_custom_conditions_resolve_exports() {
+    let found = custom_condition_unresolvable("on", None);
+    assert!(found.is_empty(), "{found:?}");
+}
+
+#[test]
+fn explicit_condition_names_win_over_tsconfig_custom_conditions() {
+    let toml = "[options.resolve]\ncondition_names = [\"import\", \"default\"]\n\n[[forbidden]]\nname = \"not-to-unresolvable\"\nseverity = \"error\"\nto = { could_not_resolve = true }\n";
+    let found = custom_condition_unresolvable("explicit", Some(toml));
+    assert_eq!(found, ["pkg/util"], "{found:?}");
+}
+
+#[test]
+fn custom_conditions_are_per_tsconfig() {
+    let dir = std::env::temp_dir().join(format!("detangle-custom-conditions-two-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let write = |path: &str, text: &str| {
+        let f = dir.join(path);
+        std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+        std::fs::write(f, text).unwrap();
+    };
+    write("package.json", r#"{"name":"r","private":true}"#);
+    for (pkg, cond) in [("pa", "ca"), ("pb", "cb")] {
+        write(&format!("node_modules/{pkg}/package.json"), &format!(r#"{{"name":"{pkg}","exports":{{"./*":{{"{cond}":"./*.ts","default":"./out/*.js"}}}}}}"#));
+        write(&format!("node_modules/{pkg}/x.ts"), "export const x = 1;\n");
+        write(&format!("{cond}/tsconfig.json"), &format!(r#"{{"compilerOptions":{{"customConditions":["{cond}"]}}}}"#));
+        write(&format!("{cond}/f.ts"), "import { x } from 'pa/x';\nimport { x as y } from 'pb/x';\nexport const f = [x, y];\n");
+    }
+    let out = Command::new(env!("CARGO_BIN_EXE_detangle")).args(["check", "-f", "json"]).current_dir(&dir).env("NO_COLOR", "1").output().unwrap();
+    let v: serde_json::Value = serde_json::from_str(&String::from_utf8(out.stdout).unwrap()).unwrap();
+    let found: Vec<(String, String)> = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|x| x["rule"] == "not-to-unresolvable")
+        .map(|x| (x["from"].as_str().unwrap().into(), x["to"].as_str().unwrap().into()))
+        .collect();
+    std::fs::remove_dir_all(&dir).unwrap();
+    // Each tsconfig's condition resolves its own package and not the other's.
+    assert_eq!(found.len(), 2, "{found:?}");
+    assert!(found.contains(&("ca/f.ts".into(), "pb/x".into())), "{found:?}");
+    assert!(found.contains(&("cb/f.ts".into(), "pa/x".into())), "{found:?}");
+}

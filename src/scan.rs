@@ -728,6 +728,13 @@ struct Resolvers {
     /// `main` without each of its condition names in turn, for a bare import
     /// whose matched `exports` condition points at a missing file (#18).
     without_condition: Vec<Resolver>,
+    /// Whether tsconfig `customConditions` apply: `condition_names` is unset.
+    use_custom_conditions: bool,
+    /// The final condition list for a tsconfig's `customConditions`, by
+    /// tsconfig path (`None` when it declares none).
+    custom_conditions: Mutex<HashMap<PathBuf, Option<Vec<String>>>>,
+    /// Resolvers by condition list, shared by tsconfigs with the same one.
+    custom: Mutex<HashMap<Vec<String>, Arc<Variant>>>,
     aliases: Aliases,
     /// `options.resolve.builtins` (a replacement list) and `builtins_add`.
     builtins: Option<Vec<String>>,
@@ -739,7 +746,54 @@ struct Resolvers {
     fallbacks: Mutex<HashMap<PathBuf, Option<Arc<Fallback>>>>,
 }
 
+/// `main` and `without_condition` with extra leading condition names.
+struct Variant {
+    main: Resolver,
+    without_condition: Vec<Resolver>,
+}
+
+fn without_each(main: &Resolver) -> Vec<Resolver> {
+    let conditions = &main.options().condition_names;
+    conditions
+        .iter()
+        .map(|c| {
+            let rest = conditions.iter().filter(|x| *x != c).cloned().collect();
+            main.clone_with_options(ResolveOptions { condition_names: rest, ..main.options().clone() })
+        })
+        .collect()
+}
+
 impl Resolvers {
+    /// The resolvers for `from`'s governing tsconfig when it declares
+    /// `customConditions`, as TypeScript honours them in `exports`/`imports`.
+    fn variant(&self, from: &Path) -> Option<Arc<Variant>> {
+        if !self.use_custom_conditions {
+            return None;
+        }
+        let tsconfig = self.main.find_tsconfig(from).ok()??;
+        let path = tsconfig.path();
+        let cached = self.custom_conditions.lock().unwrap().get(path).cloned();
+        let names = match cached {
+            Some(n) => n,
+            None => {
+                let custom = crate::tsconfig_fallback::custom_conditions(path);
+                let names = (!custom.is_empty()).then(|| {
+                    let mut names = custom.clone();
+                    names.extend(self.main.options().condition_names.iter().filter(|c| !custom.contains(c)).cloned());
+                    names
+                });
+                self.custom_conditions.lock().unwrap().insert(path.to_path_buf(), names.clone());
+                names
+            }
+        }?;
+        if let Some(v) = self.custom.lock().unwrap().get(&names) {
+            return Some(v.clone());
+        }
+        let main = self.main.clone_with_options(ResolveOptions { condition_names: names.clone(), ..self.main.options().clone() });
+        let v = Arc::new(Variant { without_condition: without_each(&main), main });
+        Some(self.custom.lock().unwrap().entry(names).or_insert(v).clone())
+    }
+
     fn is_builtin(&self, spec: &str) -> bool {
         let listed = |l: &[String]| l.iter().any(|b| b == spec || b == spec.trim_start_matches("node:"));
         match &self.builtins {
@@ -765,7 +819,9 @@ impl Resolvers {
     }
 
     fn resolve_file(&self, from: &Path, spec: &str) -> Result<Resolution, ResolveError> {
-        self.main.resolve_file(from, spec).or_else(|e| match e {
+        let variant = self.variant(from);
+        let main = variant.as_ref().map_or(&self.main, |v| &v.main);
+        main.resolve_file(from, spec).or_else(|e| match e {
             ResolveError::Ignored(_) => Err(e),
             _ => self.plain.resolve_file(from, spec).map_err(|_| e),
         })
@@ -811,14 +867,7 @@ fn make_resolver(root: &Path, opts: &Options) -> Result<Resolvers> {
         ..ResolveOptions::default()
     });
     let plain = main.clone_with_options(ResolveOptions { tsconfig: None, ..main.options().clone() });
-    let conditions = &main.options().condition_names;
-    let without_condition = conditions
-        .iter()
-        .map(|c| {
-            let rest = conditions.iter().filter(|x| *x != c).cloned().collect();
-            main.clone_with_options(ResolveOptions { condition_names: rest, ..main.options().clone() })
-        })
-        .collect();
+    let without_condition = without_each(&main);
     static NEXT_ID: AtomicU64 = AtomicU64::new(0);
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     Ok(Resolvers {
@@ -828,6 +877,9 @@ fn make_resolver(root: &Path, opts: &Options) -> Result<Resolvers> {
         main,
         plain,
         without_condition,
+        use_custom_conditions: r.condition_names.is_none(),
+        custom_conditions: Mutex::default(),
+        custom: Mutex::default(),
         aliases,
         builtins: r.builtins.clone(),
         builtins_add: r.builtins_add.clone(),
@@ -1090,7 +1142,8 @@ fn resolve(resolver: &Resolvers, from: &Path, spec: &str, fallback: Option<&Fall
             // Node takes the first matching `exports` condition even when its
             // file is missing; TypeScript moves on to the next one. Leaving
             // out the condition that matched makes the next one match.
-            for r in &resolver.without_condition {
+            let variant = resolver.variant(from);
+            for r in variant.as_ref().map_or(&resolver.without_condition, |v| &v.without_condition) {
                 if let Ok(res) = r.resolve_file(from, spec) {
                     return Some(classify(res.path(), spec));
                 }
