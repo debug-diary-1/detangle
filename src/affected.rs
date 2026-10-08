@@ -91,7 +91,7 @@ pub fn limitations(
     if !unmatched.is_empty() {
         add("unmatched-inputs", "Inputs did not match graph modules; their impact is unknown.", unmatched.to_vec(), None);
     }
-    if options.exclude_path.is_some() || options.include_only.is_some() || options.do_not_follow.is_some() {
+    if graph_restrictions(options).next().is_some() {
         add("graph-restrictions", "Active graph restrictions can hide dependency chains.", vec![], None);
     }
     let unresolved: Vec<_> = g.edges.iter().filter(|e| g.modules[e.to].kind == ModuleKind::Unresolved).collect();
@@ -113,10 +113,8 @@ pub fn print_scope(g: &Graph, options: &detangle::config::Options, filter: Optio
     if let Some(filter) = filter {
         eprintln!("output filter={filter:?}");
     }
-    for (name, value) in [("exclude_path", &options.exclude_path), ("include_only", &options.include_only), ("do_not_follow", &options.do_not_follow)] {
-        if let Some(value) = value {
-            eprintln!("graph restriction: {name}={:?}", value.0);
-        }
+    for (name, value) in graph_restrictions(options) {
+        eprintln!("graph restriction: {name}={value:?}");
     }
     for limit in limitations {
         eprint!("limitation [{}]: {}", limit.code, limit.message);
@@ -128,4 +126,10 @@ pub fn print_scope(g: &Graph, options: &detangle::config::Options, filter: Optio
         }
         eprintln!();
     }
+}
+
+pub fn graph_restrictions(options: &detangle::config::Options) -> impl Iterator<Item = (&'static str, &str)> {
+    [("exclude_path", &options.exclude_path), ("include_only", &options.include_only), ("do_not_follow", &options.do_not_follow)]
+        .into_iter()
+        .filter_map(|(name, value)| value.as_ref().filter(|p| !p.0.is_empty()).map(|p| (name, p.0.as_str())))
 }

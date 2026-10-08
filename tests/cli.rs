@@ -312,6 +312,19 @@ fn affected_why_empty_results_and_fatal_inputs_are_distinct() {
 }
 
 #[test]
+fn affected_why_does_not_report_empty_patterns_as_graph_restrictions() {
+    let dir = affected_project("empty-restrictions", &[
+        ("src/a.ts", "export const a = 1;"),
+        ("detangle.toml", "[options]\nexclude_path = ''\ninclude_only = ''\ndo_not_follow = ''\n"),
+    ]);
+    let (out, err, code) = affected_run(&dir, &["--why", "src/a.ts"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(out, "src/a.ts (changed)\n");
+    assert!(!err.contains("graph-restrictions") && !err.contains("graph restriction:"), "{err}");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn affected_since_compares_from_the_merge_base() {
     let dir = std::env::temp_dir().join(format!("detangle-affected-git-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
