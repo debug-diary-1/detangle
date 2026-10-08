@@ -131,6 +131,429 @@ fn affected_lists_transitive_dependents() {
 }
 
 #[test]
+fn affected_why_explains_shortest_import_paths_and_changed_roots() {
+    let (out, code) = detangle(&["affected", "-C", FIXTURE, "--why", "src/features/user/user.ts"]);
+    assert_eq!(code, 0);
+    assert_eq!(out, concat!(
+        "src/features/cart/cart.ts → src/features/user/profile.ts → src/features/user/user.ts (changed)\n",
+        "src/features/cart/price.ts → src/features/cart/cart.ts → src/features/user/profile.ts → src/features/user/user.ts (changed)\n",
+        "src/features/user/profile.ts → src/features/user/user.ts (changed)\n",
+        "src/features/user/user.ts (changed)\n",
+        "src/index.ts → src/features/user/user.ts (changed)\n",
+    ));
+}
+
+fn affected_project(name: &str, files: &[(&str, &str)]) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("detangle-affected-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("package.json"), r#"{"name":"affected-fixture","private":true}"#).unwrap();
+    for (path, contents) in files {
+        std::fs::write(dir.join(path), contents).unwrap();
+    }
+    dir
+}
+
+fn affected_run(dir: &std::path::Path, args: &[&str]) -> (String, String, i32) {
+    let out = Command::new(env!("CARGO_BIN_EXE_detangle"))
+        .arg("affected").args(args).current_dir(dir).env("NO_COLOR", "1")
+        .env_remove("NODE_ENV").env_remove("BABEL_ENV").output().unwrap();
+    (String::from_utf8(out.stdout).unwrap(), String::from_utf8(out.stderr).unwrap(), out.status.code().unwrap())
+}
+
+#[test]
+fn affected_json_filters_after_resource_traversal_and_retains_merged_edge_evidence() {
+    let dir = affected_project("json-resources", &[
+        ("src/data.json", "{}"),
+        ("src/site.css", "body {}"),
+        ("src/app.ts", "import './data.json'; import './site.css';"),
+        ("src/app.test.ts", "import './app'; void import('./app.ts');"),
+    ]);
+    for seed in ["src/data.json", "src/site.css"] {
+        let (out, err, code) = affected_run(&dir, &["-f", "json", seed, "--filter", r"\.test\.ts$"]);
+        assert_eq!(code, 0, "{err}");
+        let report: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(report["counts"], serde_json::json!({"inputs":1,"seeds":1,"affected":3,"displayed":1}));
+        assert_eq!(report["scope"]["outputFilter"], r"\.test\.ts$");
+        assert_eq!(report["affected"][0]["path"], serde_json::json!(["src/app.test.ts","src/app.ts",seed]));
+        assert_eq!(report["affected"][0]["edges"][0], serde_json::json!({"from":"src/app.test.ts","to":"src/app.ts","specifiers":["./app","./app.ts"],"dependencyTypes":["local"]}));
+    }
+    let (out, err, code) = affected_run(&dir, &["--format", "text", "src/site.css"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(out, "src/app.test.ts\nsrc/app.ts\nsrc/site.css\n");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn affected_json_reports_empty_results_restrictions_and_analysis_gaps() {
+    let dir = affected_project("json-limits", &[
+        ("src/a.ts", "import './missing';"),
+        ("src/b.ts", "export const b = ;"),
+        ("detangle.toml", "[options]\nexclude_path = '^excluded/'\ninclude_only = '^(src/|[.]/)'\ndo_not_follow = 'opaque'\n"),
+    ]);
+    for args in [vec!["-f", "json"], vec!["-f", "json", "package.json", "unknown.ts"]] {
+        let (out, err, code) = affected_run(&dir, &args);
+        assert_eq!(code, 0, "{err}");
+        let report: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(report["affected"], serde_json::json!([]));
+        assert_eq!(report["counts"], serde_json::json!({"inputs":args.len()-2,"seeds":0,"affected":0,"displayed":0}));
+        assert_eq!(report["scope"]["graphRestrictions"], serde_json::json!({"exclude_path":"^excluded/","include_only":"^(src/|[.]/)","do_not_follow":"opaque"}));
+        let limits = report["limitations"].as_array().unwrap();
+        for code in ["graph-restrictions", "unresolved-imports", "parse-errors", "dynamic-relationships-not-guaranteed"] {
+            assert!(limits.iter().any(|l| l["code"] == code), "{report}");
+        }
+        let unresolved = limits.iter().find(|l| l["code"] == "unresolved-imports").unwrap();
+        assert_eq!(unresolved["paths"], serde_json::json!(["src/a.ts"]));
+        assert_eq!(unresolved["count"], 1);
+        let errors = limits.iter().find(|l| l["code"] == "parse-errors").unwrap();
+        assert_eq!(errors["paths"], serde_json::json!(["src/b.ts"]));
+        assert!(errors["count"].as_u64().unwrap() > 0);
+        if args.len() == 2 { assert_eq!(report["inputs"], serde_json::json!([])); }
+        else {
+            assert_eq!(report["inputs"][0]["classification"], "configuration");
+            assert_eq!(report["inputs"][1]["classification"], "unmatched");
+        }
+    }
+    for args in [vec!["-f", "json", "--filter", "["], vec!["-f", "json", "--since", "absent"]] {
+        let (out, err, code) = affected_run(&dir, &args);
+        assert_ne!(code, 0, "{err}");
+        assert!(out.is_empty(), "{out}");
+    }
+    std::fs::write(dir.join("detangle.toml"), "[invalid").unwrap();
+    let (out, err, code) = affected_run(&dir, &["-f", "json"]);
+    assert_ne!(code, 0, "{err}");
+    assert!(out.is_empty(), "{out}");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn affected_json_preserves_git_comparison_origins_and_deleted_configuration() {
+    let dir = affected_project("json-git", &[
+        ("src/root.ts", "export const root = 1;"),
+        ("src/gone.ts", "export const gone = 1;"),
+        ("src/app.ts", "import './root';"),
+        ("tsconfig.json", "{}"),
+    ]);
+    let git = |args: &[&str]| {
+        let out = Command::new("git").args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false", "-c", "init.defaultBranch=main"])
+            .args(args).current_dir(&dir).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    };
+    git(&["init", "-q"]); git(&["add", "-A"]); git(&["commit", "-qm", "base"]);
+    let base = git(&["rev-parse", "HEAD"]);
+    git(&["checkout", "-qb", "feature"]);
+    std::fs::write(dir.join("src/root.ts"), "export const root = 2;").unwrap();
+    std::fs::remove_file(dir.join("src/gone.ts")).unwrap();
+    std::fs::remove_file(dir.join("tsconfig.json")).unwrap();
+    git(&["commit", "-qam", "feature"]);
+    let head = git(&["rev-parse", "HEAD"]);
+    git(&["checkout", "-q", "main"]);
+    std::fs::write(dir.join("src/app.ts"), "import './root'; // main only").unwrap();
+    git(&["commit", "-qam", "main moves"]); git(&["checkout", "-q", "feature"]);
+    std::fs::write(dir.join("src/new.ts"), "export const n = 1;").unwrap();
+    let (out, err, code) = affected_run(&dir, &["--format", "json", "--since", "main", "src/root.ts", "unknown.ts"]);
+    assert_eq!(code, 0, "{err}");
+    let report: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(report["comparison"], serde_json::json!({"mode":"merge-base-to-worktree","requestedReference":"main","resolvedBase":base,"head":head}));
+    assert_eq!(report["counts"], serde_json::json!({"inputs":5,"seeds":2,"affected":3,"displayed":3}));
+    assert_eq!(report["inputs"], serde_json::json!([
+        {"path":"src/gone.ts","origins":{"explicit":false,"git":true},"classification":"deleted","module":null,"deleted":true},
+        {"path":"src/new.ts","origins":{"explicit":false,"git":true},"classification":"module","module":"src/new.ts","deleted":false},
+        {"path":"src/root.ts","origins":{"explicit":true,"git":true},"classification":"module","module":"src/root.ts","deleted":false},
+        {"path":"tsconfig.json","origins":{"explicit":false,"git":true},"classification":"configuration","module":null,"deleted":true},
+        {"path":"unknown.ts","origins":{"explicit":true,"git":false},"classification":"unmatched","module":null,"deleted":false}
+    ]));
+    let limitations = report["limitations"].as_array().unwrap();
+    assert_eq!(limitations.iter().map(|l| l["code"].as_str().unwrap()).collect::<Vec<_>>(), ["historical-edges-not-analyzed","deleted-inputs-not-followed","configuration-impact-not-expanded","unmatched-inputs","dynamic-relationships-not-guaranteed"]);
+    assert_eq!(limitations[1]["paths"], serde_json::json!(["src/gone.ts","tsconfig.json"]));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn affected_json_reports_explicit_evidence_and_unique_seeds() {
+    let dir = affected_project("json-explicit", &[
+        ("src/root.ts", "export type Root = string;"),
+        ("src/app.ts", "import type { Root } from './root'; export type App = Root;"),
+        ("src/app.test.ts", "import './app';"),
+    ]);
+    let args = ["-f", "json", "src/root.ts", "./src/root.ts", "src/root.ts"];
+    let (out, err, code) = affected_run(&dir, &args);
+    assert_eq!(code, 0, "{err}");
+    let report: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(report["schemaVersion"], 1);
+    assert_eq!(report["comparison"], serde_json::json!({"mode":"explicit", "requestedReference":null,"resolvedBase":null,"head":null}));
+    assert_eq!(report["scope"], serde_json::json!({"root":std::fs::canonicalize(&dir).unwrap(),"basis":"current-graph","graphRestrictions":{},"outputFilter":null}));
+    assert_eq!(report["counts"], serde_json::json!({"inputs":2,"seeds":1,"affected":3,"displayed":3}));
+    assert_eq!(report["inputs"], serde_json::json!([
+        {"path":"./src/root.ts","origins":{"explicit":true,"git":false},"classification":"module","module":"src/root.ts","deleted":false},
+        {"path":"src/root.ts","origins":{"explicit":true,"git":false},"classification":"module","module":"src/root.ts","deleted":false}
+    ]));
+    assert_eq!(report["affected"][0], serde_json::json!({"module":"src/app.test.ts","reason":"dependent","seed":"src/root.ts",
+        "path":["src/app.test.ts","src/app.ts","src/root.ts"],"edges":[
+            {"from":"src/app.test.ts","to":"src/app.ts","specifiers":["./app"],"dependencyTypes":["local"]},
+            {"from":"src/app.ts","to":"src/root.ts","specifiers":["./root"],"dependencyTypes":["local","type-only"]}
+        ]}));
+    assert_eq!(report["affected"][2], serde_json::json!({"module":"src/root.ts","reason":"changed","seed":"src/root.ts","path":["src/root.ts"],"edges":[]}));
+    assert_eq!(report["limitations"][0]["code"], "dynamic-relationships-not-guaranteed");
+    let (with_why, err, code) = affected_run(&dir, &["--format", "json", "--why", "src/root.ts", "./src/root.ts"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&with_why).unwrap(), report);
+    let (out, err, code) = affected_run(&dir, &["-f", "json", "src/root.ts", "--filter", "no-match"]);
+    assert_eq!(code, 0, "{err}");
+    let filtered: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(filtered["affected"], serde_json::json!([]));
+    assert_eq!(filtered["counts"], serde_json::json!({"inputs":1,"seeds":1,"affected":3,"displayed":0}));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn affected_why_quotes_unusual_paths_without_splitting_explanations() {
+    let dir = affected_project("escaped", &[
+        ("src/a test.ts", "import './line\\nfeed';"),
+        ("src/line\nfeed.ts", "export const n = 1;"),
+    ]);
+    let (out, err, code) = affected_run(&dir, &["--why", "src/line\nfeed.ts"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(out, "\"src/a test.ts\" → \"src/line\\nfeed.ts\" (changed)\n\"src/line\\nfeed.ts\" (changed)\n");
+    let (out, err, code) = affected_run(&dir, &["-f", "json", "src/line\nfeed.ts"]);
+    assert_eq!(code, 0, "{err}");
+    let report: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(report["affected"][0]["path"], serde_json::json!(["src/a test.ts", "src/line\nfeed.ts"]));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn affected_why_reports_current_graph_scope_and_available_limitations() {
+    let dir = affected_project("limits", &[
+        ("src/a.ts", "import './missing';"),
+        ("src/b.ts", "export const n = ;"),
+        ("detangle.toml", "[options]\nexclude_path = '^excluded/'\ninclude_only = '^(src/|[.]/)'\ndo_not_follow = 'opaque'\n"),
+    ]);
+    let (out, err, code) = affected_run(&dir, &["--why", "package.json", "unknown.ts", "--filter", "test"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.is_empty(), "{out}");
+    for expected in ["current-graph static dependency reachability", "filter=\"test\"", "exclude_path", "include_only", "do_not_follow",
+        "configuration-impact-not-expanded", "package.json", "unmatched-inputs", "unknown.ts", "graph-restrictions",
+        "unresolved-imports", "parse-errors", "src/a.ts", "dynamic-relationships-not-guaranteed"] {
+        assert!(err.contains(expected), "missing {expected}: {err}");
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn affected_why_rejects_unsupported_git_path_encoding() {
+    use std::io::Write;
+    let dir = affected_project("encoding", &[("src/a.ts", "export const a = 1;")]);
+    for args in [vec!["init", "-q"], vec!["add", "-A"], vec!["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false", "commit", "-qm", "base"]] {
+        assert!(Command::new("git").args(args).current_dir(&dir).output().unwrap().status.success());
+    }
+    // Put the raw pathname in Git's index: some filesystems cannot create it.
+    let blob = Command::new("git").args(["rev-parse", "HEAD:src/a.ts"]).current_dir(&dir).output().unwrap();
+    let mut entry = format!("100644 {}\t", String::from_utf8(blob.stdout).unwrap().trim()).into_bytes();
+    entry.extend_from_slice(b"bad-\xff.txt\0");
+    let mut index = Command::new("git").args(["update-index", "-z", "--index-info"]).current_dir(&dir)
+        .stdin(std::process::Stdio::piped()).spawn().unwrap();
+    index.stdin.take().unwrap().write_all(&entry).unwrap();
+    assert!(index.wait().unwrap().success());
+    assert!(Command::new("git").args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false", "commit", "-qm", "raw path"])
+        .current_dir(&dir).output().unwrap().status.success());
+    let (out, err, code) = affected_run(&dir, &["--why", "--since", "HEAD"]);
+    assert_ne!(code, 0, "{err}");
+    assert!(out.is_empty(), "{out}");
+    assert!(err.contains("unsupported Git path encoding") && err.contains("UTF-8"), "{err}");
+    let (out, err, code) = affected_run(&dir, &["--format", "json", "--since", "HEAD"]);
+    assert_ne!(code, 0, "{err}");
+    assert!(out.is_empty(), "{out}");
+    assert!(err.contains("unsupported Git path encoding"), "{err}");
+    let (_, err, code) = affected_run(&dir, &["--since", "HEAD"]);
+    assert_eq!(code, 0, "{err}");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn affected_why_chooses_stable_shortest_paths_with_diamonds_cycles_and_multiple_roots() {
+    let dir = affected_project("ties", &[
+        ("src/root-a.ts", "import './root-z'; export const a = 1;"),
+        ("src/root-z.ts", "export const z = 1;"),
+        ("src/a.ts", "import './root-a'; import './b';"),
+        ("src/b.ts", "import './root-a'; import './a';"),
+        ("src/diamond.ts", "import './b'; import './a';"),
+        ("src/both.ts", "import './root-z'; import './root-a';"),
+    ]);
+    let expected = concat!(
+        "src/a.ts → src/root-a.ts (changed)\n",
+        "src/b.ts → src/root-a.ts (changed)\n",
+        "src/both.ts → src/root-a.ts (changed)\n",
+        "src/diamond.ts → src/a.ts → src/root-a.ts (changed)\n",
+        "src/root-a.ts (changed)\nsrc/root-z.ts (changed)\n",
+    );
+    for roots in [["src/root-z.ts", "src/root-a.ts", "./src/root-a.ts"], ["src/root-a.ts", "src/root-a.ts", "src/root-z.ts"]] {
+        let (out, err, code) = affected_run(&dir, &["--why", roots[0], roots[1], roots[2]]);
+        assert_eq!(code, 0, "{err}");
+        assert_eq!(out, expected);
+        assert!(err.contains("2 changed modules → 6 affected"), "{err}");
+        let (out, err, code) = affected_run(&dir, &["-f", "json", roots[0], roots[1], roots[2]]);
+        assert_eq!(code, 0, "{err}");
+        let report: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let records = report["affected"].as_array().unwrap();
+        assert_eq!(records.iter().map(|r| &r["path"]).collect::<Vec<_>>(), vec![
+            &serde_json::json!(["src/a.ts", "src/root-a.ts"]),
+            &serde_json::json!(["src/b.ts", "src/root-a.ts"]),
+            &serde_json::json!(["src/both.ts", "src/root-a.ts"]),
+            &serde_json::json!(["src/diamond.ts", "src/a.ts", "src/root-a.ts"]),
+            &serde_json::json!(["src/root-a.ts"]),
+            &serde_json::json!(["src/root-z.ts"]),
+        ]);
+        assert_eq!(report["counts"]["seeds"], 2);
+        assert_eq!(records[4]["seed"], "src/root-a.ts");
+        assert_eq!(records[5]["seed"], "src/root-z.ts");
+        assert_eq!(records[5]["edges"], serde_json::json!([]));
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn affected_why_filters_results_after_following_resources_and_type_only_edges() {
+    let dir = affected_project("resources", &[
+        ("src/style.css", "body {}"),
+        ("src/data.json", "{}"),
+        ("src/types.ts", "export type A = string;"),
+        ("src/app.ts", "import './style.css'; import data from './data.json'; import type { A } from './types'; export type B = A;"),
+        ("src/app.test.ts", "import type { B } from './app';"),
+    ]);
+    for root in ["src/style.css", "src/data.json", "src/types.ts"] {
+        let (out, err, code) = affected_run(&dir, &["--why", root, "--filter", r"\.test\.ts$"]);
+        assert_eq!(code, 0, "{err}");
+        assert_eq!(out, format!("src/app.test.ts → src/app.ts → {root} (changed)\n"));
+        let (out, err, code) = affected_run(&dir, &[root]);
+        assert_eq!(code, 0, "{err}");
+        let mut expected = vec!["src/app.test.ts", "src/app.ts", root];
+        expected.sort();
+        assert_eq!(out.lines().collect::<Vec<_>>(), expected);
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn affected_why_respects_restrictions_without_inventing_edges() {
+    let dir = affected_project("restricted", &[
+        ("src/root.ts", "export const a = 1;"),
+        ("src/middle.ts", "import './root';"),
+        ("src/test.ts", "import './middle';"),
+    ]);
+    for setting in ["exclude_path = 'middle'", "include_only = '(root|test)'", "do_not_follow = 'middle'"] {
+        std::fs::write(dir.join("detangle.toml"), format!("[options]\n{setting}\n")).unwrap();
+        let (out, err, code) = affected_run(&dir, &["--why", "src/root.ts"]);
+        assert_eq!(code, 0, "{err}");
+        assert_eq!(out, "src/root.ts (changed)\n", "{setting}: {err}");
+        assert!(err.contains("graph-restrictions"), "{err}");
+    }
+    // A retained do-not-follow node can itself be a seed through incoming edges.
+    let (out, err, code) = affected_run(&dir, &["--why", "src/middle.ts"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(out, "src/middle.ts (changed)\nsrc/test.ts → src/middle.ts (changed)\n");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn affected_reports_type_only_restrictions_without_changing_selection() {
+    let dir = affected_project("type-only-restriction", &[
+        ("src/types.ts", "export type Value = string;"),
+        ("src/app.ts", "import type { Value } from './types'; export const value: Value = 'a';"),
+    ]);
+    for enabled in [false, true] {
+        std::fs::write(dir.join("detangle.toml"), format!("[options]\nignore_type_only = {enabled}\n")).unwrap();
+        let expected = if enabled { "src/types.ts\n" } else { "src/app.ts\nsrc/types.ts\n" };
+        let (plain, err, code) = affected_run(&dir, &["src/types.ts"]);
+        assert_eq!(code, 0, "{err}");
+        assert_eq!(plain, expected);
+        let (out, err, code) = affected_run(&dir, &["--why", "src/types.ts"]);
+        assert_eq!(code, 0, "{err}");
+        assert_eq!(out, if enabled { "src/types.ts (changed)\n" } else { "src/app.ts → src/types.ts (changed)\nsrc/types.ts (changed)\n" });
+        assert_eq!(err.contains("graph restriction: ignore_type_only=true"), enabled, "{err}");
+        assert_eq!(err.contains("limitation [graph-restrictions]"), enabled, "{err}");
+        let (out, err, code) = affected_run(&dir, &["-f", "json", "src/types.ts"]);
+        assert_eq!(code, 0, "{err}");
+        let report: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(report["scope"]["graphRestrictions"], if enabled { serde_json::json!({"ignore_type_only":true}) } else { serde_json::json!({}) });
+        assert_eq!(report["affected"].as_array().unwrap().iter().map(|m| m["module"].as_str().unwrap()).collect::<Vec<_>>(), expected.lines().collect::<Vec<_>>());
+        assert_eq!(report["limitations"].as_array().unwrap().iter().any(|l| l["code"] == "graph-restrictions"), enabled);
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn affected_reports_dynamic_import_restrictions_without_changing_selection() {
+    let dir = affected_project("dynamic-restriction", &[
+        ("src/lazy.ts", "export const value = 'a';"),
+        ("src/app.ts", "export const load = () => import('./lazy');"),
+    ]);
+    for enabled in [false, true] {
+        std::fs::write(dir.join("detangle.toml"), format!("[options]\nexclude_dynamic = {enabled}\n")).unwrap();
+        let expected = if enabled { "src/lazy.ts\n" } else { "src/app.ts\nsrc/lazy.ts\n" };
+        let (plain, err, code) = affected_run(&dir, &["src/lazy.ts"]);
+        assert_eq!(code, 0, "{err}");
+        assert_eq!(plain, expected);
+        let (out, err, code) = affected_run(&dir, &["--why", "src/lazy.ts"]);
+        assert_eq!(code, 0, "{err}");
+        assert_eq!(out, if enabled { "src/lazy.ts (changed)\n" } else { "src/app.ts → src/lazy.ts (changed)\nsrc/lazy.ts (changed)\n" });
+        assert_eq!(err.contains("graph restriction: exclude_dynamic=true"), enabled, "{err}");
+        assert_eq!(err.contains("limitation [graph-restrictions]"), enabled, "{err}");
+        let (out, err, code) = affected_run(&dir, &["-f", "json", "src/lazy.ts"]);
+        assert_eq!(code, 0, "{err}");
+        let report: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(report["scope"]["graphRestrictions"], if enabled { serde_json::json!({"exclude_dynamic":true}) } else { serde_json::json!({}) });
+        assert_eq!(report["affected"].as_array().unwrap().iter().map(|m| m["module"].as_str().unwrap()).collect::<Vec<_>>(), expected.lines().collect::<Vec<_>>());
+        assert_eq!(report["limitations"].as_array().unwrap().iter().any(|l| l["code"] == "graph-restrictions"), enabled);
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn affected_why_empty_results_and_fatal_inputs_are_distinct() {
+    let dir = affected_project("failures", &[("src/a.ts", "export const a = 1;")]);
+    for args in [vec!["--why"], vec!["--why", "src/a.ts", "--filter", "no-matches"], vec!["--why", "absent.ts"]] {
+        let (out, err, code) = affected_run(&dir, &args);
+        assert_eq!(code, 0, "{err}");
+        assert!(out.is_empty(), "{out}");
+        assert!(err.contains("current-graph"), "{err}");
+    }
+    for args in [vec!["--why", "src/a.ts", "--filter", "["], vec!["--why", "--since", "HEAD"], vec!["--why", "-C", "nonexistent-directory"]] {
+        let (out, err, code) = affected_run(&dir, &args);
+        assert_ne!(code, 0, "{err}");
+        assert!(out.is_empty(), "{out}");
+        assert!(err.contains("error:"), "{err}");
+    }
+    std::fs::write(dir.join("detangle.toml"), "[broken config").unwrap();
+    let (out, err, code) = affected_run(&dir, &["--why", "src/a.ts"]);
+    assert_ne!(code, 0, "{err}");
+    assert!(out.is_empty(), "{out}");
+    assert!(err.contains("error:"), "{err}");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn affected_does_not_report_empty_patterns_or_disabled_graph_restrictions() {
+    let dir = affected_project("empty-restrictions", &[
+        ("src/a.ts", "export const a = 1;"),
+        ("detangle.toml", "[options]\nexclude_path = ''\ninclude_only = ''\ndo_not_follow = ''\nignore_type_only = false\nexclude_dynamic = false\n"),
+    ]);
+    let (out, err, code) = affected_run(&dir, &["--why", "src/a.ts"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(out, "src/a.ts (changed)\n");
+    assert!(!err.contains("graph-restrictions") && !err.contains("graph restriction:"), "{err}");
+    let (out, err, code) = affected_run(&dir, &["-f", "json", "src/a.ts"]);
+    assert_eq!(code, 0, "{err}");
+    let report: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(report["scope"]["graphRestrictions"], serde_json::json!({}));
+    assert!(!report["limitations"].as_array().unwrap().iter().any(|l| l["code"] == "graph-restrictions"));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn affected_since_compares_from_the_merge_base() {
     let dir = std::env::temp_dir().join(format!("detangle-affected-git-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -180,9 +603,26 @@ fn affected_since_compares_from_the_merge_base() {
     assert!(err.contains("deleted: src/gone.ts"), "{err}");
     assert!(err.contains("config changed: package.json"), "{err}");
 
+    let (out, err, code) = run(&["affected", "--since", "main", "--why"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(out, "src/a.ts → src/b.ts (changed)\nsrc/b.ts (changed)\nsrc/new.ts (changed)\n");
+    for expected in ["historical-edges-not-analyzed", "deleted-inputs-not-followed", "configuration-impact-not-expanded", "src/gone.ts", "package.json"] {
+        assert!(err.contains(expected), "{err}");
+    }
+    let (_, err, code) = run(&["affected", "--why", "--since", "no-such-ref"]);
+    assert_ne!(code, 0);
+    assert!(err.contains("no-such-ref"), "{err}");
+
     let (_, err, code) = run(&["affected", "--since", "no-such-ref"]);
     assert_ne!(code, 0);
     assert!(err.contains("no-such-ref"), "{err}");
+    write("tsconfig.json", "{}");
+    git(&["add", "tsconfig.json"]);
+    git(&["commit", "-qm", "tracked config"]);
+    std::fs::remove_file(dir.join("tsconfig.json")).unwrap();
+    let (_, err, code) = run(&["affected", "--why", "--since", "HEAD"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(err.lines().any(|line| line.contains("deleted-inputs-not-followed") && line.contains("tsconfig.json")), "{err}");
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

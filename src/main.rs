@@ -1,3 +1,5 @@
+mod affected;
+
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -149,6 +151,12 @@ enum Cmd {
         /// Only print affected modules matching this regex (e.g. '\.test\.ts$')
         #[arg(long)]
         filter: Option<String>,
+        /// Explain each result with one shortest import path to a changed module
+        #[arg(long)]
+        why: bool,
+        /// Output format (JSON always includes explanations)
+        #[arg(short, long, value_enum, default_value_t = AffectedFormat::Text)]
+        format: AffectedFormat,
     },
     /// Write a self-contained HTML report (violations, modules, cycles, folder graph)
     Report {
@@ -206,6 +214,12 @@ enum CheckFormat {
     Azure,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum AffectedFormat {
+    Text,
+    Json,
+}
+
 #[derive(Clone, Copy, PartialEq, ValueEnum)]
 enum BaselineMode {
     /// Record every current violation
@@ -234,8 +248,15 @@ fn analyze(path: &Path, config: Option<&Path>, mode: Option<&str>, cache: &Cache
 /// between the merge-base of `since` and HEAD and the working tree
 /// (committed, staged and unstaged), plus untracked files git doesn't ignore.
 /// Comparing from the merge-base keeps out commits that landed on `since`
-/// after the branch. Returns (present, deleted).
-fn changed_since(root: &Path, since: &str) -> Result<(Vec<String>, Vec<String>)> {
+/// after the branch. Comparison identities are resolved once for this discovery.
+struct GitChanges {
+    present: Vec<String>,
+    deleted: Vec<String>,
+    base: String,
+    head: String,
+}
+
+fn changed_since(root: &Path, since: &str, strict_paths: bool) -> Result<GitChanges> {
     let git = |args: &[&str]| -> Result<Vec<u8>> {
         let out = std::process::Command::new("git").args(args).current_dir(root).output().context("running git")?;
         if !out.status.success() {
@@ -249,25 +270,34 @@ fn changed_since(root: &Path, since: &str) -> Result<(Vec<String>, Vec<String>)>
     if git(&["rev-parse", "--verify", "--quiet", &format!("{since}^{{commit}}")]).is_err() {
         bail!("--since {since}: not a commit in this repository; fetch it first (with actions/checkout, `fetch-depth: 0`)");
     }
-    let base = match git(&["merge-base", since, "HEAD"]) {
+    let head = String::from_utf8(git(&["rev-parse", "--verify", "HEAD"])?).context("reading Git HEAD")?.trim().to_owned();
+    let base = match git(&["merge-base", since, &head]) {
         Ok(b) if !b.is_empty() => String::from_utf8_lossy(&b).trim().to_string(),
         _ => bail!(
             "--since {since}: no common ancestor with HEAD; in a shallow clone, fetch more history (with actions/checkout, `fetch-depth: 0`)"
         ),
     };
-    let fields = |bytes: Vec<u8>| -> Vec<String> {
-        bytes.split(|&b| b == 0).filter(|f| !f.is_empty()).map(|f| String::from_utf8_lossy(f).into_owned()).collect()
+    let fields = |bytes: Vec<u8>| -> Result<Vec<String>> {
+        bytes.split(|&b| b == 0).filter(|f| !f.is_empty()).map(|f| {
+            if strict_paths {
+                std::str::from_utf8(f).map(str::to_owned).context(
+                    "unsupported Git path encoding: affected explanations require UTF-8 paths; rename the path or use default text output"
+                )
+            } else {
+                Ok(String::from_utf8_lossy(f).into_owned())
+            }
+        }).collect()
     };
     // `--no-renames`: a rename is its old path deleted and its new path added.
-    let diff = fields(git(&["diff", "--name-status", "-z", "--no-renames", "--relative", &base])?);
+    let diff = fields(git(&["diff", "--name-status", "-z", "--no-renames", "--relative", &base])?)?;
     let (mut present, mut deleted) = (vec![], vec![]);
     for pair in diff.chunks(2) {
         if let [status, path] = pair {
             if status.starts_with('D') { deleted.push(path.clone()) } else { present.push(path.clone()) }
         }
     }
-    present.extend(fields(git(&["ls-files", "--others", "--exclude-standard", "-z"])?));
-    Ok((present, deleted))
+    present.extend(fields(git(&["ls-files", "--others", "--exclude-standard", "-z"])?)?);
+    Ok(GitChanges { present, deleted, base, head })
 }
 
 /// Keeps `v` until the process exits. One-shot commands use it for the
@@ -463,14 +493,38 @@ fn run() -> Result<ExitCode> {
                 }
             }
         }
-        Cmd::Affected { files, since, dir, config, mode, filter } => {
-            let a = analyze(&dir, config.as_deref(), mode.as_deref(), &cache)?;
+        Cmd::Affected { files, since, dir, config, mode, filter, why, format } => {
+            let project = one_shot(announce(Project::open(&dir, config.as_deref(), mode.as_deref(), &cache)?));
+            let a = one_shot(project.analyze()?);
             let g = &a.graph;
+            let explained = why || format == AffectedFormat::Json;
+            let mut inputs = std::collections::BTreeMap::new();
+            if format == AffectedFormat::Json {
+                for f in &files {
+                    inputs.entry(f.clone()).or_insert_with(affected::Input::default).origins.explicit = true;
+                }
+            }
             let (mut present, mut deleted) = (files, vec![]);
-            if let Some(r) = since {
-                let (p, d) = changed_since(&g.root, &r)?;
-                present.extend(p);
-                deleted = d;
+            let mut comparison = affected::Comparison { mode: "explicit", requested_reference: None, resolved_base: None, head: None };
+            let git_changes = since.as_deref().map(|r| changed_since(&g.root, r, explained)).transpose()?;
+            if let Some(changes) = &git_changes {
+                comparison = affected::Comparison {
+                    mode: "merge-base-to-worktree", requested_reference: since.as_deref(),
+                    resolved_base: Some(&changes.base), head: Some(&changes.head),
+                };
+                if format == AffectedFormat::Json {
+                    for f in &changes.present {
+                        inputs.entry(f.clone()).or_insert_with(affected::Input::default).origins.git = true;
+                    }
+                    for f in &changes.deleted {
+                        let input = inputs.entry(f.clone()).or_insert_with(affected::Input::default);
+                        input.origins.git = true;
+                        input.deleted = true;
+                        input.classification = affected::Classification::Deleted;
+                    }
+                }
+                present.extend(changes.present.iter().cloned());
+                deleted.clone_from(&changes.deleted);
             }
             present.sort();
             present.dedup();
@@ -479,39 +533,72 @@ fn run() -> Result<ExitCode> {
                 watch::is_config(name) || detangle::stamps::LOCKFILES.contains(&name)
             };
             let (config_changed, present): (Vec<String>, Vec<String>) = present.into_iter().partition(|f| is_config(f));
+            let all_deleted = if explained { deleted.clone() } else { vec![] };
             let (config_deleted, deleted): (Vec<String>, Vec<String>) = deleted.into_iter().partition(|f| is_config(f));
             let config_changed: Vec<String> = config_changed.into_iter().chain(config_deleted).collect();
             let mut starts = vec![];
-            let mut other = 0;
+            let mut unmatched = vec![];
             for f in &present {
                 match g.find(ModuleKind::Local, f.trim_start_matches("./")).or_else(|| g.lookup(f).ok()) {
-                    Some(m) => starts.push(m),
-                    None => other += 1,
+                    Some(m) => {
+                        starts.push(m);
+                        if let Some(input) = inputs.get_mut(f) {
+                            if !input.deleted { input.classification = affected::Classification::Module; }
+                            input.module = Some(g.modules[m].id.clone());
+                        }
+                    },
+                    None => unmatched.push(f.clone()),
                 }
             }
             starts.sort_unstable();
             starts.dedup();
+            for f in &config_changed {
+                if let Some(input) = inputs.get_mut(f) { input.classification = affected::Classification::Configuration; }
+            }
+            let filter_text = filter.clone();
             let filter = filter.map(|f| regex::Regex::new(&f)).transpose()?;
-            let mut hit: Vec<&str> = g
-                .closure(&starts, false)
-                .into_iter()
+            let evidence = explained.then(|| affected::Evidence::build(g, &starts));
+            let reached: Vec<usize> = match &evidence {
+                Some(e) => e.reached.keys().copied().collect(),
+                None => g.closure(&starts, false).into_iter().collect(),
+            };
+            let total_affected = reached.iter().filter(|&&m| g.modules[m].kind == ModuleKind::Local).count();
+            let mut hit: Vec<usize> = reached.into_iter()
                 .filter(|&m| g.modules[m].kind == ModuleKind::Local)
-                .map(|m| g.modules[m].id.as_str())
-                .filter(|id| filter.as_ref().is_none_or(|f| f.is_match(id)))
+                .filter(|&m| filter.as_ref().is_none_or(|f| f.is_match(&g.modules[m].id)))
                 .collect();
-            hit.sort_unstable();
-            for id in &hit {
-                println!("{id}");
+            hit.sort_unstable_by_key(|&m| &g.modules[m].id);
+            let limitations = explained.then(|| affected::limitations(g, &project.config().options, since.is_some(), &all_deleted, &config_changed, &unmatched));
+            if format == AffectedFormat::Json {
+                affected::write_json(g, evidence.as_ref().unwrap(), &hit, affected::Report {
+                    schema_version: 1,
+                    comparison,
+                    scope: affected::Scope {
+                        root: &g.root, basis: "current-graph",
+                        graph_restrictions: affected::graph_restrictions(&project.config().options).collect(),
+                        output_filter: filter_text.as_deref(),
+                    },
+                    counts: affected::Counts { inputs: inputs.len(), seeds: starts.len(), affected: total_affected, displayed: hit.len() },
+                    inputs: inputs.iter().map(|(path, input)| affected::ReportedInput { path, input }).collect(),
+                    limitations: limitations.as_deref().unwrap(),
+                })?;
+            } else {
+                for &m in &hit {
+                    match &evidence {
+                        Some(e) => e.print_path(g, m),
+                        None => println!("{}", g.modules[m].id),
+                    }
+                }
             }
             let mut summary = format!("{} changed {}", starts.len(), if starts.len() == 1 { "module" } else { "modules" });
-            for (n, what) in [(deleted.len(), "deleted"), (config_changed.len(), "config"), (other, "other")] {
+            for (n, what) in [(deleted.len(), "deleted"), (config_changed.len(), "config"), (unmatched.len(), "other")] {
                 if n > 0 {
                     summary += &format!(", {n} {what}");
                 }
             }
             eprintln!("{}", p.dim(&format!("{summary} → {} affected", hit.len())));
             let list = |v: &[String]| {
-                let mut s = v.iter().take(5).cloned().collect::<Vec<_>>().join(", ");
+                let mut s = v.iter().take(5).map(|s| if explained { affected::display_path(s) } else { s.clone() }).collect::<Vec<_>>().join(", ");
                 if v.len() > 5 {
                     s += &format!(", and {} more", v.len() - 5);
                 }
@@ -522,6 +609,9 @@ fn run() -> Result<ExitCode> {
             }
             if !config_changed.is_empty() {
                 eprintln!("{}", p.dim(&format!("config changed: {} (this can affect any module; not followed)", list(&config_changed))));
+            }
+            if let Some(limitations) = limitations {
+                affected::print_scope(g, &project.config().options, filter_text.as_deref(), &limitations);
             }
         }
         Cmd::Report { target, output, open } => {
