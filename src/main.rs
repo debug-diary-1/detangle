@@ -520,7 +520,7 @@ fn run() -> Result<ExitCode> {
                         let input = inputs.entry(f.clone()).or_insert_with(affected::Input::default);
                         input.origins.git = true;
                         input.deleted = true;
-                        input.classification = "deleted";
+                        input.classification = affected::Classification::Deleted;
                     }
                 }
                 present.extend(changes.present.iter().cloned());
@@ -543,7 +543,7 @@ fn run() -> Result<ExitCode> {
                     Some(m) => {
                         starts.push(m);
                         if let Some(input) = inputs.get_mut(f) {
-                            if !input.deleted { input.classification = "module"; }
+                            if !input.deleted { input.classification = affected::Classification::Module; }
                             input.module = Some(g.modules[m].id.clone());
                         }
                     },
@@ -553,7 +553,7 @@ fn run() -> Result<ExitCode> {
             starts.sort_unstable();
             starts.dedup();
             for f in &config_changed {
-                if let Some(input) = inputs.get_mut(f) { input.classification = "configuration"; }
+                if let Some(input) = inputs.get_mut(f) { input.classification = affected::Classification::Configuration; }
             }
             let filter_text = filter.clone();
             let filter = filter.map(|f| regex::Regex::new(&f)).transpose()?;

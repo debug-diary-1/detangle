@@ -459,6 +459,60 @@ fn affected_why_respects_restrictions_without_inventing_edges() {
 }
 
 #[test]
+fn affected_reports_type_only_restrictions_without_changing_selection() {
+    let dir = affected_project("type-only-restriction", &[
+        ("src/types.ts", "export type Value = string;"),
+        ("src/app.ts", "import type { Value } from './types'; export const value: Value = 'a';"),
+    ]);
+    for enabled in [false, true] {
+        std::fs::write(dir.join("detangle.toml"), format!("[options]\nignore_type_only = {enabled}\n")).unwrap();
+        let expected = if enabled { "src/types.ts\n" } else { "src/app.ts\nsrc/types.ts\n" };
+        let (plain, err, code) = affected_run(&dir, &["src/types.ts"]);
+        assert_eq!(code, 0, "{err}");
+        assert_eq!(plain, expected);
+        let (out, err, code) = affected_run(&dir, &["--why", "src/types.ts"]);
+        assert_eq!(code, 0, "{err}");
+        assert_eq!(out, if enabled { "src/types.ts (changed)\n" } else { "src/app.ts → src/types.ts (changed)\nsrc/types.ts (changed)\n" });
+        assert_eq!(err.contains("graph restriction: ignore_type_only=true"), enabled, "{err}");
+        assert_eq!(err.contains("limitation [graph-restrictions]"), enabled, "{err}");
+        let (out, err, code) = affected_run(&dir, &["-f", "json", "src/types.ts"]);
+        assert_eq!(code, 0, "{err}");
+        let report: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(report["scope"]["graphRestrictions"], if enabled { serde_json::json!({"ignore_type_only":true}) } else { serde_json::json!({}) });
+        assert_eq!(report["affected"].as_array().unwrap().iter().map(|m| m["module"].as_str().unwrap()).collect::<Vec<_>>(), expected.lines().collect::<Vec<_>>());
+        assert_eq!(report["limitations"].as_array().unwrap().iter().any(|l| l["code"] == "graph-restrictions"), enabled);
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn affected_reports_dynamic_import_restrictions_without_changing_selection() {
+    let dir = affected_project("dynamic-restriction", &[
+        ("src/lazy.ts", "export const value = 'a';"),
+        ("src/app.ts", "export const load = () => import('./lazy');"),
+    ]);
+    for enabled in [false, true] {
+        std::fs::write(dir.join("detangle.toml"), format!("[options]\nexclude_dynamic = {enabled}\n")).unwrap();
+        let expected = if enabled { "src/lazy.ts\n" } else { "src/app.ts\nsrc/lazy.ts\n" };
+        let (plain, err, code) = affected_run(&dir, &["src/lazy.ts"]);
+        assert_eq!(code, 0, "{err}");
+        assert_eq!(plain, expected);
+        let (out, err, code) = affected_run(&dir, &["--why", "src/lazy.ts"]);
+        assert_eq!(code, 0, "{err}");
+        assert_eq!(out, if enabled { "src/lazy.ts (changed)\n" } else { "src/app.ts → src/lazy.ts (changed)\nsrc/lazy.ts (changed)\n" });
+        assert_eq!(err.contains("graph restriction: exclude_dynamic=true"), enabled, "{err}");
+        assert_eq!(err.contains("limitation [graph-restrictions]"), enabled, "{err}");
+        let (out, err, code) = affected_run(&dir, &["-f", "json", "src/lazy.ts"]);
+        assert_eq!(code, 0, "{err}");
+        let report: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(report["scope"]["graphRestrictions"], if enabled { serde_json::json!({"exclude_dynamic":true}) } else { serde_json::json!({}) });
+        assert_eq!(report["affected"].as_array().unwrap().iter().map(|m| m["module"].as_str().unwrap()).collect::<Vec<_>>(), expected.lines().collect::<Vec<_>>());
+        assert_eq!(report["limitations"].as_array().unwrap().iter().any(|l| l["code"] == "graph-restrictions"), enabled);
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn affected_why_empty_results_and_fatal_inputs_are_distinct() {
     let dir = affected_project("failures", &[("src/a.ts", "export const a = 1;")]);
     for args in [vec!["--why"], vec!["--why", "src/a.ts", "--filter", "no-matches"], vec!["--why", "absent.ts"]] {
@@ -482,15 +536,20 @@ fn affected_why_empty_results_and_fatal_inputs_are_distinct() {
 }
 
 #[test]
-fn affected_why_does_not_report_empty_patterns_as_graph_restrictions() {
+fn affected_does_not_report_empty_patterns_or_disabled_graph_restrictions() {
     let dir = affected_project("empty-restrictions", &[
         ("src/a.ts", "export const a = 1;"),
-        ("detangle.toml", "[options]\nexclude_path = ''\ninclude_only = ''\ndo_not_follow = ''\n"),
+        ("detangle.toml", "[options]\nexclude_path = ''\ninclude_only = ''\ndo_not_follow = ''\nignore_type_only = false\nexclude_dynamic = false\n"),
     ]);
     let (out, err, code) = affected_run(&dir, &["--why", "src/a.ts"]);
     assert_eq!(code, 0, "{err}");
     assert_eq!(out, "src/a.ts (changed)\n");
     assert!(!err.contains("graph-restrictions") && !err.contains("graph restriction:"), "{err}");
+    let (out, err, code) = affected_run(&dir, &["-f", "json", "src/a.ts"]);
+    assert_eq!(code, 0, "{err}");
+    let report: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(report["scope"]["graphRestrictions"], serde_json::json!({}));
+    assert!(!report["limitations"].as_array().unwrap().iter().any(|l| l["code"] == "graph-restrictions"));
     std::fs::remove_dir_all(dir).unwrap();
 }
 

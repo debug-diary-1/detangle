@@ -115,7 +115,10 @@ pub fn print_scope(g: &Graph, options: &detangle::config::Options, filter: Optio
         eprintln!("output filter={filter:?}");
     }
     for (name, value) in graph_restrictions(options) {
-        eprintln!("graph restriction: {name}={value:?}");
+        match value {
+            Restriction::Pattern(pattern) => eprintln!("graph restriction: {name}={pattern:?}"),
+            Restriction::Enabled(enabled) => eprintln!("graph restriction: {name}={enabled}"),
+        }
     }
     for limit in limitations {
         eprint!("limitation [{}]: {}", limit.code, limit.message);
@@ -129,10 +132,19 @@ pub fn print_scope(g: &Graph, options: &detangle::config::Options, filter: Optio
     }
 }
 
-pub fn graph_restrictions(options: &detangle::config::Options) -> impl Iterator<Item = (&'static str, &str)> {
+#[derive(serde::Serialize)]
+#[serde(untagged)]
+pub enum Restriction<'a> {
+    Pattern(&'a str),
+    Enabled(bool),
+}
+
+pub fn graph_restrictions(options: &detangle::config::Options) -> impl Iterator<Item = (&'static str, Restriction<'_>)> {
     [("exclude_path", &options.exclude_path), ("include_only", &options.include_only), ("do_not_follow", &options.do_not_follow)]
         .into_iter()
-        .filter_map(|(name, value)| value.as_ref().filter(|p| !p.0.is_empty()).map(|p| (name, p.0.as_str())))
+        .filter_map(|(name, value)| value.as_ref().filter(|p| !p.0.is_empty()).map(|p| (name, Restriction::Pattern(p.0.as_str()))))
+        .chain(options.ignore_type_only.then_some(("ignore_type_only", Restriction::Enabled(true))))
+        .chain(options.exclude_dynamic.then_some(("exclude_dynamic", Restriction::Enabled(true))))
 }
 
 #[derive(Default, serde::Serialize)]
@@ -142,16 +154,25 @@ pub struct Origins {
 }
 
 #[derive(serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Classification {
+    Module,
+    Deleted,
+    Configuration,
+    Unmatched,
+}
+
+#[derive(serde::Serialize)]
 pub struct Input {
     pub origins: Origins,
-    pub classification: &'static str,
+    pub classification: Classification,
     pub module: Option<String>,
     pub deleted: bool,
 }
 
 impl Default for Input {
     fn default() -> Self {
-        Self { origins: Origins::default(), classification: "unmatched", module: None, deleted: false }
+        Self { origins: Origins::default(), classification: Classification::Unmatched, module: None, deleted: false }
     }
 }
 
@@ -176,7 +197,7 @@ pub struct Comparison<'a> {
 pub struct Scope<'a> {
     pub root: &'a std::path::Path,
     pub basis: &'static str,
-    pub graph_restrictions: std::collections::BTreeMap<&'static str, &'a str>,
+    pub graph_restrictions: std::collections::BTreeMap<&'static str, Restriction<'a>>,
     pub output_filter: Option<&'a str>,
 }
 
