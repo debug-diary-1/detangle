@@ -76,6 +76,25 @@ fn options(path: &Path, depth: usize) -> Found {
     found
 }
 
+/// `compilerOptions.customConditions` of the tsconfig, else of the first base
+/// (last `extends` entry first) that sets it: TypeScript replaces rather than
+/// merges them.
+pub fn custom_conditions(path: &Path) -> Vec<String> {
+    fn go(path: &Path, depth: usize) -> Option<Vec<String>> {
+        let json = read(path)?;
+        let own = json.get("compilerOptions").and_then(|c| c.get("customConditions")).and_then(Value::as_array);
+        if let Some(a) = own {
+            return Some(a.iter().filter_map(|c| c.as_str().map(String::from)).collect());
+        }
+        if depth >= 8 {
+            return None;
+        }
+        let dir = path.parent().unwrap_or(Path::new("."));
+        extends_of(&json).into_iter().rev().filter_map(|s| resolve_extends(dir, s)).filter(|p| p.is_file()).find_map(|b| go(&b, depth + 1))
+    }
+    go(path, 0).unwrap_or_default()
+}
+
 /// The `extends` entries that can't be found, reached from `path` through
 /// `extends` and `references` (a solution-style tsconfig owns no files and
 /// hands each to a referenced project).
