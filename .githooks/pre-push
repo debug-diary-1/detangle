@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -euo pipefail
+[ "$#" -eq 2 ] || { echo 'guardrails: pre-push requires remote name and URL' >&2; exit 2; }
+exec bash "$(git rev-parse --show-toplevel)/scripts/guardrails.sh" --pre-push "$1" "$2"
