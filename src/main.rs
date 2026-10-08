@@ -1,3 +1,5 @@
+mod affected;
+
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -149,6 +151,9 @@ enum Cmd {
         /// Only print affected modules matching this regex (e.g. '\.test\.ts$')
         #[arg(long)]
         filter: Option<String>,
+        /// Explain each result with one shortest import path to a changed module
+        #[arg(long)]
+        why: bool,
     },
     /// Write a self-contained HTML report (violations, modules, cycles, folder graph)
     Report {
@@ -235,7 +240,7 @@ fn analyze(path: &Path, config: Option<&Path>, mode: Option<&str>, cache: &Cache
 /// (committed, staged and unstaged), plus untracked files git doesn't ignore.
 /// Comparing from the merge-base keeps out commits that landed on `since`
 /// after the branch. Returns (present, deleted).
-fn changed_since(root: &Path, since: &str) -> Result<(Vec<String>, Vec<String>)> {
+fn changed_since(root: &Path, since: &str, strict_paths: bool) -> Result<(Vec<String>, Vec<String>)> {
     let git = |args: &[&str]| -> Result<Vec<u8>> {
         let out = std::process::Command::new("git").args(args).current_dir(root).output().context("running git")?;
         if !out.status.success() {
@@ -255,18 +260,26 @@ fn changed_since(root: &Path, since: &str) -> Result<(Vec<String>, Vec<String>)>
             "--since {since}: no common ancestor with HEAD; in a shallow clone, fetch more history (with actions/checkout, `fetch-depth: 0`)"
         ),
     };
-    let fields = |bytes: Vec<u8>| -> Vec<String> {
-        bytes.split(|&b| b == 0).filter(|f| !f.is_empty()).map(|f| String::from_utf8_lossy(f).into_owned()).collect()
+    let fields = |bytes: Vec<u8>| -> Result<Vec<String>> {
+        bytes.split(|&b| b == 0).filter(|f| !f.is_empty()).map(|f| {
+            if strict_paths {
+                std::str::from_utf8(f).map(str::to_owned).context(
+                    "unsupported Git path encoding: affected explanations require UTF-8 paths; rename the path or use default text output"
+                )
+            } else {
+                Ok(String::from_utf8_lossy(f).into_owned())
+            }
+        }).collect()
     };
     // `--no-renames`: a rename is its old path deleted and its new path added.
-    let diff = fields(git(&["diff", "--name-status", "-z", "--no-renames", "--relative", &base])?);
+    let diff = fields(git(&["diff", "--name-status", "-z", "--no-renames", "--relative", &base])?)?;
     let (mut present, mut deleted) = (vec![], vec![]);
     for pair in diff.chunks(2) {
         if let [status, path] = pair {
             if status.starts_with('D') { deleted.push(path.clone()) } else { present.push(path.clone()) }
         }
     }
-    present.extend(fields(git(&["ls-files", "--others", "--exclude-standard", "-z"])?));
+    present.extend(fields(git(&["ls-files", "--others", "--exclude-standard", "-z"])?)?);
     Ok((present, deleted))
 }
 
@@ -463,12 +476,13 @@ fn run() -> Result<ExitCode> {
                 }
             }
         }
-        Cmd::Affected { files, since, dir, config, mode, filter } => {
-            let a = analyze(&dir, config.as_deref(), mode.as_deref(), &cache)?;
+        Cmd::Affected { files, since, dir, config, mode, filter, why } => {
+            let project = one_shot(announce(Project::open(&dir, config.as_deref(), mode.as_deref(), &cache)?));
+            let a = one_shot(project.analyze()?);
             let g = &a.graph;
             let (mut present, mut deleted) = (files, vec![]);
-            if let Some(r) = since {
-                let (p, d) = changed_since(&g.root, &r)?;
+            if let Some(r) = &since {
+                let (p, d) = changed_since(&g.root, r, why)?;
                 present.extend(p);
                 deleted = d;
             }
@@ -479,39 +493,46 @@ fn run() -> Result<ExitCode> {
                 watch::is_config(name) || detangle::stamps::LOCKFILES.contains(&name)
             };
             let (config_changed, present): (Vec<String>, Vec<String>) = present.into_iter().partition(|f| is_config(f));
+            let all_deleted = if why { deleted.clone() } else { vec![] };
             let (config_deleted, deleted): (Vec<String>, Vec<String>) = deleted.into_iter().partition(|f| is_config(f));
             let config_changed: Vec<String> = config_changed.into_iter().chain(config_deleted).collect();
             let mut starts = vec![];
-            let mut other = 0;
+            let mut unmatched = vec![];
             for f in &present {
                 match g.find(ModuleKind::Local, f.trim_start_matches("./")).or_else(|| g.lookup(f).ok()) {
                     Some(m) => starts.push(m),
-                    None => other += 1,
+                    None => unmatched.push(f.clone()),
                 }
             }
             starts.sort_unstable();
             starts.dedup();
+            let filter_text = filter.clone();
             let filter = filter.map(|f| regex::Regex::new(&f)).transpose()?;
-            let mut hit: Vec<&str> = g
-                .closure(&starts, false)
-                .into_iter()
+            let evidence = why.then(|| affected::Evidence::build(g, &starts));
+            let reached: Vec<usize> = match &evidence {
+                Some(e) => e.reached.keys().copied().collect(),
+                None => g.closure(&starts, false).into_iter().collect(),
+            };
+            let mut hit: Vec<usize> = reached.into_iter()
                 .filter(|&m| g.modules[m].kind == ModuleKind::Local)
-                .map(|m| g.modules[m].id.as_str())
-                .filter(|id| filter.as_ref().is_none_or(|f| f.is_match(id)))
+                .filter(|&m| filter.as_ref().is_none_or(|f| f.is_match(&g.modules[m].id)))
                 .collect();
-            hit.sort_unstable();
-            for id in &hit {
-                println!("{id}");
+            hit.sort_unstable_by_key(|&m| &g.modules[m].id);
+            for &m in &hit {
+                match &evidence {
+                    Some(e) => e.print_path(g, m),
+                    None => println!("{}", g.modules[m].id),
+                }
             }
             let mut summary = format!("{} changed {}", starts.len(), if starts.len() == 1 { "module" } else { "modules" });
-            for (n, what) in [(deleted.len(), "deleted"), (config_changed.len(), "config"), (other, "other")] {
+            for (n, what) in [(deleted.len(), "deleted"), (config_changed.len(), "config"), (unmatched.len(), "other")] {
                 if n > 0 {
                     summary += &format!(", {n} {what}");
                 }
             }
             eprintln!("{}", p.dim(&format!("{summary} → {} affected", hit.len())));
             let list = |v: &[String]| {
-                let mut s = v.iter().take(5).cloned().collect::<Vec<_>>().join(", ");
+                let mut s = v.iter().take(5).map(|s| if why { affected::display_path(s) } else { s.clone() }).collect::<Vec<_>>().join(", ");
                 if v.len() > 5 {
                     s += &format!(", and {} more", v.len() - 5);
                 }
@@ -522,6 +543,10 @@ fn run() -> Result<ExitCode> {
             }
             if !config_changed.is_empty() {
                 eprintln!("{}", p.dim(&format!("config changed: {} (this can affect any module; not followed)", list(&config_changed))));
+            }
+            if why {
+                let limitations = affected::limitations(g, &project.config().options, since.is_some(), &all_deleted, &config_changed, &unmatched);
+                affected::print_scope(g, &project.config().options, filter_text.as_deref(), &limitations);
             }
         }
         Cmd::Report { target, output, open } => {

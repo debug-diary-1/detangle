@@ -16,6 +16,7 @@ detangle report --open          # self-contained HTML report
 detangle stats                  # overview + hotspots
 detangle why src/app.ts lodash  # shortest import chain from A to B
 detangle affected --since origin/main --filter '\.test\.ts$'   # tests to run
+detangle affected --since origin/main --why                    # shortest import explanations
 detangle graph -f mermaid --collapse 2 > deps.mmd               # architecture diagram
 detangle graph -f dot --focus 'features/cart' | dot -Tsvg > cart.svg
 detangle graph --focus 'cart' --focus-depth 2 --highlight 'api/'   # two steps out, api modules marked
@@ -29,6 +30,11 @@ detangle init                   # write a starter detangle.toml
 The project root is the nearest ancestor containing `detangle.toml`, or else `package.json`. Pointing detangle at a subdirectory scans only that subdirectory, and paths are still reported relative to the root.
 
 `affected --since <ref>` takes the changes since the branch left `<ref>` (their merge-base), so commits that landed on `<ref>` afterwards don't count, up to the working tree: committed, staged and unstaged changes, and untracked files git doesn't ignore. It prints the changed modules and everything that imports them, directly or not. Deleted files and changed config files (package.json, lockfiles, tsconfigs, bundler configs, detangle.toml) are listed on stderr but not followed: files that still import a deleted one, and modules a config change affects, aren't found. In CI, the merge-base needs history: with actions/checkout, set `fetch-depth: 0`.
+
+`affected --why` prints one shortest import chain from each affected module to a changed input, for example `src/app.test.ts → src/app.ts → src/date.ts (changed)`. Arrows mean imports; a changed module has a zero-hop explanation. Ties are deterministic, duplicate inputs share a seed, and `--filter` selects the displayed results after traversal, keeping intermediate modules in their explanations. Represented type-only imports, literal dynamic imports, and imported resources such as CSS and ordinary JSON participate. Paths containing whitespace, control characters or arrow separators are quoted and escaped.
+
+With `--why`, stderr also identifies the analysis root, output filter, active graph restrictions, and applicable limitations with stable codes. This is current-graph static dependency reachability: deleted historical edges, configuration-wide effects and runtime-computed relationships are not reconstructed. Unmatched inputs, unresolved imports and parse errors are reported when known. Empty results with limitations still exit successfully; invalid filters, Git references or analysis failures exit nonzero. Git paths that are not UTF-8 produce an actionable error in explanation mode. The default command keeps its path-only output and existing diagnostics.
+
 
 ### Explorer keys
 
