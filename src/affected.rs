@@ -56,6 +56,7 @@ pub fn display_path(path: &str) -> String {
     }
 }
 
+#[derive(serde::Serialize)]
 pub struct Limitation {
     pub code: &'static str,
     pub message: &'static str,
@@ -132,4 +133,156 @@ pub fn graph_restrictions(options: &detangle::config::Options) -> impl Iterator<
     [("exclude_path", &options.exclude_path), ("include_only", &options.include_only), ("do_not_follow", &options.do_not_follow)]
         .into_iter()
         .filter_map(|(name, value)| value.as_ref().filter(|p| !p.0.is_empty()).map(|p| (name, p.0.as_str())))
+}
+
+#[derive(Default, serde::Serialize)]
+pub struct Origins {
+    pub explicit: bool,
+    pub git: bool,
+}
+
+#[derive(serde::Serialize)]
+pub struct Input {
+    pub origins: Origins,
+    pub classification: &'static str,
+    pub module: Option<String>,
+    pub deleted: bool,
+}
+
+impl Default for Input {
+    fn default() -> Self {
+        Self { origins: Origins::default(), classification: "unmatched", module: None, deleted: false }
+    }
+}
+
+#[derive(serde::Serialize)]
+pub struct ReportedInput<'a> {
+    pub path: &'a str,
+    #[serde(flatten)]
+    pub input: &'a Input,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Comparison<'a> {
+    pub mode: &'static str,
+    pub requested_reference: Option<&'a str>,
+    pub resolved_base: Option<&'a str>,
+    pub head: Option<&'a str>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Scope<'a> {
+    pub root: &'a std::path::Path,
+    pub basis: &'static str,
+    pub graph_restrictions: std::collections::BTreeMap<&'static str, &'a str>,
+    pub output_filter: Option<&'a str>,
+}
+
+#[derive(serde::Serialize)]
+pub struct Counts {
+    pub inputs: usize,
+    pub seeds: usize,
+    pub affected: usize,
+    pub displayed: usize,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Report<'a> {
+    pub schema_version: usize,
+    pub comparison: Comparison<'a>,
+    pub scope: Scope<'a>,
+    pub inputs: Vec<ReportedInput<'a>>,
+    pub counts: Counts,
+    pub limitations: &'a [Limitation],
+}
+
+/// Serialize paths directly from predecessors. Even a long chain needs no
+/// duplicated path buffers; only the graph, traversal and result indices live.
+pub fn write_json(g: &Graph, evidence: &Evidence, hit: &[usize], report: Report<'_>) -> anyhow::Result<()> {
+    use std::io::Write;
+    #[derive(serde::Serialize)]
+    struct Document<'a> {
+        #[serde(flatten)]
+        report: Report<'a>,
+        affected: Results<'a>,
+    }
+    let mut out = std::io::BufWriter::new(std::io::stdout().lock());
+    serde_json::to_writer(&mut out, &Document { report, affected: Results { g, evidence, hit } })?;
+    writeln!(out)?;
+    out.flush()?;
+    Ok(())
+}
+
+struct Results<'a> {
+    g: &'a Graph,
+    evidence: &'a Evidence,
+    hit: &'a [usize],
+}
+
+impl serde::Serialize for Results<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        #[derive(serde::Serialize)]
+        struct Record<'a> {
+            module: &'a str,
+            reason: &'static str,
+            seed: &'a str,
+            path: Chain<'a>,
+            edges: Chain<'a>,
+        }
+        let mut seq = serializer.serialize_seq(Some(self.hit.len()))?;
+        for &m in self.hit {
+            let reason = &self.evidence.reached[&m];
+            seq.serialize_element(&Record {
+                module: &self.g.modules[m].id,
+                reason: if reason.edge.is_none() { "changed" } else { "dependent" },
+                seed: &self.g.modules[reason.seed].id,
+                path: Chain { g: self.g, evidence: self.evidence, start: m, edges: false },
+                edges: Chain { g: self.g, evidence: self.evidence, start: m, edges: true },
+            })?;
+        }
+        seq.end()
+    }
+}
+
+struct Chain<'a> {
+    g: &'a Graph,
+    evidence: &'a Evidence,
+    start: usize,
+    edges: bool,
+}
+
+impl serde::Serialize for Chain<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        #[derive(serde::Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Edge<'a> {
+            from: &'a str,
+            to: &'a str,
+            specifiers: Vec<&'a str>,
+            dependency_types: Vec<&'a str>,
+        }
+        let mut seq = serializer.serialize_seq(None)?;
+        let mut m = self.start;
+        loop {
+            if !self.edges { seq.serialize_element(&self.g.modules[m].id)?; }
+            let Some(e) = self.evidence.reached[&m].edge else { break; };
+            let e = &self.g.edges[e];
+            if self.edges {
+                let mut specifiers: Vec<_> = e.imports().into_iter().map(|(s, _)| s).collect();
+                specifiers.sort_unstable();
+                specifiers.dedup();
+                let mut dependency_types = e.types.to_vec();
+                dependency_types.sort_unstable();
+                dependency_types.dedup();
+                seq.serialize_element(&Edge { from: &self.g.modules[m].id, to: &self.g.modules[e.to].id, specifiers, dependency_types })?;
+            }
+            m = e.to;
+        }
+        seq.end()
+    }
 }

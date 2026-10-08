@@ -17,6 +17,7 @@ detangle stats                  # overview + hotspots
 detangle why src/app.ts lodash  # shortest import chain from A to B
 detangle affected --since origin/main --filter '\.test\.ts$'   # tests to run
 detangle affected --since origin/main --why                    # shortest import explanations
+detangle affected --since origin/main -f json                  # versioned evidence report
 detangle graph -f mermaid --collapse 2 > deps.mmd               # architecture diagram
 detangle graph -f dot --focus 'features/cart' | dot -Tsvg > cart.svg
 detangle graph --focus 'cart' --focus-depth 2 --highlight 'api/'   # two steps out, api modules marked
@@ -34,6 +35,23 @@ The project root is the nearest ancestor containing `detangle.toml`, or else `pa
 `affected --why` prints one shortest import chain from each affected module to a changed input, for example `src/app.test.ts → src/app.ts → src/date.ts (changed)`. Arrows mean imports; a changed module has a zero-hop explanation. Ties are deterministic, duplicate inputs share a seed, and `--filter` selects the displayed results after traversal, keeping intermediate modules in their explanations. Represented type-only imports, literal dynamic imports, and imported resources such as CSS and ordinary JSON participate. Paths containing whitespace, control characters or arrow separators are quoted and escaped.
 
 With `--why`, stderr also identifies the analysis root, output filter, active graph restrictions, and applicable limitations with stable codes. This is current-graph static dependency reachability: deleted historical edges, configuration-wide effects and runtime-computed relationships are not reconstructed. Unmatched inputs, unresolved imports and parse errors are reported when known. Empty results with limitations still exit successfully; invalid filters, Git references or analysis failures exit nonzero. Git paths that are not UTF-8 produce an actionable error in explanation mode. The default command keeps its path-only output and existing diagnostics.
+
+`affected --format json` (or `-f json`) writes exactly one version-1 JSON document to stdout. JSON always includes explanations; adding `--why` produces the same report. `--format text` is the default. Human diagnostics stay on stderr. Successful empty reports include empty `inputs` and `affected` arrays and zero counts where appropriate. Fatal errors exit nonzero without a successful JSON report; non-UTF-8 Git paths are rejected in JSON and explanation modes.
+
+The JSON fields are:
+
+| Field | Contents |
+| --- | --- |
+| `schemaVersion` | `1` |
+| `comparison` | `mode` (`explicit` or `merge-base-to-worktree`), `requestedReference`, `resolvedBase`, and `head`; Git values are null in explicit mode. The base and HEAD identify the comparison used during input discovery. |
+| `scope` | Absolute analysis `root`, `basis: "current-graph"`, active `graphRestrictions` by option name, and `outputFilter` (null when absent). |
+| `inputs` | Sorted, distinct reported `path` records with boolean `origins.explicit` and `origins.git`, `classification` (`module`, `deleted`, `configuration`, or `unmatched`), matched `module` or null, and `deleted` (true only when Git reports deletion). Configuration classification takes precedence; a deleted configuration still has `deleted: true`. |
+| `counts` | `inputs` counts distinct reported paths; `seeds` counts unique matched modules; `affected` counts reachable local modules before filtering; `displayed` counts the returned records. Existing lookup aliases may map different input paths to one seed. |
+| `affected` | Sorted records with `module`, `reason` (`changed` or `dependent`), originating `seed`, import-direction `path`, and `edges`. Each edge gives `from`, `to`, sorted distinct `specifiers`, and sorted recorded `dependencyTypes`. These are graph evidence, without source call-site locations. |
+| `limitations` | Records with stable `code`, readable `message`, relevant sorted `paths` (possibly empty), and available `count` (otherwise null). |
+
+Limitation codes are `historical-edges-not-analyzed`, `deleted-inputs-not-followed`, `configuration-impact-not-expanded`, `unmatched-inputs`, `graph-restrictions`, `unresolved-imports`, `parse-errors`, and `dynamic-relationships-not-guaranteed`. Only applicable codes appear; dynamic relationships are always qualified. A report is evidence of represented static reachability, not a completeness or safe-to-merge verdict. Paths and edge evidence are streamed from one shared traversal, so large reports do not retain a separate explanation buffer per result.
+
 
 
 ### Explorer keys
