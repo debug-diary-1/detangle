@@ -241,3 +241,122 @@ jobs:
           git add Formula/detangle.rb
           git commit -m "detangle ${{ needs.version.outputs.version }}"
           git push
+
+  # What used to be done by hand after every release: wait until npm serves
+  # the new tarballs, run the install check against them, and open the PR
+  # that locks npm/package-lock.json's platform entries (the release commit
+  # leaves them as { "optional": true }, and `npm ci` fails until they're
+  # locked).
+  #
+  # The PR is opened with GITHUB_TOKEN, so it needs the repository setting
+  # "Allow GitHub Actions to create and approve pull requests", and CI does
+  # not start on it by itself: push an empty commit to its branch.
+  after-publish:
+    needs: [version, npm]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      actions: write # dispatch and watch install-check.yml
+      contents: write # push the lock-<version> branch
+      pull-requests: write # open the lockfile PR
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      # npm has taken 2 to 25 minutes to serve a newly published tarball.
+      # Every 30 s, for up to 40 minutes.
+      - name: Wait for npm to serve the tarballs
+        run: |
+          urls=(
+            "https://registry.npmjs.org/detangle-linux-x64-musl/-/detangle-linux-x64-musl-$VERSION.tgz"
+            "https://registry.npmjs.org/detangle/-/detangle-$VERSION.tgz"
+          )
+          for attempt in $(seq 1 80); do
+            missing=0
+            for u in "${urls[@]}"; do
+              code=$(curl -sI -o /dev/null -w '%{http_code}' "$u" || true)
+              if [ "$code" != 200 ]; then
+                missing=1
+                echo "attempt $attempt: $code $u"
+              fi
+            done
+            if [ "$missing" = 0 ]; then
+              echo "npm serves both tarballs"
+              exit 0
+            fi
+            sleep 30
+          done
+          echo "::error::npm did not serve detangle $VERSION's tarballs within 40 minutes"
+          exit 1
+
+      # gh workflow run doesn't print the new run's ID, so look for the
+      # workflow_dispatch run of install-check.yml created after the dispatch.
+      - name: Dispatch the install check
+        id: dispatch
+        run: |
+          since=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          gh workflow run install-check.yml --ref main -f version="$VERSION"
+          for _ in $(seq 1 30); do
+            sleep 10
+            id=$(gh run list --workflow install-check.yml --event workflow_dispatch --limit 20 \
+              --json databaseId,createdAt \
+              --jq "[.[] | select(.createdAt >= \"$since\")] | sort_by(.createdAt) | first | .databaseId // empty")
+            if [ -n "$id" ]; then
+              echo "install check: $GITHUB_SERVER_URL/$GH_REPO/actions/runs/$id"
+              echo "run-id=$id" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          done
+          echo "::error::the dispatched install-check run did not appear within 5 minutes"
+          exit 1
+
+      # Opened while the install check runs: the packages are published
+      # either way, and every open PR's `npm ci` fails until this is merged.
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Open the lockfile PR
+        run: |
+          branch="lock-$VERSION"
+          title="npm: lock the published $VERSION platform packages"
+          (cd npm && npm install --package-lock-only --ignore-scripts --prefer-online --no-audit --no-fund)
+          # Every platform entry must now be locked at this version.
+          # shellcheck disable=SC2016 # JavaScript in single quotes, on purpose
+          node -e '
+            const lock = require("./npm/package-lock.json");
+            const v = process.argv[1];
+            const bad = Object.entries(lock.packages)
+              .filter(([k]) => /^node_modules\/detangle-[^/]+$/.test(k))
+              .filter(([, p]) => p.version !== v);
+            if (bad.length) throw new Error(`not locked at ${v}: ${bad.map(([k]) => k).join(", ")}`);
+          ' "$VERSION"
+          if git diff --quiet -- npm/package-lock.json; then
+            echo "npm/package-lock.json already locks $VERSION; no PR needed"
+            exit 0
+          fi
+          git switch -c "$branch"
+          git add npm/package-lock.json
+          git -c user.name=Pallav -c user.email=15070765+debug-diary-1@users.noreply.github.com \
+            commit -m "$title"
+          git push --force origin "$branch"
+          if [ -n "$(gh pr list --head "$branch" --state open --json number --jq '.[].number')" ]; then
+            echo "a PR from $branch is already open"
+            exit 0
+          fi
+          body="Locks npm/package-lock.json's platform entries at the published $VERSION. Opened by the Release workflow with GITHUB_TOKEN, so CI doesn't start by itself: push an empty commit to \`$branch\` to run it."
+          if ! gh pr create --base main --head "$branch" --title "$title" --body "$body"; then
+            url="$GITHUB_SERVER_URL/$GH_REPO/compare/main...$branch?expand=1"
+            echo "::error::could not open the PR (is \"Allow GitHub Actions to create and approve pull requests\" on?). Open it by hand: $url"
+            echo "Open the lockfile PR by hand: $url" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+      # Still reported if the lockfile PR step failed.
+      - name: Wait for the install check
+        if: ${{ !cancelled() && steps.dispatch.outputs.run-id != '' }}
+        run: gh run watch "${{ steps.dispatch.outputs.run-id }}" --exit-status --interval 30
