@@ -283,7 +283,7 @@ fn affected_json_reports_explicit_evidence_and_unique_seeds() {
     let report: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(report["schemaVersion"], 1);
     assert_eq!(report["comparison"], serde_json::json!({"mode":"explicit", "requestedReference":null,"resolvedBase":null,"head":null}));
-    assert_eq!(report["scope"], serde_json::json!({"root":std::fs::canonicalize(&dir).unwrap(),"basis":"current-graph","graphRestrictions":{},"outputFilter":null}));
+    assert_eq!(report["scope"], serde_json::json!({"root":dunce::canonicalize(&dir).unwrap(),"basis":"current-graph","graphRestrictions":{},"outputFilter":null}));
     assert_eq!(report["counts"], serde_json::json!({"inputs":2,"seeds":1,"affected":3,"displayed":3}));
     assert_eq!(report["inputs"], serde_json::json!([
         {"path":"./src/root.ts","origins":{"explicit":true,"git":false},"classification":"module","module":"src/root.ts","deleted":false},
