@@ -16,7 +16,8 @@
 # Exit status: 0 if every check passed, was skipped or was neutral; 1 if any
 # failed or was cancelled; 2 after 30 minutes without a result, or on a usage
 # error. With --merge, a PR whose checks all passed is merged with
-# `gh pr merge --merge --delete-branch`, which deletes the remote branch but
+# `gh pr merge --merge --delete-branch` (`--squash` when an active ruleset requires
+# linear history), which deletes the remote branch but
 # leaves the local checkout alone; anything else is left alone. A merge that
 # GitHub refuses (a conflict, say) also exits 1.
 set -euo pipefail
@@ -119,7 +120,15 @@ if [ "$merge" -eq 1 ]; then
   # pulls main, which fails in a worktree when main is checked out elsewhere,
   # and then skips deleting the remote branch.
   repo=$(gh repo view --json nameWithOwner -q .nameWithOwner)
-  if ! gh pr merge "$pr" --repo "$repo" --merge --delete-branch; then
+  # A ruleset that requires linear history rejects merge commits; squash then.
+  # GitHub signs the squash commit, which also satisfies required signatures.
+  method=--merge
+  if gh api "repos/$repo/rulesets" --jq '.[] | select(.enforcement == "active") | .id' 2>/dev/null \
+     | xargs -I{} gh api "repos/$repo/rulesets/{}" --jq '.rules[].type' 2>/dev/null \
+     | grep -qx required_linear_history; then
+    method=--squash
+  fi
+  if ! gh pr merge "$pr" --repo "$repo" "$method" --delete-branch; then
     echo "wait-pr: checks passed but merging PR #$pr failed" >&2
     exit 1
   fi
