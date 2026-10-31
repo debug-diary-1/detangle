@@ -72,6 +72,11 @@ With GitHub Actions, the [detangle action](https://github.com/debug-diary-1/deta
 ```
 
 Anywhere else, run it through npm: `npx detangle check` (exit 1 on errors), with `-f github`, `-f markdown`, `-f azure` or `-f teamcity` for that CI's annotations.
+For pull requests, `detangle affected` can select the tests a change can affect:
+
+    npx detangle affected --since origin/main --filter '\.test\.ts$'    # tests a PR can break
+
+`--since` compares from where the branch left `origin/main`, including uncommitted and untracked files. In CI, the merge-base needs repository history, so with `actions/checkout` set `fetch-depth: 0`.
 
 ## Before you commit
 
