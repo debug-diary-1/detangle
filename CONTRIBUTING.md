@@ -34,7 +34,7 @@ DETANGLE_ADDON=target/debug/libdetangle_napi.dylib DETANGLE_BIN=target/debug/det
 - **One change per pull request**, with a description of what changed and how you checked it. CI runs on Linux, macOS and Windows; Windows often catches path handling.
 - **CI runs `scripts/guardrails.sh`**, which checks commit authorship, tool names and what lives in `docs/`; run it locally with `scripts/guardrails.sh origin/main..HEAD`.
 - **Waiting on CI.** `scripts/wait-pr.sh <n>` waits for a PR's checks and shows why one failed.
-- Benchmarks against other tools live in [detangle-bench](https://github.com/debug-diary-1/detangle-bench), not in this repository.
+- Benchmarks against other tools live in [detangle-bench](https://github.com/debug-diary-1/detangle-bench), not in this repository. To update the site's benchmark table, run that repo's `site.mjs` on a results file; it rewrites the `bench-data` block in `site/index.html`.
 
 ## License
 
