@@ -21,7 +21,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { name: macOS arm64, os: macos-14 }
+          - { name: macOS arm64, os: macos-latest }
           - { name: Linux x64 (glibc), os: ubuntu-latest }
           - { name: Linux arm64 (glibc), os: ubuntu-22.04-arm }
           - { name: Linux x64 (musl), os: ubuntu-latest, container: "node:22-alpine", shell: sh }
