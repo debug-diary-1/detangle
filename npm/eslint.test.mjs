@@ -485,13 +485,13 @@ test("a panic is reported, and recovers after the text changes and the floor pas
     const good = 'import "./legacy/old";\n';
     assert.deepEqual(await p.lintFile("src/a.ts", good), ["1:8 no-legacy: src/a.ts → src/legacy/old.ts"]);
     const handle = handleOf(p.dir);
-    handle.__setRetryFloorMs(300);
+    handle.__setRetryFloorMs(2000);
     const crash = `${good}// __detangle_test_panic__\n`;
     const [m] = await p.lintFile("src/a.ts", crash);
     assert.match(m, /^1:1 detangle: internal error \(test panic\)/);
     // Fixed at once: within the floor, still failed. Nothing threw.
     assert.match((await p.lintFile("src/a.ts", good))[0], /internal error/);
-    await new Promise((r) => setTimeout(r, 350));
+    await new Promise((r) => setTimeout(r, 2100));
     assert.deepEqual(await p.lintFile("src/a.ts", good), ["1:8 no-legacy: src/a.ts → src/legacy/old.ts"]);
     assert.equal(handle.__stats().openAttempts, 2);
   } finally {
